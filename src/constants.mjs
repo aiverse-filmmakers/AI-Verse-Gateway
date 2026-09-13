@@ -1,0 +1,13 @@
+export const VERSION = "0.1.0-beta.1";
+export const COMPONENT_ID = "ai-verse-gateway";
+export const HOST_PROTOCOL = "ai-verse-brain-bridge/1.0";
+export const GOAL_PROTOCOL = "ai-verse-goal-owner/1.0";
+export const DEFAULT_HOST = "127.0.0.1";
+export const DEFAULT_PORT = 8787;
+export const DEFAULT_MAX_BODY_BYTES = 256 * 1024;
+export const DEFAULT_REQUESTS_PER_MINUTE = 120;
+export const DEFAULT_GOAL_TURNS = 20;
+export const DEFAULT_NO_PROGRESS_THRESHOLD = 2;
+export const DEFAULT_WALL_CLOCK_SECONDS = 120;
+export const RUN_TERMINAL = new Set(["completed", "failed", "canceled", "blocked", "budget_limited"]);
+export const RUN_RECOVERABLE = new Set(["running", "resuming", "waiting_tool"]);

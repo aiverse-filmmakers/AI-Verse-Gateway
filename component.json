@@ -1,0 +1,14 @@
+{
+  "schema_version": "1.0",
+  "component_id": "ai-verse-gateway",
+  "version": "0.1.0-beta.1",
+  "compatibility": { "node": ">=20", "host_protocol": "ai-verse-brain-bridge/1.0" },
+  "install_source": "npm-or-git",
+  "setup_required": true,
+  "lifecycle": ["install", "setup", "status", "doctor", "enable", "disable", "update", "uninstall"],
+  "authority_transfer_separate": true,
+  "uninstall_preserves_canonical_state": true,
+  "requested_capabilities": ["client-ingress", "run-loop", "host-invocation"],
+  "canonical_state_owned": ["sessions", "runs", "run-checkpoints", "gateway-audit-receipts"],
+  "canonical_state_not_owned": ["goals", "memory", "data", "skills", "bot-coordination", "external-credentials", "token-truth", "dashboard-presentation"]
+}
