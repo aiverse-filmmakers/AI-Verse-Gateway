@@ -268,6 +268,27 @@ export class RunEngine {
           }
         };
       }
+      if (args.operation === "skills.learning-candidate" && parameters?.task_evidence?.substantial_task !== true) {
+        const result = {
+          status: "succeeded",
+          effect_occurred: false,
+          result: {
+            learning_candidate: {
+              state: "ignored",
+              reason: "Gateway substantial-task gate suppressed learning review for this turn",
+              suggested_owner: "none"
+            }
+          }
+        };
+        run.messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
+        await this.store.event(run.run_id, "learning.review.skipped", {
+          tool_call_id: call.id,
+          reason: "not_substantial"
+        });
+        await this.store.saveRun(run);
+        continue;
+      }
+
       const request = {
         action_class: args.action_class,
         scope,
