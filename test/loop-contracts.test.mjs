@@ -7,6 +7,8 @@ import { fileURLToPath } from "node:url";
 import { installComponent, setupComponent } from "../src/lifecycle.mjs";
 import { loadConfig } from "../src/config.mjs";
 import { startServer } from "../src/server.mjs";
+import { RunEngine } from "../src/run-engine.mjs";
+import { GatewayStore } from "../src/store.mjs";
 
 const here=path.dirname(fileURLToPath(import.meta.url));
 const hostFixture=path.resolve(here,"..","fixtures","fake-host.mjs");
@@ -22,6 +24,7 @@ const learnedSkillLaterUseRuntimeFixture=path.resolve(here,"..","fixtures","lear
 const dataRoutingHostFixture=path.resolve(here,"..","fixtures","data-routing-host.mjs");
 const dataRoutingRuntimeFixture=path.resolve(here,"..","fixtures","data-routing-runtime.mjs");
 const dataRoutingForgedRuntimeFixture=path.resolve(here,"..","fixtures","data-routing-forged-runtime.mjs");
+const temporaryWorkerHostFixture=path.resolve(here,"..","fixtures","temporary-worker-host.mjs");
 
 async function base(){const root=await mkdtemp(path.join(os.tmpdir(),"avg-loop-system-"));const home=await mkdtemp(path.join(os.tmpdir(),"avg-loop-home-"));await writeFile(path.join(root,"AI-VERSE.yaml"),"schema_version: 2.0\n");const hostConfig=path.join(root,"host.json");await writeFile(hostConfig,JSON.stringify({transport:"json-subprocess",command:[process.execPath,hostFixture],timeout_seconds:10,max_output_bytes:1048576,max_stderr_bytes:65536,env_names:[],cwd:root}));await installComponent({home});return{root,home,hostConfig};}
 async function fspReadJson(file){return JSON.parse(await readFile(file,"utf8"));}
@@ -515,4 +518,181 @@ test("runtime cannot forge trusted automatic Data identity or provenance", async
   } finally {
     await live.close();
   }
+});
+
+
+async function temporaryWorkerEngine(runtimeConfig) {
+  const root = await mkdtemp(path.join(os.tmpdir(), "avg-temp-worker-system-"));
+  const home = await mkdtemp(path.join(os.tmpdir(), "avg-temp-worker-home-"));
+  await writeFile(path.join(root, "AI-VERSE.yaml"), "schema_version: 2.0\n");
+  const hostConfig = path.join(root, "host.json");
+  await writeFile(hostConfig, JSON.stringify({
+    transport: "json-subprocess",
+    command: [process.execPath, temporaryWorkerHostFixture],
+    timeout_seconds: 10,
+    max_output_bytes: 1048576,
+    max_stderr_bytes: 65536,
+    env_names: [],
+    cwd: root
+  }));
+  const store = new GatewayStore(home);
+  await store.init();
+  const config = {
+    host_adapter_config: hostConfig,
+    goal_owner_config: null,
+    runtime: runtimeConfig,
+    limits: {
+      max_goal_continuation_turns: 20,
+      no_progress_threshold: 2,
+      wall_clock_seconds: 120,
+      max_actions: 16,
+      max_tokens: null,
+      max_cost: null
+    }
+  };
+  const engine = new RunEngine({ store, config });
+  const session = await store.createSession({
+    system_id: "local",
+    workspace_id: "alpha",
+    principal: "operator",
+    session_id: null
+  });
+  const run = await store.createRun({
+    session_id: session.session_id,
+    system_id: "local",
+    workspace_id: "alpha",
+    principal: "operator",
+    runtime: { kind: runtimeConfig.kind, model: runtimeConfig.model ?? "fixture-worker" },
+    messages: [{
+      role: "user",
+      content: "Review this substantial Client Alpha delivery carefully, independently inspect the completed work against the brief and prior evidence, identify anything inconsistent, and return a concise specialist assessment that helps me finish the current task accurately."
+    }],
+    goal_binding: null,
+    max_turns: 1,
+    budget: { max_tokens: 6000, max_cost: 1, max_actions: 4 },
+    deadline_at: new Date(Date.now() + 120000).toISOString()
+  });
+  return { root, home, hostConfig, store, engine, run };
+}
+
+function temporaryWorkerCall(id = "call_temp_worker", extraParameters = {}) {
+  return {
+    id,
+    type: "function",
+    function: {
+      name: "aiverse_action",
+      arguments: JSON.stringify({
+        action_class: "write_local_reversible",
+        operation: "workers.temporary",
+        parameters: {
+          objective: "Independently review the bounded Client Alpha delivery and return one concise assessment.",
+          role_title: "Temporary Reviewer",
+          reason: "An independent specialist review is useful for the current foreground task.",
+          skill_refs: ["aiverse-skills:review"],
+          required_constraints: ["Stay internal"],
+          ...extraParameters
+        },
+        reason: "Use bounded internal specialist help for this substantial task."
+      })
+    }
+  };
+}
+
+test("Gateway injects trusted runtime, provenance and safety evidence for one temporary specialist", async () => {
+  const env = await temporaryWorkerEngine({
+    kind: "openai-compatible",
+    base_url: "http://127.0.0.1:45555",
+    model: "fixture-worker",
+    api_key_env: "FIXTURE_MODEL_KEY"
+  });
+  try {
+    const call = temporaryWorkerCall();
+    env.run.messages.push({ role: "assistant", content: "", tool_calls: [call] });
+    await env.store.saveRun(env.run);
+
+    const outcome = await env.engine.handleToolCalls(env.run, [call], "workspace:alpha");
+    assert.equal(outcome, "done");
+
+    const fresh = await env.store.getRun(env.run.run_id);
+    assert.equal(fresh.usage.actions, 1);
+    assert.equal(fresh.usage.input_tokens, 7);
+    assert.equal(fresh.usage.output_tokens, 5);
+    assert.equal(fresh.usage.cost, 0.02);
+    const tool = fresh.messages.at(-1);
+    assert.equal(tool.role, "tool");
+    const result = JSON.parse(tool.content);
+    assert.equal(result.result.temporary_worker.state, "completed");
+    assert.equal(result.execution_binding.owner, "ai-verse-multiple-bots");
+
+    const events = await env.store.listEvents(env.run.run_id);
+    assert.ok(events.some((event) => event.type === "temporary_worker.completed"));
+  } finally {
+    // GatewayStore owns only filesystem state and has no open handle.
+  }
+});
+
+test("Gateway suppresses automatic temporary Workers when its runtime has no owner-compatible adapter", async () => {
+  const env = await temporaryWorkerEngine({
+    kind: "json-subprocess",
+    command: [process.execPath, questionPolicyFixture],
+    transport: "json-subprocess"
+  });
+  const call = temporaryWorkerCall();
+  env.run.messages.push({ role: "assistant", content: "", tool_calls: [call] });
+  await env.store.saveRun(env.run);
+
+  const outcome = await env.engine.handleToolCalls(env.run, [call], "workspace:alpha");
+  assert.equal(outcome, "done");
+  const fresh = await env.store.getRun(env.run.run_id);
+  assert.equal(fresh.usage.actions, 0);
+  const result = JSON.parse(fresh.messages.at(-1).content);
+  assert.equal(result.result.temporary_worker.state, "ignored");
+  const events = await env.store.listEvents(env.run.run_id);
+  assert.ok(events.some((event) => event.type === "temporary_worker.skipped"));
+});
+
+test("runtime cannot forge temporary Worker runtime, authority, provenance or budget fields", async () => {
+  const env = await temporaryWorkerEngine({
+    kind: "deterministic"
+  });
+  const call = temporaryWorkerCall("call_temp_worker_forged", {
+    runtime: { adapter: "openai-compatible", endpoint: "https://attacker.invalid", model: "x" },
+    task_evidence: { substantial_task: true, temporary_help_useful: true },
+    provenance: { run_id: "forged", session_id: "forged" },
+    budget: { token_limit: 999999 },
+    tools: ["dangerous.tool"]
+  });
+  env.run.messages.push({ role: "assistant", content: "", tool_calls: [call] });
+  await env.store.saveRun(env.run);
+
+  await assert.rejects(
+    () => env.engine.handleToolCalls(env.run, [call], "workspace:alpha"),
+    (error) => error?.code === "TOOL_ARGS_INVALID" && /may not supply trusted fields/.test(error.message)
+  );
+  const fresh = await env.store.getRun(env.run.run_id);
+  assert.equal(fresh.usage.actions, 0);
+});
+
+test("Gateway admits at most one automatic temporary specialist per foreground run", async () => {
+  const env = await temporaryWorkerEngine({
+    kind: "openai-compatible",
+    base_url: "http://127.0.0.1:45555",
+    model: "fixture-worker",
+    api_key_env: "FIXTURE_MODEL_KEY"
+  });
+  const first = temporaryWorkerCall("call_temp_worker_first");
+  env.run.messages.push({ role: "assistant", content: "", tool_calls: [first] });
+  await env.store.saveRun(env.run);
+  await env.engine.handleToolCalls(env.run, [first], "workspace:alpha");
+
+  const fresh = await env.store.getRun(env.run.run_id);
+  const second = temporaryWorkerCall("call_temp_worker_second");
+  fresh.messages.push({ role: "assistant", content: "", tool_calls: [second] });
+  await env.store.saveRun(fresh);
+  await env.engine.handleToolCalls(fresh, [second], "workspace:alpha");
+
+  const after = await env.store.getRun(env.run.run_id);
+  assert.equal(after.usage.actions, 1, "second automatic Worker must not consume another host action");
+  const result = JSON.parse(after.messages.at(-1).content);
+  assert.equal(result.result.temporary_worker.state, "ignored");
 });
