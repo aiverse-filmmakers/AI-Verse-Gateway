@@ -104,6 +104,64 @@ switch (input.operation) {
           }
         }
       };
+    } else if (req.operation === "bots.permanent") {
+      const params = req.parameters ?? {};
+      const runtime = params.runtime ?? {};
+      const consent = params.consent ?? {};
+      const provenance = params.provenance ?? {};
+      const trusted =
+        req.action_class === "modify_canonical_state" &&
+        req.scope === "workspace:alpha" &&
+        Object.keys(params).sort().join(",") === "consent,mission,name,provenance,role_title,runtime,skill_refs" &&
+        runtime.adapter === "openai-compatible" &&
+        runtime.endpoint === "http://127.0.0.1:45555/v1/chat/completions" &&
+        runtime.model === "fixture-worker" &&
+        runtime.api_key_env === "FIXTURE_MODEL_KEY" &&
+        consent.explicit === true &&
+        ["direct_request", "affirmative_to_recommendation"].includes(consent.mode) &&
+        /^sha256:[a-f0-9]{64}$/.test(String(consent.user_message_digest ?? "")) &&
+        (consent.mode !== "affirmative_to_recommendation" || /^sha256:[a-f0-9]{64}$/.test(String(consent.recommendation_message_digest ?? ""))) &&
+        typeof provenance.run_id === "string" &&
+        provenance.run_id.startsWith("run_") &&
+        typeof provenance.session_id === "string" &&
+        provenance.session_id.startsWith("sess_") &&
+        Array.isArray(params.skill_refs);
+      result = trusted ? {
+        status: "succeeded",
+        effect_occurred: true,
+        result: {
+          permanent_bot: {
+            state: "created",
+            consent_mode: consent.mode,
+            bot: {
+              id: "bot_fixture_durable",
+              kind: "bot",
+              workspace_id: "alpha",
+              payload: {
+                kind: "durable",
+                status: "active",
+                name: params.name,
+                role: { title: params.role_title, mission: params.mission }
+              }
+            }
+          }
+        },
+        execution_binding: {
+          owner: "ai-verse-multiple-bots",
+          request_fingerprint: req.request_fingerprint,
+          operation: req.operation,
+          scope: req.scope
+        }
+      } : {
+        status: "blocked",
+        effect_occurred: false,
+        result: {
+          permanent_bot: {
+            state: "blocked",
+            reason: "trusted permanent Bot consent/runtime binding missing"
+          }
+        }
+      };
     } else if (req.operation === "memory.session_digest") {
       result = {
         status: "succeeded",
