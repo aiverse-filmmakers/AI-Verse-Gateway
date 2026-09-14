@@ -26,7 +26,18 @@ Workspace organization:
   authority: { permission_expansion: false, privacy_ambiguous: false, new_connection: false, new_credential: false }
 - Do not invent source references. Omit unknown optional arrays or use empty arrays.
 - If a real privacy or scope boundary is ambiguous, ask only the natural question needed to resolve that boundary instead of making the workspace mutation.
-- After successful internal organization, continue the user's work and use natural outcome language if mentioning it. Do not expose OS schema or component jargon.`;
+- After successful internal organization, continue the user's work and use natural outcome language if mentioning it. Do not expose OS schema or component jargon.
+
+Historical Memory capture:
+- Do not persist every turn. Only consider capture when the work produced or clearly revealed a high-confidence durable historical fact, preference, entity, event, experience, workflow, lesson, or correction that is likely to matter later.
+- Never use automatic Memory capture for current state, current constraints, decisions, strategic direction, credentials/secrets, ambiguous private material, permission changes, or uncertain information.
+- Prefer no capture for greetings, brainstorming fragments, transient task details, already-known context, or weak evidence.
+- Use action_class "write_local_reversible", operation "memory.capture".
+- The parameters must contain only the historical candidate fields Memory needs: text, type, optional importance/confidence/why/tags, and admission.
+- Set admission.durable=true and admission.historical=true only when strongly supported by the completed work/evidence.
+- Set admission.current_truth=false, contains_secret=false, strategic=false, permission_expansion=false, privacy_ambiguous=false, external_authority=false only when each statement is actually supported. If any boundary is uncertain, do not call memory.capture.
+- Do not provide source, evidence_refs, effect_id, scope, or workspace. Gateway supplies trusted run provenance/retry identity and OS binds scope before Memory admission.
+- After successful capture, continue normally. Do not announce internal Memory mechanics unless advanced inspection was requested.`;
 
 const ACTION_TOOL = {
   type: "function",
@@ -207,6 +218,18 @@ export class RunEngine {
             classifier: "gateway-runtime",
             source: "gateway"
           }
+        };
+      }
+      if (args.operation === "memory.capture") {
+        if (!parameters || typeof parameters !== "object" || Array.isArray(parameters)) throw new GatewayError("TOOL_ARGS_INVALID", "memory.capture parameters must be an object");
+        const forbidden = ["source", "evidence_refs", "effect_id", "scope", "workspace"];
+        const suppliedForbidden = forbidden.filter((key) => Object.hasOwn(parameters, key));
+        if (suppliedForbidden.length) throw new GatewayError("TOOL_ARGS_INVALID", `memory.capture runtime parameters may not supply trusted fields: ${suppliedForbidden.join(", ")}`);
+        parameters = {
+          ...parameters,
+          source: `gateway-run:${run.run_id}`,
+          evidence_refs: [`run:${run.run_id}`, `session:${run.session_id}`],
+          effect_id: `gateway:${run.run_id}:${call.id}:memory.capture`
         };
       }
       const request = {
