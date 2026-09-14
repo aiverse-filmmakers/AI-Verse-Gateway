@@ -1,0 +1,350 @@
+name: Invisible Intelligence Automation Consent Composition
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gateway-os-automations-consent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      OS_SHA: b08cc8c05c56fad7bc390f391292bdfbdd7d23e0
+      AUTOMATIONS_SHA: caaed83b98026dd955640fc015d181529b91a1c6
+
+    steps:
+      - name: Checkout Gateway under test
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Gateway dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Fetch exact accepted OS and Automations owners
+        shell: bash
+        run: |
+          set -euo pipefail
+          OS="$RUNNER_TEMP/AI-Verse-OS"
+          AUT="$RUNNER_TEMP/AI-Verse-Automations"
+          git clone https://github.com/aiverse-filmmakers/AI-Verse-OS.git "$OS"
+          git -C "$OS" checkout --detach "$OS_SHA"
+          test "$(git -C "$OS" rev-parse HEAD)" = "$OS_SHA"
+          git clone https://github.com/aiverse-filmmakers/AI-Verse-Automations.git "$AUT"
+          git -C "$AUT" checkout --detach "$AUTOMATIONS_SHA"
+          test "$(git -C "$AUT" rev-parse HEAD)" = "$AUTOMATIONS_SHA"
+          python -m pip install "$AUT"
+          printf '%s' "$OS" > "$RUNNER_TEMP/os-repo.txt"
+          printf '%s' "$AUT" > "$RUNNER_TEMP/automations-repo.txt"
+
+      - name: Prepare OS workspace, Automations owner and host adapter
+        shell: bash
+        run: |
+          set -euo pipefail
+          OS="$(cat "$RUNNER_TEMP/os-repo.txt")"
+          STATE="$RUNNER_TEMP/automations-state"
+          mkdir -p "$OS/workspaces/alpha/context"
+          cat > "$OS/workspaces/alpha/WORKSPACE.yaml" <<'YAML'
+          schema_version: "2.0"
+          id: alpha
+          name: Alpha
+          type: project
+          status: active
+          purpose: End-to-end recurring responsibility acceptance.
+          domains: []
+          owners: []
+          success_criteria: []
+          canonical_sources: []
+          connections: []
+          current_context: context/CURRENT.md
+          YAML
+          cat > "$OS/workspaces/alpha/context/CURRENT.md" <<'MD'
+          # Current Workspace Context
+
+          ## Objective
+
+          Maintain Client Alpha delivery quality.
+
+          ## Current state
+
+          Weekly review work is active.
+          MD
+
+          STATE="$STATE" OS_ROOT="$OS" python - <<'PY'
+          import os
+          from pathlib import Path
+          from aiverse_automations.lifecycle import setup
+          from aiverse_automations.os_extension import install_os_extension
+
+          state=Path(os.environ["STATE"])
+          root=Path(os.environ["OS_ROOT"])
+          report=setup(state,os_root=str(root),enable=True)
+          assert report["state"]=="ready", report
+          attached=install_os_extension(state,root)
+          assert attached["status"] in {"installed","unchanged"}, attached
+          print("Canonical Automations owner attached: PASS")
+          PY
+
+          python "$OS/scripts/ai_verse_host_adapter.py" \
+            --root "$OS" \
+            --write-config "$RUNNER_TEMP/os-host.json"
+
+      - name: Create, fire and restart-replay the consented recurring responsibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { mkdtemp, readdir, readFile } from "node:fs/promises";
+          import os from "node:os";
+          import path from "node:path";
+          import { promisify } from "node:util";
+          import { execFile } from "node:child_process";
+          import { installComponent, setupComponent } from "./src/lifecycle.mjs";
+          import { loadConfig } from "./src/config.mjs";
+          import { startServer } from "./src/server.mjs";
+          import { GatewayStore } from "./src/store.mjs";
+          import { RunEngine } from "./src/run-engine.mjs";
+
+          const execFileAsync = promisify(execFile);
+          const home = await mkdtemp(path.join(os.tmpdir(), "gateway-automation-composed-"));
+          const osRoot = process.env.RUNNER_TEMP + "/AI-Verse-OS";
+          const hostConfig = process.env.RUNNER_TEMP + "/os-host.json";
+          const automationState = process.env.RUNNER_TEMP + "/automations-state";
+
+          await installComponent({ home });
+          const setup = await setupComponent({
+            home,
+            system_root: osRoot,
+            host_config: hostConfig,
+            runtime: "deterministic"
+          });
+          let config = await loadConfig(home);
+          let live = await startServer(config, home, { port: 0 });
+          let baseUrl = `http://127.0.0.1:${live.port}`;
+          process.env.GATEWAY_AUTOMATION_TOKEN = setup.api_token;
+
+          await execFileAsync("python", ["-c", `
+from pathlib import Path
+from aiverse_automations.config import load_config, save_config
+state=Path(r"${automationState}")
+cfg=load_config(state,required=True)
+cfg.setdefault("targets",{})["gateway"]={
+    "url":r"${baseUrl}/v1/automations/invoke",
+    "bearer_token_ref":"env:GATEWAY_AUTOMATION_TOKEN",
+}
+save_config(state,cfg)
+print("Gateway target configured")
+`], {
+            env: { ...process.env, GATEWAY_AUTOMATION_TOKEN: setup.api_token }
+          });
+
+          const store = live.store;
+          const engine = live.engine;
+          const session = await store.createSession({
+            system_id: config.system.id,
+            workspace_id: "alpha",
+            principal: "operator"
+          });
+          const run = await store.createRun({
+            session_id: session.session_id,
+            system_id: config.system.id,
+            workspace_id: "alpha",
+            principal: "operator",
+            runtime: { kind: "deterministic", model: "aiverse" },
+            messages: [{
+              role: "user",
+              content: "Every Monday at 09:00 Europe/Bucharest, review the Client Alpha delivery checklist and prepare the usual concise summary."
+            }],
+            goal_binding: null,
+            max_turns: 1,
+            budget: { max_tokens: 6000, max_cost: null, max_actions: 4 },
+            deadline_at: new Date(Date.now() + 120000).toISOString()
+          });
+          const call = {
+            id: "call_composed_automation_direct",
+            type: "function",
+            function: {
+              name: "aiverse_action",
+              arguments: JSON.stringify({
+                action_class: "modify_canonical_state",
+                operation: "automations.create",
+                parameters: {
+                  name: "Monday Client Alpha review",
+                  objective: "Review the Client Alpha delivery checklist and prepare the usual concise summary.",
+                  trigger: {
+                    kind: "cron",
+                    spec: {
+                      expr: "0 9 * * MON",
+                      timezone: "Europe/Bucharest"
+                    }
+                  }
+                },
+                reason: "Create the recurring responsibility explicitly requested by the user."
+              })
+            }
+          };
+          run.messages.push({ role: "assistant", content: "", tool_calls: [call] });
+          await store.saveRun(run);
+          const outcome = await engine.handleToolCalls(run, [call], "workspace:alpha");
+          if (outcome !== "done") throw new Error("Gateway recurring creation did not complete");
+
+          const createdRun = await store.getRun(run.run_id);
+          if (createdRun.usage.actions !== 1) throw new Error("consented recurring creation did not reach the real owner exactly once");
+          const tool = JSON.parse(createdRun.messages.at(-1).content);
+          if (tool?.result?.automation?.state !== "created") throw new Error("canonical Automation was not created");
+          if (tool?.result?.automation?.consent_mode !== "direct_request") throw new Error("direct consent provenance was lost");
+          if (tool?.execution_binding?.owner !== "ai-verse-automations") throw new Error("canonical Automations owner binding missing");
+          const automationId = tool.result.automation.automation_id;
+
+          const noConsent = await store.createRun({
+            session_id: session.session_id,
+            system_id: config.system.id,
+            workspace_id: "alpha",
+            principal: "operator",
+            runtime: { kind: "deterministic", model: "aiverse" },
+            messages: [{
+              role: "user",
+              content: "We seem to do this every Monday at 09:00 Europe/Bucharest and it keeps taking time."
+            }],
+            goal_binding: null,
+            max_turns: 1,
+            budget: { max_tokens: 6000, max_cost: null, max_actions: 4 },
+            deadline_at: new Date(Date.now() + 120000).toISOString()
+          });
+          const noConsentCall = {
+            ...call,
+            id: "call_composed_automation_without_consent"
+          };
+          noConsent.messages.push({ role: "assistant", content: "", tool_calls: [noConsentCall] });
+          await store.saveRun(noConsent);
+          await engine.handleToolCalls(noConsent, [noConsentCall], "workspace:alpha");
+          const suppressed = await store.getRun(noConsent.run_id);
+          if (suppressed.usage.actions !== 0) throw new Error("repeated need crossed the recurring consent boundary");
+          const suppressedTool = JSON.parse(suppressed.messages.at(-1).content);
+          if (suppressedTool?.result?.automation?.state !== "not_created") throw new Error("no-consent request was not suppressed");
+
+          const fired = await execFileAsync("python", ["-c", `
+import json
+from pathlib import Path
+from aiverse_automations.engine import Engine
+from aiverse_automations.store import Store
+state=Path(r"${automationState}")
+store=Store(state)
+rows=store.list_automations()
+assert len(rows)==1, rows
+assert rows[0]["id"]==r"${automationId}", rows
+result=Engine(state).run_now(r"${automationId}")
+assert result["status"]=="succeeded", result
+print(json.dumps(result))
+`], {
+            env: { ...process.env, GATEWAY_AUTOMATION_TOKEN: setup.api_token },
+            maxBuffer: 1024 * 1024
+          });
+          const firedRun = JSON.parse(fired.stdout.trim().split(/\r?\n/).at(-1));
+          const wake = firedRun.wake;
+          if (!wake || wake.automation_id !== automationId || wake.target_kind !== "gateway") {
+            throw new Error("Automations fired an invalid Gateway wake");
+          }
+
+          const runsDir = path.join(home, "state", "runs");
+          let scheduledRun = null;
+          const deadline = Date.now() + 5000;
+          while (Date.now() < deadline && !scheduledRun) {
+            for (const name of await readdir(runsDir)) {
+              if (!name.endsWith(".json")) continue;
+              const item = JSON.parse(await readFile(path.join(runsDir, name), "utf8"));
+              if (item?.automation_binding?.invocation_id === wake.invocation_id) {
+                scheduledRun = item;
+                break;
+              }
+            }
+            if (!scheduledRun) await new Promise((resolve) => setTimeout(resolve, 25));
+          }
+          if (!scheduledRun) throw new Error("Gateway did not create a run from the canonical Automations wake");
+
+          while (["queued","running","resuming","waiting_tool"].includes(scheduledRun.status) && Date.now() < deadline) {
+            await new Promise((resolve) => setTimeout(resolve, 25));
+            scheduledRun = await store.getRun(scheduledRun.run_id);
+          }
+          if (scheduledRun.status !== "completed") throw new Error(`scheduled Gateway run did not complete: ${scheduledRun.status}`);
+          if (scheduledRun.workspace_id !== "alpha") throw new Error("scheduled run lost workspace scope");
+          if (scheduledRun.automation_binding?.automation_id !== automationId) throw new Error("scheduled run lost Automation provenance");
+
+          const originalScheduledRunId = scheduledRun.run_id;
+          await live.close();
+
+          config = await loadConfig(home);
+          live = await startServer(config, home, { port: 0 });
+          baseUrl = `http://127.0.0.1:${live.port}`;
+
+          const replayResponse = await fetch(`${baseUrl}/v1/automations/invoke`, {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${setup.api_token}`,
+              "content-type": "application/json"
+            },
+            body: JSON.stringify(wake)
+          });
+          if (replayResponse.status !== 200) throw new Error(`restart replay returned HTTP ${replayResponse.status}`);
+          const replay = await replayResponse.json();
+          if (!replay.replayed || replay.run_id !== originalScheduledRunId) {
+            throw new Error("exact wake replay after Gateway restart did not resolve to the original run");
+          }
+
+          const changedResponse = await fetch(`${baseUrl}/v1/automations/invoke`, {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${setup.api_token}`,
+              "content-type": "application/json"
+            },
+            body: JSON.stringify({
+              ...wake,
+              payload: {
+                ...wake.payload,
+                objective: "Changed objective under the same invocation id."
+              }
+            })
+          });
+          if (changedResponse.status !== 409) throw new Error("changed wake replay was not rejected");
+
+          await live.close();
+          console.log("Gateway -> OS -> Automations -> Gateway recurring consent composition: PASS");
+          NODE
+
+      - name: Prove final canonical state has one recurring definition
+        shell: bash
+        run: |
+          set -euo pipefail
+          STATE="$RUNNER_TEMP/automations-state"
+          STATE="$STATE" python - <<'PY'
+          import os
+          from pathlib import Path
+          from aiverse_automations.store import Store
+
+          store=Store(Path(os.environ["STATE"]))
+          rows=store.list_automations()
+          assert len(rows)==1, rows
+          automation=rows[0]
+          assert automation["scope"]=="workspace:alpha"
+          assert automation["target_kind"]=="gateway"
+          assert automation["action_class"]=="read_local"
+          assert automation["wake"]["created_via"]=="gateway_explicit_consent"
+          assert automation["wake"]["consent"]["mode"]=="direct_request"
+          triggers=store.list_triggers(automation["id"])
+          assert len(triggers)==1, triggers
+          assert triggers[0]["kind"]=="cron"
+          assert triggers[0]["spec"]=={
+              "expr":"0 9 * * MON",
+              "timezone":"Europe/Bucharest",
+          }
+          print("Exactly one conservative canonical recurring definition: PASS")
+          PY
