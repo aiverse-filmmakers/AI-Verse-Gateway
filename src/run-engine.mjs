@@ -734,7 +734,7 @@ function permanentBotConsentEvidence(run) {
     };
   }
 
-  const affirmative = userText.length <= 160 && /^(?:yes|yes please|yep|yeah|do it|go ahead|set it up|create it|make it|make it permanent|sounds good[,. ]*do it|please do)[.! ]*$/i.test(userText);
+  const affirmative = userText.length <= 160 && /^(?:yes(?:,?\s+(?:please|set it up|do it|go ahead|create it|make it(?: permanent)?))?|yep|yeah|do it|go ahead|set it up|create it|make it|make it permanent|sounds good[,. ]*do it|please do)[.! ]*$/i.test(userText);
   if (!affirmative) return null;
 
   let priorAssistant = null;
