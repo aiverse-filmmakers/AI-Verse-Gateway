@@ -25,6 +25,7 @@ const dataRoutingHostFixture=path.resolve(here,"..","fixtures","data-routing-hos
 const dataRoutingRuntimeFixture=path.resolve(here,"..","fixtures","data-routing-runtime.mjs");
 const dataRoutingForgedRuntimeFixture=path.resolve(here,"..","fixtures","data-routing-forged-runtime.mjs");
 const temporaryWorkerHostFixture=path.resolve(here,"..","fixtures","temporary-worker-host.mjs");
+const automationRecommendationFixture=path.resolve(here,"..","fixtures","automation-recommendation-runtime.mjs");
 
 async function base(){const root=await mkdtemp(path.join(os.tmpdir(),"avg-loop-system-"));const home=await mkdtemp(path.join(os.tmpdir(),"avg-loop-home-"));await writeFile(path.join(root,"AI-VERSE.yaml"),"schema_version: 2.0\n");const hostConfig=path.join(root,"host.json");await writeFile(hostConfig,JSON.stringify({transport:"json-subprocess",command:[process.execPath,hostFixture],timeout_seconds:10,max_output_bytes:1048576,max_stderr_bytes:65536,env_names:[],cwd:root}));await installComponent({home});return{root,home,hostConfig};}
 async function fspReadJson(file){return JSON.parse(await readFile(file,"utf8"));}
@@ -876,4 +877,79 @@ test("advice questions do not become durable Bot consent", async () => {
   const fresh = await env.store.getRun(env.run.run_id);
   assert.equal(fresh.usage.actions, 0);
   assert.equal(JSON.parse(fresh.messages.at(-1).content).result.permanent_bot.state, "not_created");
+});
+
+
+test("clear repeated responsibility is recommended naturally without creating recurring state", async () => {
+  const f = await base();
+  const setup = await setupComponent({
+    home: f.home,
+    system_root: f.root,
+    host_config: f.hostConfig,
+    runtime: "json-subprocess",
+    runtime_command: JSON.stringify([process.execPath, automationRecommendationFixture])
+  });
+  const live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+  const baseUrl = `http://127.0.0.1:${live.port}`;
+  try {
+    const response = await fetch(`${baseUrl}/v1/runs`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${setup.api_token}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "fixture",
+        messages: [{
+          role: "user",
+          content: "Every Monday I review the Client Alpha delivery checklist and send myself the same summary."
+        }],
+        metadata: { workspace_id: "alpha" }
+      })
+    });
+    assert.equal(response.status, 202);
+    const created = await response.json();
+    const done = await waitStatus(baseUrl, setup.api_token, created.run_id, ["completed", "failed"]);
+    assert.equal(done.status, "completed");
+    assert.equal(done.output.content, "I can handle this every Monday for you if you want.");
+    assert.equal(done.usage.actions, 0, "recommendation must not create recurring owner state");
+    assert.doesNotMatch(done.output.content, /\b(?:automation|scheduler|cron|trigger|job)\b/i);
+  } finally {
+    await live.close();
+  }
+});
+
+test("one-off work does not produce a recurring responsibility recommendation", async () => {
+  const f = await base();
+  const setup = await setupComponent({
+    home: f.home,
+    system_root: f.root,
+    host_config: f.hostConfig,
+    runtime: "json-subprocess",
+    runtime_command: JSON.stringify([process.execPath, automationRecommendationFixture])
+  });
+  const live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+  const baseUrl = `http://127.0.0.1:${live.port}`;
+  try {
+    const response = await fetch(`${baseUrl}/v1/runs`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${setup.api_token}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "fixture",
+        messages: [{ role: "user", content: "Review this delivery checklist today." }],
+        metadata: { workspace_id: "alpha" }
+      })
+    });
+    assert.equal(response.status, 202);
+    const created = await response.json();
+    const done = await waitStatus(baseUrl, setup.api_token, created.run_id, ["completed", "failed"]);
+    assert.equal(done.status, "completed");
+    assert.equal(done.output.content, "I’ll keep this as a one-off and just handle the current task.");
+    assert.equal(done.usage.actions, 0);
+  } finally {
+    await live.close();
+  }
 });

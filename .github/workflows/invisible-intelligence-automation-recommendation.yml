@@ -1,0 +1,86 @@
+name: Invisible Intelligence Automation Recommendation Boundary
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recommendation-does-not-schedule:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      AUTOMATIONS_SHA: 494469a496d479cfec618bcd9511033c0cd3e815
+
+    steps:
+      - name: Checkout Gateway under test
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Gateway dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Fetch exact canonical Automations owner
+        shell: bash
+        run: |
+          set -euo pipefail
+          AUT="$RUNNER_TEMP/AI-Verse-Automations"
+          git clone https://github.com/aiverse-filmmakers/AI-Verse-Automations.git "$AUT"
+          git -C "$AUT" checkout --detach "$AUTOMATIONS_SHA"
+          test "$(git -C "$AUT" rev-parse HEAD)" = "$AUTOMATIONS_SHA"
+          printf '%s' "$AUT" > "$RUNNER_TEMP/automations-repo.txt"
+
+      - name: Initialize empty canonical Automations state
+        shell: bash
+        run: |
+          set -euo pipefail
+          AUT="$(cat "$RUNNER_TEMP/automations-repo.txt")"
+          STATE="$RUNNER_TEMP/automations-state"
+          AUT="$AUT" STATE="$STATE" python - <<'PY'
+          import os, sys
+          from pathlib import Path
+          sys.path.insert(0, str(Path(os.environ["AUT"]) / "src"))
+          from aiverse_automations.db import initialize
+          from aiverse_automations.store import Store
+          state = Path(os.environ["STATE"])
+          initialize(state)
+          assert Store(state).list_automations() == []
+          print("Canonical Automations baseline is empty: PASS")
+          PY
+
+      - name: Prove repeated responsibility only recommends
+        run: |
+          node --test --test-name-pattern="clear repeated responsibility|one-off work" test/loop-contracts.test.mjs
+
+      - name: Prove recommendation created no canonical schedule or trigger
+        shell: bash
+        run: |
+          set -euo pipefail
+          AUT="$(cat "$RUNNER_TEMP/automations-repo.txt")"
+          STATE="$RUNNER_TEMP/automations-state"
+          AUT="$AUT" STATE="$STATE" python - <<'PY'
+          import os, sqlite3, sys
+          from pathlib import Path
+          sys.path.insert(0, str(Path(os.environ["AUT"]) / "src"))
+          from aiverse_automations.store import Store
+          from aiverse_automations.db import db_path
+          state = Path(os.environ["STATE"])
+          store = Store(state)
+          assert store.list_automations() == []
+          conn = sqlite3.connect(db_path(state))
+          try:
+            assert conn.execute("SELECT COUNT(*) FROM triggers").fetchone()[0] == 0
+            assert conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+          finally:
+            conn.close()
+          print("Recommendation left canonical Automations state untouched: PASS")
+          PY
