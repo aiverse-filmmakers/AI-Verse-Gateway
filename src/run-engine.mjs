@@ -118,6 +118,13 @@ const ORGANIZATION_REVIEW_POLICY = `Invisible completed-work organization review
 - Prefer no action over weak evidence. Owner authorization and canonical owner validation remain stronger than this review.
 - Use only the bounded completed-work evidence supplied below. Do not assume hidden facts.`;
 
+const ORGANIZATION_REVIEW_BUDGET = Object.freeze({
+  max_evidence_chars: 5600,
+  max_output_tokens: 768,
+  max_actions: 4,
+  max_reported_cost: 0.02
+});
+
 const ACTION_TOOL = {
   type: "function",
   function: {
@@ -780,16 +787,58 @@ export class RunEngine {
       }
       const attempts = Number(review.attempts ?? 0) + 1;
       try {
+        const evidenceJson = JSON.stringify(evidence);
+        if (evidenceJson.length > ORGANIZATION_REVIEW_BUDGET.max_evidence_chars) {
+          fresh.organization_review = {
+            ...(fresh.organization_review ?? review),
+            status: "skipped",
+            reason: "bounded review evidence exceeded the deterministic evidence cap",
+            attempts,
+            budget: {
+              ...ORGANIZATION_REVIEW_BUDGET,
+              evidence_chars: evidenceJson.length,
+              state: "not_invoked"
+            },
+            updated_at: nowIso(),
+            last_error: null
+          };
+          await this.store.saveRun(fresh);
+          await this.store.event(fresh.run_id, "organization.review.skipped", {
+            reason: "evidence_cap",
+            evidence_chars: evidenceJson.length
+          });
+          return null;
+        }
         const result = await this.runtime.invoke({
           run_id: fresh.run_id + ":organization-review",
           model: fresh.runtime?.model,
           messages: [
             { role: "system", content: ORGANIZATION_REVIEW_POLICY },
-            { role: "user", content: "Completed-work evidence:\n" + JSON.stringify(evidence) }
+            { role: "user", content: "Completed-work evidence:\n" + evidenceJson }
           ],
-          tools: [ACTION_TOOL]
+          tools: [ACTION_TOOL],
+          max_output_tokens: ORGANIZATION_REVIEW_BUDGET.max_output_tokens
         });
-        const proposal = normalizeOrganizationReviewProposal(result?.tool_calls ?? []);
+        const runtimeUsage = {
+          input_tokens: Number(result?.usage?.input_tokens ?? 0),
+          output_tokens: Number(result?.usage?.output_tokens ?? 0),
+          cost: Number(result?.usage?.cost ?? 0)
+        };
+        const budgetExceeded =
+          runtimeUsage.output_tokens > ORGANIZATION_REVIEW_BUDGET.max_output_tokens ||
+          runtimeUsage.cost > ORGANIZATION_REVIEW_BUDGET.max_reported_cost;
+        const proposal = budgetExceeded
+          ? {
+              actions: [],
+              rejected: [{ operation: "review", reason: "review_budget_exceeded" }]
+            }
+          : normalizeOrganizationReviewProposal(result?.tool_calls ?? []);
+        if (proposal.actions.length > ORGANIZATION_REVIEW_BUDGET.max_actions) {
+          for (const action of proposal.actions.slice(ORGANIZATION_REVIEW_BUDGET.max_actions)) {
+            proposal.rejected.push({ operation: action.operation, reason: "review_action_budget_exceeded" });
+          }
+          proposal.actions = proposal.actions.slice(0, ORGANIZATION_REVIEW_BUDGET.max_actions);
+        }
         const foregroundOperations = new Set(requestedActionOperations(fresh));
         if (foregroundOperations.size) {
           const retained = [];
@@ -810,20 +859,26 @@ export class RunEngine {
           attempts,
           proposal,
           results: fresh.organization_review?.results ?? {},
-          runtime_usage: {
-            input_tokens: Number(result?.usage?.input_tokens ?? 0),
-            output_tokens: Number(result?.usage?.output_tokens ?? 0),
-            cost: Number(result?.usage?.cost ?? 0)
+          runtime_usage: runtimeUsage,
+          budget: {
+            ...ORGANIZATION_REVIEW_BUDGET,
+            evidence_chars: evidenceJson.length,
+            state: budgetExceeded ? "exceeded" : "within",
+            observed_output_tokens: runtimeUsage.output_tokens,
+            observed_reported_cost: runtimeUsage.cost
           },
           updated_at: nowIso(),
           last_error: null
         };
         fresh.organization_review = review;
         await this.store.saveRun(fresh);
-        await this.store.event(fresh.run_id, "organization.review.classified", {
+        await this.store.event(fresh.run_id, budgetExceeded ? "organization.review.budget_limited" : "organization.review.classified", {
           admitted_operations: proposal.actions.map((action) => action.operation),
           rejected_count: proposal.rejected.length,
-          attempt: attempts
+          attempt: attempts,
+          budget_state: budgetExceeded ? "exceeded" : "within",
+          evidence_chars: evidenceJson.length,
+          max_output_tokens: ORGANIZATION_REVIEW_BUDGET.max_output_tokens
         });
       } catch (error) {
         const e = asGatewayError(error);
@@ -940,19 +995,21 @@ export class RunEngine {
 
     fresh = await this.store.getRun(run.run_id);
     if (!fresh || fresh.status !== "completed") return null;
+    const budgetLimited = fresh.organization_review?.budget?.state === "exceeded";
     fresh.organization_review = {
       ...(fresh.organization_review ?? review),
-      status: "completed",
+      status: budgetLimited ? "budget_limited" : "completed",
       results,
       completed_at: nowIso(),
       updated_at: nowIso(),
       last_error: null
     };
     await this.store.saveRun(fresh);
-    await this.store.event(fresh.run_id, "organization.review.completed", {
+    await this.store.event(fresh.run_id, budgetLimited ? "organization.review.budget_limited_completed" : "organization.review.completed", {
       routed_operations: Object.entries(results).filter(([, value]) => value?.state === "completed").map(([operation]) => operation),
       skipped_operations: Object.entries(results).filter(([, value]) => value?.state === "skipped").map(([operation]) => operation),
-      rejected_count: proposal.rejected?.length ?? 0
+      rejected_count: proposal.rejected?.length ?? 0,
+      budget_state: budgetLimited ? "exceeded" : "within"
     });
     return fresh.organization_review;
   }
@@ -1335,14 +1392,51 @@ function completedOrganizationReviewEvidence(run, content) {
   );
   const request = compactText(publicUsers.at(-1)?.content ?? "", 1600);
   const outcome = compactText(content, 3200);
-  if (!request || !outcome || !isSubstantialLearningTask(run) || secretLike(request) || secretLike(outcome)) return null;
+  if (!request || !outcome || secretLike(request) || secretLike(outcome)) return null;
+  const gate = completedOrganizationReviewGate(run, request, outcome, publicUsers.length);
+  if (!gate.eligible) return null;
   return {
     run_id: run.run_id,
     session_id: run.session_id,
     current_scope: run.workspace_id === "operator" ? "operator" : `workspace:${run.workspace_id}`,
     request,
     outcome,
-    foreground_operations: requestedActionOperations(run)
+    foreground_operations: gate.foreground_operations,
+    gate: {
+      substantial_text: gate.substantial_text,
+      meaningful_owner_action: gate.meaningful_owner_action,
+      multi_turn: gate.multi_turn,
+      goal_bound: gate.goal_bound
+    }
+  };
+}
+function completedOrganizationReviewGate(run, request, outcome, publicUserCount) {
+  const meaningfulTokens = request.match(/[\p{L}\p{N}][\p{L}\p{N}'_-]*/gu)?.length ?? 0;
+  const foregroundOperations = requestedActionOperations(run);
+  const meaningfulOwnerActions = new Set([
+    "workspace.ensure",
+    "memory.capture",
+    "skills.learning-candidate",
+    "data.structured-truth",
+    "workers.temporary",
+    "bots.permanent",
+    "automations.create"
+  ]);
+  const meaningfulOwnerAction = foregroundOperations.some((operation) => meaningfulOwnerActions.has(operation));
+  const multiTurn = Number(publicUserCount ?? 0) > 1 || Number(run.continuation?.turn ?? 0) > 1;
+  const goalBound = Boolean(run.goal_binding);
+  const substantialText =
+    request.length >= 180 &&
+    meaningfulTokens >= 28 &&
+    request.length + outcome.length >= 220;
+  const eligible = goalBound || multiTurn || meaningfulOwnerAction || substantialText;
+  return {
+    eligible,
+    substantial_text: substantialText,
+    meaningful_owner_action: meaningfulOwnerAction,
+    multi_turn: multiTurn,
+    goal_bound: goalBound,
+    foreground_operations: foregroundOperations
   };
 }
 function requestedActionOperations(run) {
