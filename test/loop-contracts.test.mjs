@@ -1399,3 +1399,105 @@ test("completed work is invisibly organized through only safe canonical owner ro
     await live.close();
   }
 });
+
+
+test("durable organization proposal resumes after restart with stable owner idempotency", async () => {
+  const f = await base();
+  const reviewHostConfig = path.join(f.root, "organization-review-recovery-host.json");
+  await writeFile(reviewHostConfig, JSON.stringify({
+    transport: "json-subprocess",
+    command: [process.execPath, organizationReviewHostFixture],
+    timeout_seconds: 10,
+    max_output_bytes: 1048576,
+    max_stderr_bytes: 65536,
+    env_names: [],
+    cwd: f.root
+  }));
+  await setupComponent({
+    home: f.home,
+    system_root: f.root,
+    host_config: reviewHostConfig,
+    runtime: "deterministic"
+  });
+
+  const store = new GatewayStore(f.home);
+  await store.init();
+  const session = await store.createSession({
+    system_id: "local",
+    workspace_id: "alpha",
+    principal: "local-user",
+    session_id: "sess-review-recovery"
+  });
+  const run = await store.createRun({
+    session_id: session.session_id,
+    system_id: "local",
+    workspace_id: "alpha",
+    principal: "local-user",
+    runtime: { kind: "deterministic", model: "fixture" },
+    messages: [{
+      role: "user",
+      content: "Persist the confirmed current Alice contact state for this ongoing Client Alpha workspace."
+    }],
+    max_turns: 1,
+    budget: { max_tokens: null, max_cost: null, max_actions: 16 },
+    deadline_at: new Date(Date.now() + 60000).toISOString()
+  });
+  run.status = "completed";
+  run.output = { content: "Foreground already completed before restart." };
+  run.completed_at = new Date().toISOString();
+  run.memory_digest = { status: "skipped", attempts: 0, updated_at: run.completed_at };
+  run.organization_review = {
+    status: "routing",
+    attempts: 1,
+    proposal: {
+      actions: [{
+        operation: "data.structured-truth",
+        action_class: "write_local_reversible",
+        reason: "Persist confirmed current structured truth.",
+        parameters: {
+          candidate: {
+            suggested_owner: "data",
+            summary: "Current Client Alpha contact status.",
+            confidence: 0.99,
+            repeated_evidence: true,
+            current_truth: true,
+            structured_operational: true,
+            contains_secret: false,
+            privacy_ambiguous: false,
+            permission_expansion: false,
+            destructive: false,
+            structure: { space: "crm", schema: "contacts" },
+            match: { field: "email", value: "alice@example.test" },
+            record: { data: { email: "alice@example.test", name: "Alice", status: "active" } }
+          }
+        }
+      }],
+      rejected: []
+    },
+    results: {},
+    updated_at: run.completed_at,
+    last_error: null
+  };
+  await store.saveRun(run);
+
+  let live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+  try {
+    let reviewed = await waitOrganizationReview(f.home, run.run_id, ["completed"]);
+    assert.equal(reviewed.organization_review.results["data.structured-truth"].state, "completed");
+    let hostState = await fspReadJson(path.join(f.root, ".fixture-organization-review.json"));
+    assert.equal(hostState.operations.filter((entry) => entry.operation === "data.structured-truth").length, 1);
+    assert.equal(
+      hostState.operations.find((entry) => entry.operation === "data.structured-truth").idempotency_key,
+      `gateway:${run.run_id}:organization-review:data.structured-truth`
+    );
+
+    await live.close();
+    live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+    reviewed = await waitOrganizationReview(f.home, run.run_id, ["completed"]);
+    assert.equal(reviewed.organization_review.status, "completed");
+    hostState = await fspReadJson(path.join(f.root, ".fixture-organization-review.json"));
+    assert.equal(hostState.operations.filter((entry) => entry.operation === "data.structured-truth").length, 1);
+  } finally {
+    await live.close();
+  }
+});
