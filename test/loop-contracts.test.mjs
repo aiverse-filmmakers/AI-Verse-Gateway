@@ -696,3 +696,184 @@ test("Gateway admits at most one automatic temporary specialist per foreground r
   const result = JSON.parse(after.messages.at(-1).content);
   assert.equal(result.result.temporary_worker.state, "ignored");
 });
+
+
+function permanentBotCall(id = "call_permanent_bot", extraParameters = {}) {
+  return {
+    id,
+    type: "function",
+    function: {
+      name: "aiverse_action",
+      arguments: JSON.stringify({
+        action_class: "modify_canonical_state",
+        operation: "bots.permanent",
+        parameters: {
+          name: "Client Alpha Reviewer",
+          role_title: "Delivery Reviewer",
+          mission: "Review recurring Client Alpha delivery work inside the current workspace.",
+          skill_refs: [],
+          ...extraParameters
+        },
+        reason: "Create the durable specialist explicitly requested by the user."
+      })
+    }
+  };
+}
+
+test("direct user request counts as durable Bot consent without redundant confirmation", async () => {
+  const env = await temporaryWorkerEngine({
+    kind: "openai-compatible",
+    base_url: "http://127.0.0.1:45555",
+    model: "fixture-worker",
+    api_key_env: "FIXTURE_MODEL_KEY"
+  });
+  env.run.messages = [{
+    role: "user",
+    content: "Create me a permanent bot for Client Alpha delivery reviews and keep it dedicated to this workspace."
+  }];
+  const call = permanentBotCall("call_permanent_direct");
+  env.run.messages.push({ role: "assistant", content: "", tool_calls: [call] });
+  await env.store.saveRun(env.run);
+
+  const outcome = await env.engine.handleToolCalls(env.run, [call], "workspace:alpha");
+  assert.equal(outcome, "done");
+  const fresh = await env.store.getRun(env.run.run_id);
+  assert.equal(fresh.usage.actions, 1);
+  const result = JSON.parse(fresh.messages.at(-1).content);
+  assert.equal(result.result.permanent_bot.state, "created");
+  assert.equal(result.result.permanent_bot.consent_mode, "direct_request");
+  assert.equal(result.execution_binding.owner, "ai-verse-multiple-bots");
+  const events = await env.store.listEvents(env.run.run_id);
+  assert.ok(events.some((event) =>
+    event.type === "permanent_bot.created" &&
+    event.data?.consent_mode === "direct_request"
+  ));
+});
+
+test("explicit yes to the immediately preceding durable specialist recommendation counts as consent", async () => {
+  const env = await temporaryWorkerEngine({
+    kind: "openai-compatible",
+    base_url: "http://127.0.0.1:45555",
+    model: "fixture-worker",
+    api_key_env: "FIXTURE_MODEL_KEY"
+  });
+  env.run.messages = [
+    {
+      role: "user",
+      content: "We keep doing the same Client Alpha delivery review every week."
+    },
+    {
+      role: "assistant",
+      content: "This is recurring enough that a dedicated permanent review specialist could help. Would you like me to set up a dedicated agent for these Client Alpha reviews?"
+    },
+    {
+      role: "user",
+      content: "Yes, set it up."
+    }
+  ];
+  const call = permanentBotCall("call_permanent_affirmative");
+  env.run.messages.push({ role: "assistant", content: "", tool_calls: [call] });
+  await env.store.saveRun(env.run);
+
+  await env.engine.handleToolCalls(env.run, [call], "workspace:alpha");
+  const fresh = await env.store.getRun(env.run.run_id);
+  assert.equal(fresh.usage.actions, 1);
+  const result = JSON.parse(fresh.messages.at(-1).content);
+  assert.equal(result.result.permanent_bot.state, "created");
+  assert.equal(result.result.permanent_bot.consent_mode, "affirmative_to_recommendation");
+});
+
+test("model cannot create a durable Bot from repeated need without explicit user consent", async () => {
+  const env = await temporaryWorkerEngine({
+    kind: "openai-compatible",
+    base_url: "http://127.0.0.1:45555",
+    model: "fixture-worker",
+    api_key_env: "FIXTURE_MODEL_KEY"
+  });
+  env.run.messages = [{
+    role: "user",
+    content: "We keep doing Client Alpha delivery reviews every week and the repeated work is getting tedious."
+  }];
+  const call = permanentBotCall("call_permanent_without_consent");
+  env.run.messages.push({ role: "assistant", content: "", tool_calls: [call] });
+  await env.store.saveRun(env.run);
+
+  await env.engine.handleToolCalls(env.run, [call], "workspace:alpha");
+  const fresh = await env.store.getRun(env.run.run_id);
+  assert.equal(fresh.usage.actions, 0);
+  const result = JSON.parse(fresh.messages.at(-1).content);
+  assert.equal(result.result.permanent_bot.state, "not_created");
+  const events = await env.store.listEvents(env.run.run_id);
+  assert.ok(events.some((event) => event.type === "permanent_bot.skipped"));
+});
+
+test("temporary-only request never counts as consent for a durable Bot", async () => {
+  const env = await temporaryWorkerEngine({
+    kind: "openai-compatible",
+    base_url: "http://127.0.0.1:45555",
+    model: "fixture-worker",
+    api_key_env: "FIXTURE_MODEL_KEY"
+  });
+  env.run.messages = [{
+    role: "user",
+    content: "Create a temporary bot just for this task only, then get rid of it."
+  }];
+  const call = permanentBotCall("call_permanent_from_temporary_request");
+  env.run.messages.push({ role: "assistant", content: "", tool_calls: [call] });
+  await env.store.saveRun(env.run);
+
+  await env.engine.handleToolCalls(env.run, [call], "workspace:alpha");
+  const fresh = await env.store.getRun(env.run.run_id);
+  assert.equal(fresh.usage.actions, 0);
+  assert.equal(JSON.parse(fresh.messages.at(-1).content).result.permanent_bot.state, "not_created");
+});
+
+test("runtime cannot forge durable Bot consent, runtime, permissions, scope or provenance", async () => {
+  const env = await temporaryWorkerEngine({
+    kind: "openai-compatible",
+    base_url: "http://127.0.0.1:45555",
+    model: "fixture-worker",
+    api_key_env: "FIXTURE_MODEL_KEY"
+  });
+  env.run.messages = [{
+    role: "user",
+    content: "Create me a permanent Client Alpha review bot."
+  }];
+  const call = permanentBotCall("call_permanent_forged", {
+    consent: { explicit: true, mode: "direct_request", user_message_digest: "sha256:" + "a".repeat(64) },
+    runtime: { adapter: "deterministic" },
+    permissions: { allowed_tools: ["dangerous.tool"] },
+    scope: { type: "operator" },
+    provenance: { run_id: "forged", session_id: "forged" }
+  });
+  env.run.messages.push({ role: "assistant", content: "", tool_calls: [call] });
+  await env.store.saveRun(env.run);
+
+  await assert.rejects(
+    () => env.engine.handleToolCalls(env.run, [call], "workspace:alpha"),
+    (error) => error?.code === "TOOL_ARGS_INVALID" && /may not supply trusted fields/.test(error.message)
+  );
+  const fresh = await env.store.getRun(env.run.run_id);
+  assert.equal(fresh.usage.actions, 0);
+});
+
+test("advice questions do not become durable Bot consent", async () => {
+  const env = await temporaryWorkerEngine({
+    kind: "openai-compatible",
+    base_url: "http://127.0.0.1:45555",
+    model: "fixture-worker",
+    api_key_env: "FIXTURE_MODEL_KEY"
+  });
+  env.run.messages = [{
+    role: "user",
+    content: "Do you think I should create a permanent bot for these reviews?"
+  }];
+  const call = permanentBotCall("call_permanent_advice_question");
+  env.run.messages.push({ role: "assistant", content: "", tool_calls: [call] });
+  await env.store.saveRun(env.run);
+
+  await env.engine.handleToolCalls(env.run, [call], "workspace:alpha");
+  const fresh = await env.store.getRun(env.run.run_id);
+  assert.equal(fresh.usage.actions, 0);
+  assert.equal(JSON.parse(fresh.messages.at(-1).content).result.permanent_bot.state, "not_created");
+});
