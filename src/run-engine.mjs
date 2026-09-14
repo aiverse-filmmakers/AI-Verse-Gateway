@@ -37,7 +37,19 @@ Historical Memory capture:
 - Set admission.durable=true and admission.historical=true only when strongly supported by the completed work/evidence.
 - Set admission.current_truth=false, contains_secret=false, strategic=false, permission_expansion=false, privacy_ambiguous=false, external_authority=false only when each statement is actually supported. If any boundary is uncertain, do not call memory.capture.
 - Do not provide source, evidence_refs, effect_id, scope, or workspace. Gateway supplies trusted run provenance/retry identity and OS binds scope before Memory admission.
-- After successful capture, continue normally. Do not announce internal Memory mechanics unless advanced inspection was requested.`;
+- After successful capture, continue normally. Do not announce internal Memory mechanics unless advanced inspection was requested.
+
+Reusable Skill learning:
+- Do not review every turn for learning. Only consider a reusable Skill after meaningful work where a procedure was actually useful, corrected, or repeated and is likely to help later.
+- Do not turn facts, preferences, current state, strategy, recurring schedules, durable employee roles, credentials, Connections, or transient one-off details into Skills.
+- Use action_class "write_local_reversible", operation "skills.learning-candidate".
+- Runtime parameters may contain only:
+  candidate: { suggested_owner:"skills", kind:"create|repair", summary, optional skill_id/target_skill_id, success_signal, failure_signal, risk, confidence, requested_capabilities, requested_dependencies, requires_connection, requires_credential, source_ownership:"agent_learned|workspace_local" }
+  skill_md: a complete bounded SKILL.md package entrypoint containing only the reusable procedure.
+- Do not provide candidate_id, scope, evidence_refs, created_at, task_evidence, approval, authorization, or trusted provenance. Gateway supplies trusted run identity/evidence and independently determines whether the task was substantial enough to route.
+- A new capability, dependency, credential, Connection, permission expansion, risky/ambiguous package, protected/user/upstream overwrite, or uncertain scope must not be silently promoted. Owner gates remain stronger than model suggestions.
+- Do not call this route merely because a procedure could hypothetically be reusable. There must be concrete evidence from the current completed work.
+- After a successful internal learning route, continue the user's work naturally. Do not expose Skill/proposal/generation jargon unless advanced inspection was requested.`;
 
 const ACTION_TOOL = {
   type: "function",
@@ -232,6 +244,30 @@ export class RunEngine {
           effect_id: `gateway:${run.run_id}:${call.id}:memory.capture`
         };
       }
+      if (args.operation === "skills.learning-candidate") {
+        if (!parameters || typeof parameters !== "object" || Array.isArray(parameters)) throw new GatewayError("TOOL_ARGS_INVALID", "skills.learning-candidate parameters must be an object");
+        const allowed = ["candidate", "skill_md"];
+        const extras = Object.keys(parameters).filter((key) => !allowed.includes(key));
+        if (extras.length) throw new GatewayError("TOOL_ARGS_INVALID", `skills.learning-candidate runtime parameters contain unsupported fields: ${extras.join(", ")}`);
+        if (!parameters.candidate || typeof parameters.candidate !== "object" || Array.isArray(parameters.candidate)) throw new GatewayError("TOOL_ARGS_INVALID", "skills.learning-candidate candidate must be an object");
+        if (typeof parameters.skill_md !== "string" || !parameters.skill_md.trim()) throw new GatewayError("TOOL_ARGS_INVALID", "skills.learning-candidate skill_md must be non-empty");
+        const forbiddenCandidate = ["candidate_id", "scope", "evidence_refs", "created_at", "task_evidence", "approval", "authorization"];
+        const suppliedTrusted = forbiddenCandidate.filter((key) => Object.hasOwn(parameters.candidate, key));
+        if (suppliedTrusted.length) throw new GatewayError("TOOL_ARGS_INVALID", `skills.learning-candidate runtime candidate may not supply trusted fields: ${suppliedTrusted.join(", ")}`);
+        parameters = {
+          candidate: {
+            ...parameters.candidate,
+            candidate_id: `learn-${run.run_id}-${call.id}`,
+            scope,
+            evidence_refs: [`run:${run.run_id}`, `session:${run.session_id}`],
+            created_at: run.created_at
+          },
+          skill_md: parameters.skill_md,
+          task_evidence: {
+            substantial_task: isSubstantialLearningTask(run)
+          }
+        };
+      }
       const request = {
         action_class: args.action_class,
         scope,
@@ -325,6 +361,22 @@ export class RunEngine {
   assertBudgetAfterUsage(run) { const b = run.budget ?? {}; const tokens = Number(run.usage.input_tokens ?? 0) + Number(run.usage.output_tokens ?? 0); if (Number.isFinite(b.max_tokens) && b.max_tokens !== null && tokens > b.max_tokens) throw new GatewayError("TOKEN_BUDGET_EXCEEDED", "Token budget exceeded", 409); if (Number.isFinite(b.max_cost) && b.max_cost !== null && run.usage.cost > b.max_cost) throw new GatewayError("COST_BUDGET_EXCEEDED", "Cost budget exceeded", 409); if (Number.isFinite(b.max_actions) && run.usage.actions > b.max_actions) throw new GatewayError("ACTION_BUDGET_EXCEEDED", "Action budget exceeded", 409); }
   async emitText(runId, text) { for (let i = 0; i < text.length; i += 256) await this.store.event(runId, "assistant.delta", { text: text.slice(i, i + 256) }); }
   async complete(run, content) { run.status = "completed"; run.output = { content }; run.completed_at = nowIso(); run.checkpoint = { phase: "completed", at: nowIso() }; await this.store.saveRun(run); await this.store.event(run.run_id, "run.completed", { usage: run.usage }); }
+}
+
+function isSubstantialLearningTask(run) {
+  const userText = run.messages
+    .filter((message) => message.role === "user" && message._gateway_continuation !== true)
+    .map((message) => typeof message.content === "string" ? message.content : JSON.stringify(message.content ?? ""))
+    .join("\n")
+    .trim();
+  const meaningfulTokens = userText.match(/[\p{L}\p{N}][\p{L}\p{N}'_-]*/gu)?.length ?? 0;
+  return Boolean(
+    run.goal_binding
+    || Number(run.usage?.actions ?? 0) > 0
+    || Number(run.continuation?.turn ?? 0) > 1
+    || userText.length >= 120
+    || meaningfulTokens >= 18
+  );
 }
 
 function stripInternal(messages) { return messages.map(({ _gateway_context, _gateway_continuation, ...m }) => m); }
