@@ -19,6 +19,9 @@ const learningRoutingFixture=path.resolve(here,"..","fixtures","learning-routing
 const learningRoutingInvalidFixture=path.resolve(here,"..","fixtures","learning-routing-invalid-runtime.mjs");
 const learnedSkillPersistenceHostFixture=path.resolve(here,"..","fixtures","learned-skill-persistence-host.mjs");
 const learnedSkillLaterUseRuntimeFixture=path.resolve(here,"..","fixtures","learned-skill-later-use-runtime.mjs");
+const dataRoutingHostFixture=path.resolve(here,"..","fixtures","data-routing-host.mjs");
+const dataRoutingRuntimeFixture=path.resolve(here,"..","fixtures","data-routing-runtime.mjs");
+const dataRoutingForgedRuntimeFixture=path.resolve(here,"..","fixtures","data-routing-forged-runtime.mjs");
 
 async function base(){const root=await mkdtemp(path.join(os.tmpdir(),"avg-loop-system-"));const home=await mkdtemp(path.join(os.tmpdir(),"avg-loop-home-"));await writeFile(path.join(root,"AI-VERSE.yaml"),"schema_version: 2.0\n");const hostConfig=path.join(root,"host.json");await writeFile(hostConfig,JSON.stringify({transport:"json-subprocess",command:[process.execPath,hostFixture],timeout_seconds:10,max_output_bytes:1048576,max_stderr_bytes:65536,env_names:[],cwd:root}));await installComponent({home});return{root,home,hostConfig};}
 async function fspReadJson(file){return JSON.parse(await readFile(file,"utf8"));}
@@ -338,6 +341,177 @@ test("a later normal run rediscovers and uses a persisted learned Skill after Ga
     assert.equal(secondDone.status, "completed");
     assert.equal(secondDone.output.content, "learned-skill-used");
     assert.equal(secondDone.usage.actions, 1);
+  } finally {
+    await live.close();
+  }
+});
+
+
+test("automatic structured Data survives restart and is read on a later normal turn", async () => {
+  const f = await base();
+  const dataHostConfig = path.join(f.root, "structured-data-host.json");
+  await writeFile(dataHostConfig, JSON.stringify({
+    transport: "json-subprocess",
+    command: [process.execPath, dataRoutingHostFixture],
+    timeout_seconds: 10,
+    max_output_bytes: 1048576,
+    max_stderr_bytes: 65536,
+    env_names: [],
+    cwd: f.root
+  }));
+  const setup = await setupComponent({
+    home: f.home,
+    system_root: f.root,
+    host_config: dataHostConfig,
+    runtime: "json-subprocess",
+    runtime_command: JSON.stringify([process.execPath, dataRoutingRuntimeFixture])
+  });
+  const sessionId = "sess-structured-data";
+  let live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+  try {
+    let baseUrl = `http://127.0.0.1:${live.port}`;
+    const first = await fetch(`${baseUrl}/v1/runs`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${setup.api_token}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "fixture",
+        messages: [{
+          role: "user",
+          content: "For Client Alpha, we have again confirmed the current contact record for Alice. Her email is alice@example.test and her active status remains current. Keep this operational information organized for the ongoing client work without asking me about backend structure."
+        }],
+        metadata: {
+          session_id: sessionId,
+          workspace_id: "alpha"
+        }
+      })
+    });
+    assert.equal(first.status, 202);
+    const firstCreated = await first.json();
+    const firstDone = await waitStatus(baseUrl, setup.api_token, firstCreated.run_id, ["completed", "failed"]);
+    assert.equal(firstDone.status, "completed");
+    assert.equal(firstDone.output.content, "structured-data-organized");
+    assert.equal(firstDone.usage.actions, 1);
+
+    await live.close();
+    live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+    baseUrl = `http://127.0.0.1:${live.port}`;
+
+    const second = await fetch(`${baseUrl}/v1/runs`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${setup.api_token}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "fixture",
+        messages: [{ role: "user", content: "What is Alice's current status?" }],
+        metadata: { session_id: sessionId }
+      })
+    });
+    assert.equal(second.status, 202);
+    const secondCreated = await second.json();
+    assert.equal(secondCreated.workspace_id, "alpha");
+    const secondDone = await waitStatus(baseUrl, setup.api_token, secondCreated.run_id, ["completed", "failed"]);
+    assert.equal(secondDone.status, "completed");
+    assert.equal(secondDone.output.content, "canonical-data-read");
+    assert.equal(secondDone.usage.actions, 1);
+  } finally {
+    await live.close();
+  }
+});
+
+test("trivial turns suppress automatic Data organization before any owner action", async () => {
+  const f = await base();
+  const dataHostConfig = path.join(f.root, "structured-data-host.json");
+  await writeFile(dataHostConfig, JSON.stringify({
+    transport: "json-subprocess",
+    command: [process.execPath, dataRoutingHostFixture],
+    timeout_seconds: 10,
+    max_output_bytes: 1048576,
+    max_stderr_bytes: 65536,
+    env_names: [],
+    cwd: f.root
+  }));
+  const setup = await setupComponent({
+    home: f.home,
+    system_root: f.root,
+    host_config: dataHostConfig,
+    runtime: "json-subprocess",
+    runtime_command: JSON.stringify([process.execPath, dataRoutingRuntimeFixture])
+  });
+  const live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+  const baseUrl = `http://127.0.0.1:${live.port}`;
+  try {
+    const r = await fetch(`${baseUrl}/v1/runs`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${setup.api_token}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "fixture",
+        messages: [{ role: "user", content: "Thanks." }],
+        metadata: { workspace_id: "alpha" }
+      })
+    });
+    assert.equal(r.status, 202);
+    const created = await r.json();
+    const done = await waitStatus(baseUrl, setup.api_token, created.run_id, ["completed", "failed"]);
+    assert.equal(done.status, "completed");
+    assert.equal(done.output.content, "data-organization-ignored");
+    assert.equal(done.usage.actions, 0);
+  } finally {
+    await live.close();
+  }
+});
+
+test("runtime cannot forge trusted automatic Data identity or provenance", async () => {
+  const f = await base();
+  const dataHostConfig = path.join(f.root, "structured-data-host.json");
+  await writeFile(dataHostConfig, JSON.stringify({
+    transport: "json-subprocess",
+    command: [process.execPath, dataRoutingHostFixture],
+    timeout_seconds: 10,
+    max_output_bytes: 1048576,
+    max_stderr_bytes: 65536,
+    env_names: [],
+    cwd: f.root
+  }));
+  const setup = await setupComponent({
+    home: f.home,
+    system_root: f.root,
+    host_config: dataHostConfig,
+    runtime: "json-subprocess",
+    runtime_command: JSON.stringify([process.execPath, dataRoutingForgedRuntimeFixture])
+  });
+  const live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+  const baseUrl = `http://127.0.0.1:${live.port}`;
+  try {
+    const r = await fetch(`${baseUrl}/v1/runs`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${setup.api_token}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "fixture",
+        messages: [{
+          role: "user",
+          content: "Review this substantial Client Alpha contact workflow, verify the current structured contact facts carefully, and organize only safe internal current truth if the evidence supports it."
+        }],
+        metadata: { workspace_id: "alpha" }
+      })
+    });
+    assert.equal(r.status, 202);
+    const created = await r.json();
+    const done = await waitStatus(baseUrl, setup.api_token, created.run_id, ["failed", "completed"]);
+    assert.equal(done.status, "failed");
+    assert.equal(done.error.code, "TOOL_ARGS_INVALID");
+    assert.match(done.error.message, /may not supply trusted fields/);
+    assert.equal(done.usage.actions, 0);
   } finally {
     await live.close();
   }
