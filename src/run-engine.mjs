@@ -93,7 +93,18 @@ Recurring responsibility recommendation:
 - Do not infer recurrence from one vague or one-off task. There must be explicit recurrence language or strong repeated evidence.
 - Phrase the recommendation in normal outcome language, for example: "I can handle this every Monday for you if you want."
 - Do not mention Automation, scheduler, cron, trigger, job, canonical state, or subsystem ownership unless advanced inspection was requested.
-- If recommendation evidence is weak or the task is clearly one-off, simply complete the current work without proposing recurring setup.`;
+- If recommendation evidence is weak or the task is clearly one-off, simply complete the current work without proposing recurring setup.
+
+Recurring responsibility creation:
+- A direct user instruction to repeat work on a schedule is already consent for that recurring responsibility. Do not ask a redundant confirmation when the cadence is fully specified.
+- A short affirmative such as "yes, set it up" counts only when it directly follows your own recommendation that included the complete cadence.
+- When explicit consent and a complete verifiable cadence exist, use action_class "modify_canonical_state", operation "automations.create".
+- Runtime parameters may contain only: name, objective, trigger.
+- trigger currently supports only recurring cron or interval definitions. For cron, include an explicit timezone. Do not invent a timezone or time the user did not provide or approve.
+- Do not provide target owner, target_ref, action_class for the future wake, consent evidence, scope, durable IDs, idempotency, approval, provenance, credentials, Connections, permissions, or scheduler state. Gateway and OS bind those trusted fields.
+- If an exact time/timezone or interval needed for correct execution is genuinely missing, ask only for that missing timing detail instead of creating a guessed schedule.
+- The recurring wake itself does not grant permission for later external effects. Scheduled work must pass normal action authorization when it runs.
+- Do not create another recurring responsibility from an Automation-triggered run unless a real user explicitly requests it in a separate foreground interaction.`;
 
 const ACTION_TOOL = {
   type: "function",
@@ -426,6 +437,43 @@ export class RunEngine {
         };
         if (!runtime || !consent || secret) parameters._gateway_permanent_bot_admitted = false;
       }
+      if (args.operation === "automations.create") {
+        if (args.action_class !== "modify_canonical_state") {
+          throw new GatewayError("TOOL_ARGS_INVALID", "automations.create requires modify_canonical_state");
+        }
+        if (!parameters || typeof parameters !== "object" || Array.isArray(parameters)) {
+          throw new GatewayError("TOOL_ARGS_INVALID", "automations.create parameters must be an object");
+        }
+        const allowed = ["name", "objective", "trigger"];
+        const extras = Object.keys(parameters).filter((key) => !allowed.includes(key));
+        if (extras.length) {
+          throw new GatewayError("TOOL_ARGS_INVALID", `automations.create runtime parameters may not supply trusted fields: ${extras.join(", ")}`);
+        }
+        for (const [key, limit] of [["name", 160], ["objective", 4000]]) {
+          if (typeof parameters[key] !== "string" || !parameters[key].trim() || parameters[key].trim().length > limit) {
+            throw new GatewayError("TOOL_ARGS_INVALID", `automations.create ${key} is invalid`);
+          }
+        }
+        const trigger = normalizeAutomationTrigger(parameters.trigger);
+        const consent = automationConsentEvidence(run, trigger);
+        const firstCreate = countOperationRequests(run, "automations.create") <= 1;
+        const secret = secretLike(stableStringify({
+          name: parameters.name,
+          objective: parameters.objective,
+          trigger
+        }));
+        parameters = {
+          name: parameters.name.trim(),
+          objective: parameters.objective.trim(),
+          trigger,
+          consent,
+          provenance: {
+            run_id: run.run_id,
+            session_id: run.session_id
+          }
+        };
+        if (!consent || !firstCreate || secret) parameters._gateway_automation_admitted = false;
+      }
       if (args.operation === "skills.learning-candidate" && parameters?.task_evidence?.substantial_task !== true) {
         const result = {
           status: "succeeded",
@@ -505,6 +553,26 @@ export class RunEngine {
         continue;
       }
       if (args.operation === "bots.permanent") delete parameters._gateway_permanent_bot_admitted;
+      if (args.operation === "automations.create" && parameters?._gateway_automation_admitted === false) {
+        const result = {
+          status: "succeeded",
+          effect_occurred: false,
+          result: {
+            automation: {
+              state: "not_created",
+              reason: "explicit_user_consent_or_verifiable_complete_schedule_missing"
+            }
+          }
+        };
+        run.messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
+        await this.store.event(run.run_id, "automation.skipped", {
+          tool_call_id: call.id,
+          reason: "consent_or_schedule_mismatch"
+        });
+        await this.store.saveRun(run);
+        continue;
+      }
+      if (args.operation === "automations.create") delete parameters._gateway_automation_admitted;
 
       const request = {
         action_class: args.action_class,
@@ -545,6 +613,16 @@ export class RunEngine {
           state: result?.result?.permanent_bot?.state ?? null,
           consent_mode: parameters?.consent?.mode ?? null,
           effect_occurred: result?.effect_occurred === true
+        });
+      }
+      if (request.operation === "automations.create") {
+        await this.store.event(run.run_id, "automation.created", {
+          tool_call_id: call.id,
+          state: result?.result?.automation?.state ?? null,
+          consent_mode: parameters?.consent?.mode ?? null,
+          effect_occurred: result?.effect_occurred === true,
+          automation_id: result?.result?.automation?.automation_id ?? null,
+          trigger_id: result?.result?.automation?.trigger_id ?? null
         });
       }
       run.usage.actions += 1;
@@ -708,6 +786,152 @@ export class RunEngine {
     for (const run of runs) await this.handoffCompletedSessionDigest(run);
     return runs.map((run) => run.run_id);
   }
+}
+
+function normalizeAutomationTrigger(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value) || !["cron", "interval"].includes(value.kind)) {
+    throw new GatewayError("TOOL_ARGS_INVALID", "automations.create trigger must be cron or interval");
+  }
+  if (!value.spec || typeof value.spec !== "object" || Array.isArray(value.spec)) {
+    throw new GatewayError("TOOL_ARGS_INVALID", "automations.create trigger spec must be an object");
+  }
+  if (value.kind === "interval") {
+    if (Object.keys(value.spec).length !== 1 || !Number.isInteger(value.spec.seconds) || value.spec.seconds < 60 || value.spec.seconds > 365 * 86400) {
+      throw new GatewayError("TOOL_ARGS_INVALID", "automations.create interval must contain only seconds between 60 and 31536000");
+    }
+    return { kind: "interval", spec: { seconds: value.spec.seconds } };
+  }
+  if (
+    Object.keys(value.spec).sort().join(",") !== "expr,timezone"
+    || typeof value.spec.expr !== "string"
+    || typeof value.spec.timezone !== "string"
+    || !value.spec.timezone.trim()
+  ) {
+    throw new GatewayError("TOOL_ARGS_INVALID", "automations.create cron requires exactly expr and explicit timezone");
+  }
+  const fields = value.spec.expr.trim().split(/\s+/);
+  if (fields.length !== 5) throw new GatewayError("TOOL_ARGS_INVALID", "automations.create cron expression must contain five fields");
+  return {
+    kind: "cron",
+    spec: {
+      expr: fields.join(" "),
+      timezone: value.spec.timezone.trim()
+    }
+  };
+}
+
+function automationConsentEvidence(run, trigger) {
+  if (run?.automation_binding) return null;
+  const messages = (run?.messages ?? []).filter((message) =>
+    ["user", "assistant"].includes(message?.role)
+    && message?._gateway_context !== true
+    && message?._gateway_continuation !== true
+  );
+  let userIndex = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]?.role === "user") {
+      userIndex = index;
+      break;
+    }
+  }
+  if (userIndex < 0) return null;
+  const userText = typeof messages[userIndex]?.content === "string"
+    ? messages[userIndex].content.trim()
+    : JSON.stringify(messages[userIndex]?.content ?? "").trim();
+  if (!userText || userText.length > 4000) return null;
+
+  const negated = /\b(?:do not|don't|dont|never|stop|cancel)\b[\s\S]{0,80}\b(?:every|each|daily|weekly|schedule|remind)\b/i.test(userText);
+  const advice = /\b(?:should i|should we|do you think|would it make sense)\b/i.test(userText);
+  const explicitImperative =
+    /^(?:please\s+)?(?:review|check|send|prepare|do|handle|run|summarize|remind|schedule|set\s+up)\b[\s\S]*\b(?:every|each|daily|weekly)\b/i.test(userText)
+    || /\b(?:can you|could you|please|i want you to|i need you to|remind me|schedule this|set this up)\b[\s\S]*\b(?:every|each|daily|weekly)\b/i.test(userText)
+    || /^(?:every|each)\b[\s\S]{0,180},\s*(?:review|check|send|prepare|do|handle|run|summarize|remind)\b/i.test(userText);
+
+  if (explicitImperative && !negated && !advice && scheduleMatchesText(userText, trigger)) {
+    return {
+      explicit: true,
+      mode: "direct_request",
+      user_message_digest: "sha256:" + createHash("sha256").update(userText).digest("hex")
+    };
+  }
+
+  const affirmative = userText.length <= 160 && /^(?:yes(?:,?\s+(?:please|set it up|do it|go ahead|schedule it|make it recurring))?|yep|yeah|do it|go ahead|set it up|schedule it|please do)[.! ]*$/i.test(userText);
+  if (!affirmative) return null;
+
+  let priorAssistant = null;
+  for (let index = userIndex - 1; index >= 0; index -= 1) {
+    if (messages[index]?.role === "assistant") {
+      priorAssistant = messages[index];
+      break;
+    }
+    if (messages[index]?.role === "user") break;
+  }
+  const recommendation = typeof priorAssistant?.content === "string"
+    ? priorAssistant.content.trim()
+    : JSON.stringify(priorAssistant?.content ?? "").trim();
+  if (!recommendation || recommendation.length > 6000) return null;
+  const recommendsRecurring =
+    /\b(?:i can|would you like me to|want me to|shall i|should i)\b/i.test(recommendation)
+    && /\b(?:every|each|daily|weekly)\b/i.test(recommendation)
+    && scheduleMatchesText(recommendation, trigger);
+  if (!recommendsRecurring) return null;
+
+  return {
+    explicit: true,
+    mode: "affirmative_to_recommendation",
+    user_message_digest: "sha256:" + createHash("sha256").update(userText).digest("hex"),
+    recommendation_message_digest: "sha256:" + createHash("sha256").update(recommendation).digest("hex")
+  };
+}
+
+function scheduleMatchesText(text, trigger) {
+  if (!trigger || !["cron", "interval"].includes(trigger.kind)) return false;
+  const source = String(text ?? "");
+  if (trigger.kind === "interval") {
+    const seconds = trigger.spec?.seconds;
+    if (!Number.isInteger(seconds)) return false;
+    const matches = [...source.matchAll(/\bevery\s+(?:(\d+)\s+)?(minute|minutes|hour|hours|day|days|week|weeks)\b/gi)];
+    return matches.some((match) => {
+      const count = match[1] ? Number(match[1]) : 1;
+      const unit = match[2].toLowerCase();
+      const multiplier = unit.startsWith("minute") ? 60
+        : unit.startsWith("hour") ? 3600
+        : unit.startsWith("day") ? 86400
+        : 7 * 86400;
+      return count * multiplier === seconds;
+    });
+  }
+
+  const expr = String(trigger.spec?.expr ?? "").trim().split(/\s+/);
+  const timezone = String(trigger.spec?.timezone ?? "").trim();
+  if (expr.length !== 5 || !timezone || !source.toLowerCase().includes(timezone.toLowerCase())) return false;
+  const [minuteRaw, hourRaw, dayOfMonth, month, weekdayRaw] = expr;
+  if (!/^\d{1,2}$/.test(minuteRaw) || !/^\d{1,2}$/.test(hourRaw) || dayOfMonth !== "*" || month !== "*") return false;
+  const minute = Number(minuteRaw), hour = Number(hourRaw);
+  if (minute < 0 || minute > 59 || hour < 0 || hour > 23) return false;
+  if (!timeMatchesText(source, hour, minute)) return false;
+
+  const weekday = weekdayRaw.toUpperCase();
+  const names = {
+    SUN: "sunday", MON: "monday", TUE: "tuesday", WED: "wednesday",
+    THU: "thursday", FRI: "friday", SAT: "saturday"
+  };
+  if (weekday === "*") return /\b(?:daily|every day|each day)\b/i.test(source);
+  if (!Object.hasOwn(names, weekday)) return false;
+  return new RegExp(`\\b(?:(?:every|each)\\s+|weekly\\s+(?:on\\s+)?)${names[weekday]}\\b`, "i").test(source);
+}
+
+function timeMatchesText(text, hour24, minute) {
+  const padded = String(minute).padStart(2, "0");
+  const hourPadded = String(hour24).padStart(2, "0");
+  const twentyFour = new RegExp(`\\b(?:at\\s+)?(?:${hour24}|${hourPadded}):${padded}\\b`, "i");
+  if (twentyFour.test(text)) return true;
+  const suffix = hour24 >= 12 ? "pm" : "am";
+  const hour12 = hour24 % 12 || 12;
+  if (minute === 0) {
+    return new RegExp(`\\b(?:at\\s+)?${hour12}(?::00)?\\s*${suffix}\\b`, "i").test(text);
+  }
+  return new RegExp(`\\b(?:at\\s+)?${hour12}:${padded}\\s*${suffix}\\b`, "i").test(text);
 }
 
 function permanentBotConsentEvidence(run) {
@@ -892,7 +1116,7 @@ function completedSessionDigest(run, content) {
     completed_at: run.completed_at ?? nowIso()
   };
 }
-function stripInternal(messages) { return messages.map(({ _gateway_context, _gateway_continuation, ...m }) => m); }
+function stripInternal(messages) { return messages.map(({ _gateway_context, _gateway_continuation, _gateway_automation_wake, ...m }) => m); }
 function lastUserText(messages) { const m = [...messages].reverse().find((x) => x.role === "user"); return typeof m?.content === "string" ? m.content : JSON.stringify(m?.content ?? ""); }
 function addUsage(target, usage = {}) { target.input_tokens += Number(usage.input_tokens ?? 0); target.output_tokens += Number(usage.output_tokens ?? 0); target.cost += Number(usage.cost ?? 0); }
 function progressFingerprint(value) { return createHash("sha256").update(stableStringify(value)).digest("hex"); }

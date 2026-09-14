@@ -84,3 +84,46 @@ jobs:
             conn.close()
           print("Recommendation left canonical Automations state untouched: PASS")
           PY
+
+  gateway-os-automations-consent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      OS_SHA: b08cc8c05c56fad7bc390f391292bdfbdd7d23e0
+      AUTOMATIONS_SHA: caaed83b98026dd955640fc015d181529b91a1c6
+
+    steps:
+      - name: Checkout Gateway under test
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Gateway dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Fetch exact accepted OS and Automations owners
+        shell: bash
+        run: |
+          set -euo pipefail
+          OS="$RUNNER_TEMP/AI-Verse-OS"
+          AUT="$RUNNER_TEMP/AI-Verse-Automations"
+          git clone https://github.com/aiverse-filmmakers/AI-Verse-OS.git "$OS"
+          git -C "$OS" checkout --detach "$OS_SHA"
+          test "$(git -C "$OS" rev-parse HEAD)" = "$OS_SHA"
+          git clone https://github.com/aiverse-filmmakers/AI-Verse-Automations.git "$AUT"
+          git -C "$AUT" checkout --detach "$AUTOMATIONS_SHA"
+          test "$(git -C "$AUT" rev-parse HEAD)" = "$AUTOMATIONS_SHA"
+          python -m pip install "$AUT"
+
+      - name: Run full recurring consent composition
+        env:
+          OS_ROOT: ${{ runner.temp }}/AI-Verse-OS
+          AUTOMATIONS_STATE: ${{ runner.temp }}/automations-state
+          HOST_CONFIG: ${{ runner.temp }}/os-host.json
+        run: node scripts/test-automation-consent-composition.mjs

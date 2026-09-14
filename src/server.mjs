@@ -43,6 +43,10 @@ async function handle(req, res, ctx) {
       const run = await createRun(req, body, identity, ctx);
       return json(res, 202, sanitizeRun(run));
     }
+    if (req.method === "POST" && url.pathname === "/v1/automations/invoke") {
+      const body = await readJsonBody(req, ctx.config.server.max_body_bytes);
+      return await automationWake(res, body, identity, ctx);
+    }
     const match = url.pathname.match(/^\/v1\/runs\/([^/]+)(?:\/(events|cancel|pause|resume|approval))?$/);
     if (match) {
       const runId = match[1], action = match[2];
@@ -114,6 +118,143 @@ async function createRun(req, body, identity, ctx) {
   await ctx.store.commitIdempotency(idem.mapKey, { run_id: run.run_id });
   await ctx.engine.start(run.run_id);
   return run;
+}
+
+async function automationWake(res, body, identity, ctx) {
+  const wake = validateAutomationWake(body);
+  const idem = await ctx.store.claimIdempotency("automation_wake", wake.invocation_id, wake);
+  if (idem.state === "replay" && idem.record.result?.run_id) {
+    const replay = await ctx.store.getRun(idem.record.result.run_id);
+    if (!replay) throw new GatewayError("AUTOMATION_WAKE_REPLAY_MISSING", "Automation wake replay points to a missing run", 409);
+    return json(res, 200, {
+      accepted: true,
+      replayed: true,
+      run_id: replay.run_id,
+      status: replay.status,
+      invocation_id: wake.invocation_id
+    });
+  }
+
+  const workspace = wake.scope === "operator" ? "operator" : wake.scope.slice("workspace:".length);
+  const systemId = ctx.config.system.id;
+  const session = await ctx.store.createSession({
+    system_id: systemId,
+    workspace_id: workspace,
+    principal: identity.principal,
+    title: `Scheduled: ${String(wake.payload.objective).slice(0, 160)}`
+  });
+  const limits = intersectBudget(ctx.config.limits, {});
+  const run = await ctx.store.createRun({
+    session_id: session.session_id,
+    system_id: systemId,
+    workspace_id: workspace,
+    principal: identity.principal,
+    runtime: {
+      kind: ctx.config.runtime.kind,
+      model: ctx.config.runtime.model ?? null
+    },
+    messages: [{
+      role: "user",
+      content: wake.payload.objective,
+      _gateway_automation_wake: true
+    }],
+    goal_binding: null,
+    automation_binding: {
+      automation_id: wake.automation_id,
+      trigger_id: wake.trigger_id,
+      invocation_id: wake.invocation_id,
+      source_kind: wake.source_kind,
+      fired_at: wake.fired_at,
+      scheduled_for: wake.scheduled_for ?? null
+    },
+    max_turns: 1,
+    budget: {
+      max_tokens: limits.max_tokens,
+      max_cost: limits.max_cost,
+      max_actions: limits.max_actions
+    },
+    deadline_at: new Date(Date.now() + limits.wall_clock_seconds * 1000).toISOString()
+  });
+  session.active_run_id = run.run_id;
+  await ctx.store.saveSession(session);
+  await ctx.store.commitIdempotency(idem.mapKey, { run_id: run.run_id });
+  await ctx.store.audit({
+    principal: identity.principal,
+    action: "automation.wake.accepted",
+    run_id: run.run_id,
+    request: {
+      automation_id: wake.automation_id,
+      trigger_id: wake.trigger_id,
+      invocation_id: wake.invocation_id,
+      scope: wake.scope,
+      source_kind: wake.source_kind
+    },
+    outcome: { status: "accepted" }
+  });
+  await ctx.engine.start(run.run_id);
+  return json(res, 202, {
+    accepted: true,
+    replayed: false,
+    run_id: run.run_id,
+    status: run.status,
+    invocation_id: wake.invocation_id
+  });
+}
+
+function validateAutomationWake(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    throw new GatewayError("AUTOMATION_WAKE_INVALID", "Automation wake must be an object", 400);
+  }
+  const allowed = new Set([
+    "schema_version", "automation_id", "trigger_id", "invocation_id", "scope",
+    "fired_at", "source_kind", "target_kind", "target_ref", "payload",
+    "scheduled_for", "event", "event_source", "event_type"
+  ]);
+  const extra = Object.keys(body).filter((key) => !allowed.has(key));
+  if (extra.length) throw new GatewayError("AUTOMATION_WAKE_INVALID", `Automation wake has unsupported fields: ${extra.join(", ")}`, 400);
+  if (body.schema_version !== "1.0") throw new GatewayError("AUTOMATION_WAKE_INVALID", "Automation wake schema_version must be 1.0", 400);
+  for (const key of ["automation_id", "trigger_id", "invocation_id"]) {
+    if (typeof body[key] !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(body[key])) {
+      throw new GatewayError("AUTOMATION_WAKE_INVALID", `Automation wake ${key} is invalid`, 400);
+    }
+  }
+  if (typeof body.scope !== "string" || !/^(operator|workspace:[a-z0-9][a-z0-9-]{0,127})$/.test(body.scope)) {
+    throw new GatewayError("AUTOMATION_WAKE_INVALID", "Automation wake scope is invalid", 400);
+  }
+  if (body.target_kind !== "gateway" || body.target_ref != null) {
+    throw new GatewayError("AUTOMATION_WAKE_INVALID", "Automation wake is not bound to this Gateway target", 400);
+  }
+  if (!["schedule", "manual", "event", "webhook"].includes(body.source_kind)) {
+    throw new GatewayError("AUTOMATION_WAKE_INVALID", "Automation wake source_kind is invalid", 400);
+  }
+  for (const key of ["fired_at", ...(body.scheduled_for == null ? [] : ["scheduled_for"])]) {
+    if (typeof body[key] !== "string" || !Number.isFinite(Date.parse(body[key]))) {
+      throw new GatewayError("AUTOMATION_WAKE_INVALID", `Automation wake ${key} is invalid`, 400);
+    }
+  }
+  if (!body.payload || typeof body.payload !== "object" || Array.isArray(body.payload)) {
+    throw new GatewayError("AUTOMATION_WAKE_INVALID", "Automation wake payload must be an object", 400);
+  }
+  const objective = body.payload.objective;
+  if (typeof objective !== "string" || !objective.trim() || objective.trim().length > 4000 || secretLikeWake(objective)) {
+    throw new GatewayError("AUTOMATION_WAKE_INVALID", "Automation wake objective is invalid", 400);
+  }
+  return {
+    ...body,
+    payload: {
+      ...body.payload,
+      objective: objective.trim()
+    }
+  };
+}
+
+function secretLikeWake(value) {
+  const text = String(value ?? "");
+  return [
+    /\b(?:password|passwd|api[_ -]?key|access[_ -]?token|refresh[_ -]?token|private[_ -]?key)\s*[:=]\s*[^\s,;]{6,}/i,
+    /\bsk-[A-Za-z0-9_-]{20,}\b/,
+    /-----BEGIN [A-Z ]*PRIVATE KEY-----/
+  ].some((pattern) => pattern.test(text));
 }
 
 async function controlRun(res, runId, action, body, identity, ctx) {
