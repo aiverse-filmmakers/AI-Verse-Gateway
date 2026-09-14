@@ -28,7 +28,8 @@ const temporaryWorkerHostFixture=path.resolve(here,"..","fixtures","temporary-wo
 const automationRecommendationFixture=path.resolve(here,"..","fixtures","automation-recommendation-runtime.mjs");
 const organizationReviewRuntimeFixture=path.resolve(here,"..","fixtures","organization-review-runtime.mjs");
 const organizationReviewHostFixture=path.resolve(here,"..","fixtures","organization-review-host.mjs");
-const reviewBudgetRuntimeFixture=path.resolve(here,"..","fixtures","review-budget-runtime.mjs");\nconst outcomeLanguageRuntimeFixture=path.resolve(here,"..","fixtures","outcome-language-runtime.mjs");
+const reviewBudgetRuntimeFixture=path.resolve(here,"..","fixtures","review-budget-runtime.mjs");
+const outcomeLanguageRuntimeFixture=path.resolve(here,"..","fixtures","outcome-language-runtime.mjs");
 
 async function base(){const root=await mkdtemp(path.join(os.tmpdir(),"avg-loop-system-"));const home=await mkdtemp(path.join(os.tmpdir(),"avg-loop-home-"));await writeFile(path.join(root,"AI-VERSE.yaml"),"schema_version: 2.0\n");const hostConfig=path.join(root,"host.json");await writeFile(hostConfig,JSON.stringify({transport:"json-subprocess",command:[process.execPath,hostFixture],timeout_seconds:10,max_output_bytes:1048576,max_stderr_bytes:65536,env_names:[],cwd:root}));await installComponent({home});return{root,home,hostConfig};}
 async function fspReadJson(file){return JSON.parse(await readFile(file,"utf8"));}
