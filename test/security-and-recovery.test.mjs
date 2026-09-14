@@ -1,14 +1,31 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, readdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { GatewayStore } from "../src/store.mjs";
 import { hashToken, verifyToken } from "../src/auth.mjs";
 import { GatewayError } from "../src/errors.mjs";
+import { atomicJson, readJson } from "../src/util.mjs";
 import { RunEngine } from "../src/run-engine.mjs";
 
 test("auth stores a one-way scrypt verifier", () => { const token="secret-fixture";const record=hashToken(token,"operator");assert.equal(record.hash.includes(token),false);assert.equal(verifyToken(token,record),true);assert.equal(verifyToken("wrong",record),false); });
+
+
+test("atomic JSON replacement serializes same-file writers and leaves one valid record", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "avg-atomic-json-"));
+  const file = path.join(home, "state", "shared.json");
+  const writes = Array.from({ length: 48 }, (_, sequence) =>
+    atomicJson(file, { schema_version: "1.0", sequence, payload: "x".repeat(64) })
+  );
+  await Promise.all(writes);
+  const saved = await readJson(file);
+  assert.equal(saved.schema_version, "1.0");
+  assert.equal(Number.isInteger(saved.sequence), true);
+  assert.ok(saved.sequence >= 0 && saved.sequence < 48);
+  const names = await readdir(path.dirname(file));
+  assert.deepEqual(names.filter((name) => name.endsWith(".tmp")), []);
+});
 
 test("idempotency rejects same operation id with changed payload", async()=>{const home=await mkdtemp(path.join(os.tmpdir(),"avg-store-"));const store=new GatewayStore(home);await store.init();await store.claimIdempotency("run","same",{a:1});await assert.rejects(()=>store.claimIdempotency("run","same",{a:2}),e=>e instanceof GatewayError&&e.code==="IDEMPOTENCY_CONFLICT");});
 
