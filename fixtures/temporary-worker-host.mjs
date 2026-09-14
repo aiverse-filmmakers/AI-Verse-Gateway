@@ -162,6 +162,56 @@ switch (input.operation) {
           }
         }
       };
+    } else if (req.operation === "automations.create") {
+      const params = req.parameters ?? {};
+      const consent = params.consent ?? {};
+      const provenance = params.provenance ?? {};
+      const trigger = params.trigger ?? {};
+      const trusted =
+        req.action_class === "modify_canonical_state" &&
+        req.scope === "workspace:alpha" &&
+        Object.keys(params).sort().join(",") === "consent,name,objective,provenance,trigger" &&
+        typeof params.name === "string" && params.name.length > 0 &&
+        typeof params.objective === "string" && params.objective.length > 0 &&
+        ["cron", "interval"].includes(trigger.kind) &&
+        trigger.spec && typeof trigger.spec === "object" &&
+        consent.explicit === true &&
+        ["direct_request", "affirmative_to_recommendation"].includes(consent.mode) &&
+        /^sha256:[a-f0-9]{64}$/.test(String(consent.user_message_digest ?? "")) &&
+        (consent.mode !== "affirmative_to_recommendation" || /^sha256:[a-f0-9]{64}$/.test(String(consent.recommendation_message_digest ?? ""))) &&
+        typeof provenance.run_id === "string" &&
+        provenance.run_id.startsWith("run_") &&
+        typeof provenance.session_id === "string" &&
+        provenance.session_id.startsWith("sess_");
+      result = trusted ? {
+        status: "succeeded",
+        effect_occurred: true,
+        result: {
+          automation: {
+            state: "created",
+            automation_id: "aut_fixture_recurring",
+            trigger_id: "trg_fixture_recurring",
+            trigger_kind: trigger.kind,
+            next_run_at: "2026-09-21T06:00:00Z",
+            consent_mode: consent.mode
+          }
+        },
+        execution_binding: {
+          owner: "ai-verse-automations",
+          request_fingerprint: req.request_fingerprint,
+          operation: req.operation,
+          scope: req.scope
+        }
+      } : {
+        status: "blocked",
+        effect_occurred: false,
+        result: {
+          automation: {
+            state: "blocked",
+            reason: "trusted recurring consent binding missing"
+          }
+        }
+      };
     } else if (req.operation === "memory.session_digest") {
       result = {
         status: "succeeded",
