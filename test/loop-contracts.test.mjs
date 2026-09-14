@@ -15,6 +15,8 @@ const goalFixture=path.resolve(here,"..","fixtures","fake-goal-owner.mjs");
 const questionPolicyFixture=path.resolve(here,"..","fixtures","question-policy-runtime.mjs");
 const workspaceRoutingFixture=path.resolve(here,"..","fixtures","workspace-routing-runtime.mjs");
 const memoryRoutingFixture=path.resolve(here,"..","fixtures","memory-routing-runtime.mjs");
+const learningRoutingFixture=path.resolve(here,"..","fixtures","learning-routing-runtime.mjs");
+const learningRoutingInvalidFixture=path.resolve(here,"..","fixtures","learning-routing-invalid-runtime.mjs");
 
 async function base(){const root=await mkdtemp(path.join(os.tmpdir(),"avg-loop-system-"));const home=await mkdtemp(path.join(os.tmpdir(),"avg-loop-home-"));await writeFile(path.join(root,"AI-VERSE.yaml"),"schema_version: 2.0\n");const hostConfig=path.join(root,"host.json");await writeFile(hostConfig,JSON.stringify({transport:"json-subprocess",command:[process.execPath,hostFixture],timeout_seconds:10,max_output_bytes:1048576,max_stderr_bytes:65536,env_names:[],cwd:root}));await installComponent({home});return{root,home,hostConfig};}
 async function fspReadJson(file){return JSON.parse(await readFile(file,"utf8"));}
@@ -145,6 +147,112 @@ test("automatic historical Memory capture uses trusted Gateway provenance and ow
     assert.equal(done.status, "completed");
     assert.equal(done.output.content, "memory-captured");
     assert.equal(done.usage.actions, 1);
+  } finally {
+    await live.close();
+  }
+});
+
+
+test("substantial completed work routes a trusted reusable procedure candidate", async () => {
+  const f = await base();
+  const setup = await setupComponent({
+    home: f.home,
+    system_root: f.root,
+    host_config: f.hostConfig,
+    runtime: "json-subprocess",
+    runtime_command: JSON.stringify([process.execPath, learningRoutingFixture])
+  });
+  const live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+  const baseUrl = `http://127.0.0.1:${live.port}`;
+  try {
+    const r = await fetch(`${baseUrl}/v1/runs`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${setup.api_token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "fixture",
+        messages: [{
+          role: "user",
+          content: "For Client Alpha, review the completed delivery against the brief, compare the final output with the earlier successful version, keep the notes concise, verify every requested item is present, and prepare the final handoff using the same proven process."
+        }],
+        metadata: { workspace_id: "alpha" }
+      })
+    });
+    assert.equal(r.status, 202);
+    const created = await r.json();
+    const done = await waitStatus(baseUrl, setup.api_token, created.run_id, ["completed", "failed"]);
+    assert.equal(done.status, "completed");
+    assert.equal(done.output.content, "learning-routed");
+    assert.equal(done.usage.actions, 1);
+  } finally {
+    await live.close();
+  }
+});
+
+test("trivial turns suppress learning before any owner action", async () => {
+  const f = await base();
+  const setup = await setupComponent({
+    home: f.home,
+    system_root: f.root,
+    host_config: f.hostConfig,
+    runtime: "json-subprocess",
+    runtime_command: JSON.stringify([process.execPath, learningRoutingFixture])
+  });
+  const live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+  const baseUrl = `http://127.0.0.1:${live.port}`;
+  try {
+    const r = await fetch(`${baseUrl}/v1/runs`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${setup.api_token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "fixture",
+        messages: [{ role: "user", content: "Thanks." }],
+        metadata: { workspace_id: "alpha" }
+      })
+    });
+    assert.equal(r.status, 202);
+    const created = await r.json();
+    const done = await waitStatus(baseUrl, setup.api_token, created.run_id, ["completed", "failed"]);
+    assert.equal(done.status, "completed");
+    assert.equal(done.output.content, "learning-ignored");
+    assert.equal(done.usage.actions, 0);
+    const events = await fspReadJson(path.join(f.home, "state", "runs", `${created.run_id}.json`));
+    assert.equal(events.status, "completed");
+  } finally {
+    await live.close();
+  }
+});
+
+test("runtime cannot forge trusted learning candidate identity or provenance", async () => {
+  const f = await base();
+  const setup = await setupComponent({
+    home: f.home,
+    system_root: f.root,
+    host_config: f.hostConfig,
+    runtime: "json-subprocess",
+    runtime_command: JSON.stringify([process.execPath, learningRoutingInvalidFixture])
+  });
+  const live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+  const baseUrl = `http://127.0.0.1:${live.port}`;
+  try {
+    const r = await fetch(`${baseUrl}/v1/runs`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${setup.api_token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "fixture",
+        messages: [{
+          role: "user",
+          content: "Complete a detailed reusable review process for this delivery, verify each step carefully, compare the result against prior evidence, and preserve only a safe internal procedure if the work genuinely proves one."
+        }],
+        metadata: { workspace_id: "alpha" }
+      })
+    });
+    assert.equal(r.status, 202);
+    const created = await r.json();
+    const done = await waitStatus(baseUrl, setup.api_token, created.run_id, ["failed", "completed"]);
+    assert.equal(done.status, "failed");
+    assert.equal(done.error.code, "TOOL_ARGS_INVALID");
+    assert.match(done.error.message, /may not supply trusted fields/);
+    assert.equal(done.usage.actions, 0);
   } finally {
     await live.close();
   }
