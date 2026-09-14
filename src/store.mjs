@@ -119,6 +119,21 @@ export class GatewayStore {
     pending.sort((a, b) => String(a.completed_at ?? "").localeCompare(String(b.completed_at ?? "")));
     return pending;
   }
+  async pendingOrganizationReviewRuns() {
+    let names = [];
+    try { names = await readdir(this.p.runs); } catch { return []; }
+    const pending = [];
+    for (const name of names) {
+      if (!name.endsWith(".json")) continue;
+      const run = await readJson(path.join(this.p.runs, name), null);
+      if (
+        run?.status === "completed" &&
+        ["pending", "retryable", "routing"].includes(run?.organization_review?.status)
+      ) pending.push(run);
+    }
+    pending.sort((a, b) => String(a.completed_at ?? "").localeCompare(String(b.completed_at ?? "")));
+    return pending;
+  }
   async recoverInterrupted() {
     let names = [];
     try { names = await readdir(this.p.runs); } catch { return []; }
