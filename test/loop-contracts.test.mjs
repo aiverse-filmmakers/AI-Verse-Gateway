@@ -12,6 +12,7 @@ const here=path.dirname(fileURLToPath(import.meta.url));
 const hostFixture=path.resolve(here,"..","fixtures","fake-host.mjs");
 const runtimeFixture=path.resolve(here,"..","fixtures","fake-runtime.mjs");
 const goalFixture=path.resolve(here,"..","fixtures","fake-goal-owner.mjs");
+const questionPolicyFixture=path.resolve(here,"..","fixtures","question-policy-runtime.mjs");
 
 async function base(){const root=await mkdtemp(path.join(os.tmpdir(),"avg-loop-system-"));const home=await mkdtemp(path.join(os.tmpdir(),"avg-loop-home-"));await writeFile(path.join(root,"AI-VERSE.yaml"),"schema_version: 2.0\n");const hostConfig=path.join(root,"host.json");await writeFile(hostConfig,JSON.stringify({transport:"json-subprocess",command:[process.execPath,hostFixture],timeout_seconds:10,max_output_bytes:1048576,max_stderr_bytes:65536,env_names:[],cwd:root}));await installComponent({home});return{root,home,hostConfig};}
 async function waitStatus(baseUrl,token,runId,wanted,timeout=5000){const end=Date.now()+timeout;while(Date.now()<end){const r=await fetch(`${baseUrl}/v1/runs/${runId}`,{headers:{authorization:`Bearer ${token}`}});const body=await r.json();if(wanted.includes(body.status))return body;await new Promise(r=>setTimeout(r,25));}throw new Error(`timeout waiting for ${wanted}`);}
@@ -19,3 +20,31 @@ async function waitStatus(baseUrl,token,runId,wanted,timeout=5000){const end=Dat
 test("approval interrupt reauthorizes before tool execution and resumes from checkpoint",async()=>{const f=await base();const setup=await setupComponent({home:f.home,system_root:f.root,host_config:f.hostConfig,runtime:"json-subprocess",runtime_command:JSON.stringify([process.execPath,runtimeFixture])});const live=await startServer(await loadConfig(f.home),f.home,{port:0});const baseUrl=`http://127.0.0.1:${live.port}`;try{const r=await fetch(`${baseUrl}/v1/runs`,{method:"POST",headers:{authorization:`Bearer ${setup.api_token}`,"content-type":"application/json"},body:JSON.stringify({model:"fixture",messages:[{role:"user",content:"use the fixture tool"}]})});assert.equal(r.status,202);const created=await r.json();const pending=await waitStatus(baseUrl,setup.api_token,created.run_id,["awaiting_approval"]);assert.equal(pending.pending_approval.authorization.approval_required,true);const approved=await fetch(`${baseUrl}/v1/runs/${created.run_id}/approval`,{method:"POST",headers:{authorization:`Bearer ${setup.api_token}`,"content-type":"application/json"},body:JSON.stringify({operation_id:"approve-1",decision:"approve"})});assert.equal(approved.status,200);const done=await waitStatus(baseUrl,setup.api_token,created.run_id,["completed"]);assert.equal(done.output.content,"approved tool completed");assert.equal(done.usage.actions,1);}finally{await live.close();}});
 
 test("Goal-bound run reads and evaluates through Brain owner adapter without storing Goal truth",async()=>{const f=await base();const goalConfig=path.join(f.root,"goal-owner.json");await writeFile(goalConfig,JSON.stringify({transport:"json-subprocess",command:[process.execPath,goalFixture],timeout_seconds:10,max_output_bytes:1048576,max_stderr_bytes:65536,env_names:[],cwd:f.root}));const setup=await setupComponent({home:f.home,system_root:f.root,host_config:f.hostConfig,goal_owner_config:goalConfig,runtime:"deterministic"});const live=await startServer(await loadConfig(f.home),f.home,{port:0});const baseUrl=`http://127.0.0.1:${live.port}`;try{const r=await fetch(`${baseUrl}/v1/runs`,{method:"POST",headers:{authorization:`Bearer ${setup.api_token}`,"content-type":"application/json"},body:JSON.stringify({model:"aiverse",messages:[{role:"user",content:"finish goal"}],metadata:{workspace_id:"alpha",goal_id:"goal_fixture"}})});assert.equal(r.status,202);const created=await r.json();const done=await waitStatus(baseUrl,setup.api_token,created.run_id,["completed","failed"]);assert.equal(done.status,"completed");assert.deepEqual(done.goal_binding,{goal_id:"goal_fixture",version:1,activation_epoch:1});}finally{await live.close();}});
+
+
+test("runtime receives the natural-language question gate without replacing host authority", async () => {
+  const f = await base();
+  const setup = await setupComponent({
+    home: f.home,
+    system_root: f.root,
+    host_config: f.hostConfig,
+    runtime: "json-subprocess",
+    runtime_command: JSON.stringify([process.execPath, questionPolicyFixture])
+  });
+  const live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+  const baseUrl = `http://127.0.0.1:${live.port}`;
+  try {
+    const r = await fetch(`${baseUrl}/v1/runs`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${setup.api_token}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "fixture", messages: [{ role: "user", content: "organize this safely without technical questions" }] })
+    });
+    assert.equal(r.status, 202);
+    const created = await r.json();
+    const done = await waitStatus(baseUrl, setup.api_token, created.run_id, ["completed", "failed"]);
+    assert.equal(done.status, "completed");
+    assert.equal(done.output.content, "question-policy-ok");
+  } finally {
+    await live.close();
+  }
+});
