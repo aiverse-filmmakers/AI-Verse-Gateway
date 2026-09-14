@@ -341,7 +341,7 @@ export class RunEngine {
     } else {
       run.memory_digest = {
         status: "skipped",
-        reason: "completed run did not meet the conservative meaningful-session threshold",
+        reason: "completed run did not qualify for a safe compact session digest",
         attempts: Number(run.memory_digest?.attempts ?? 0),
         updated_at: run.completed_at
       };
