@@ -764,20 +764,20 @@ export class RunEngine {
       updated_at: nowIso(),
       last_error: null
     };
-    const evidence = prepared ?? completedOrganizationReviewEvidence(fresh, fresh.output?.content ?? "");
-    if (!evidence) {
-      fresh.organization_review = {
-        ...review,
-        status: "skipped",
-        reason: "completed run did not qualify for bounded organization review",
-        updated_at: nowIso(),
-        last_error: null
-      };
-      await this.store.saveRun(fresh);
-      return null;
-    }
-
+    let evidence = prepared ?? null;
     if (!review.proposal) {
+      evidence = evidence ?? completedOrganizationReviewEvidence(fresh, fresh.output?.content ?? "");
+      if (!evidence) {
+        fresh.organization_review = {
+          ...review,
+          status: "skipped",
+          reason: "completed run did not qualify for bounded organization review",
+          updated_at: nowIso(),
+          last_error: null
+        };
+        await this.store.saveRun(fresh);
+        return null;
+      }
       const attempts = Number(review.attempts ?? 0) + 1;
       try {
         const result = await this.runtime.invoke({
@@ -790,6 +790,18 @@ export class RunEngine {
           tools: [ACTION_TOOL]
         });
         const proposal = normalizeOrganizationReviewProposal(result?.tool_calls ?? []);
+        const foregroundOperations = new Set(requestedActionOperations(fresh));
+        if (foregroundOperations.size) {
+          const retained = [];
+          for (const action of proposal.actions) {
+            if (foregroundOperations.has(action.operation)) {
+              proposal.rejected.push({ operation: action.operation, reason: "already_routed_foreground" });
+            } else {
+              retained.push(action);
+            }
+          }
+          proposal.actions = retained;
+        }
         fresh = await this.store.getRun(run.run_id);
         if (!fresh || fresh.status !== "completed") return null;
         review = {
