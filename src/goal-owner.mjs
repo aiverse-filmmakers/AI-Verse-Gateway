@@ -15,5 +15,5 @@ export class GoalOwnerClient {
     return envelope.result;
   }
   get(goalId, scope, signal) { return this.call("goal.get", { goal_id: goalId, scope }, signal); }
-  evaluate(goalId, expectedVersion, evidence, signal) { return this.call("goal.evaluate", { goal_id: goalId, expected_version: expectedVersion, evidence }, signal); }
+  evaluate(goalId, scope, expectedVersion, evidence, signal) { return this.call("goal.evaluate", { goal_id: goalId, scope, expected_version: expectedVersion, evidence }, signal); }
 }
