@@ -1,0 +1,264 @@
+name: Invisible Intelligence Permanent Bot Composition
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gateway-os-bots-consent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      OS_SHA: c13d3ca858f887b3ceac690544819ccc55e9d5b0
+      BOTS_SHA: c600e2bc014351a61e1c0e2673fc63f5d5fa54ec
+
+    steps:
+      - name: Checkout Gateway under test
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Gateway dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Fetch exact accepted owners
+        shell: bash
+        run: |
+          set -euo pipefail
+          OS="$RUNNER_TEMP/AI-Verse-OS"
+          BOTS="$RUNNER_TEMP/AI-Verse-Multiple-Bots"
+          git clone https://github.com/aiverse-filmmakers/AI-Verse-OS.git "$OS"
+          git -C "$OS" checkout --detach "$OS_SHA"
+          test "$(git -C "$OS" rev-parse HEAD)" = "$OS_SHA"
+          git clone https://github.com/aiverse-filmmakers/AI-Verse-Multiple-Bots.git "$BOTS"
+          git -C "$BOTS" checkout --detach "$BOTS_SHA"
+          test "$(git -C "$BOTS" rev-parse HEAD)" = "$BOTS_SHA"
+          npm --prefix "$BOTS" install --no-audit --no-fund
+          npm --prefix "$BOTS" run build
+          printf '%s' "$OS" > "$RUNNER_TEMP/os-repo.txt"
+          printf '%s' "$BOTS" > "$RUNNER_TEMP/bots-repo.txt"
+
+      - name: Prepare real OS workspace and Multiple Bots extension
+        shell: bash
+        run: |
+          set -euo pipefail
+          OS="$(cat "$RUNNER_TEMP/os-repo.txt")"
+          BOTS="$(cat "$RUNNER_TEMP/bots-repo.txt")"
+          mkdir -p "$OS/workspaces/alpha/context"
+          cat > "$OS/workspaces/alpha/WORKSPACE.yaml" <<'YAML'
+          schema_version: "2.0"
+          id: alpha
+          name: Alpha
+          type: project
+          status: active
+          purpose: Permanent Bot consent composition acceptance.
+          domains: []
+          owners: []
+          success_criteria: []
+          canonical_sources: []
+          connections: []
+          current_context: context/CURRENT.md
+          YAML
+          cat > "$OS/workspaces/alpha/context/CURRENT.md" <<'MD'
+          # Current Workspace Context
+
+          ## Objective
+
+          Maintain Client Alpha delivery quality.
+
+          ## Current state
+
+          Recurring delivery review work is active.
+          MD
+
+          BOTS="$BOTS" OS="$OS" node --input-type=module <<'NODE'
+          const mod = await import(process.env.BOTS + "/dist/src/ai-verse-os-install.js");
+          const result = mod.installAiVerseOsExtension(process.env.OS);
+          if (!["installed", "unchanged"].includes(result.status)) throw new Error("Multiple Bots install failed");
+          NODE
+
+          python "$OS/scripts/ai_verse_host_adapter.py" \
+            --root "$OS" \
+            --write-config "$RUNNER_TEMP/os-host.json"
+
+      - name: Drive direct consent through Gateway into real owners
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { mkdtemp } from "node:fs/promises";
+          import os from "node:os";
+          import path from "node:path";
+          import { GatewayStore } from "./src/store.mjs";
+          import { RunEngine } from "./src/run-engine.mjs";
+
+          const home = await mkdtemp(path.join(os.tmpdir(), "gateway-permanent-bot-composed-"));
+          const store = new GatewayStore(home);
+          await store.init();
+          const config = {
+            host_adapter_config: process.env.RUNNER_TEMP + "/os-host.json",
+            goal_owner_config: null,
+            runtime: { kind: "deterministic" },
+            limits: {
+              max_goal_continuation_turns: 20,
+              no_progress_threshold: 2,
+              wall_clock_seconds: 120,
+              max_actions: 4,
+              max_tokens: 6000,
+              max_cost: null
+            }
+          };
+          const engine = new RunEngine({ store, config });
+          const session = await store.createSession({
+            system_id: "local",
+            workspace_id: "alpha",
+            principal: "operator"
+          });
+
+          const createRun = await store.createRun({
+            session_id: session.session_id,
+            system_id: "local",
+            workspace_id: "alpha",
+            principal: "operator",
+            runtime: { kind: "deterministic", model: "aiverse" },
+            messages: [{
+              role: "user",
+              content: "Create me a permanent bot for Client Alpha delivery reviews and keep it dedicated to this workspace."
+            }],
+            max_turns: 1,
+            budget: { max_tokens: 6000, max_cost: null, max_actions: 4 },
+            deadline_at: new Date(Date.now() + 120000).toISOString()
+          });
+          const createCall = {
+            id: "call_composed_permanent_bot",
+            type: "function",
+            function: {
+              name: "aiverse_action",
+              arguments: JSON.stringify({
+                action_class: "modify_canonical_state",
+                operation: "bots.permanent",
+                parameters: {
+                  name: "Client Alpha Reviewer",
+                  role_title: "Delivery Reviewer",
+                  mission: "Review recurring Client Alpha delivery work inside the current workspace.",
+                  skill_refs: []
+                },
+                reason: "Create the durable specialist explicitly requested by the user."
+              })
+            }
+          };
+          createRun.messages.push({ role: "assistant", content: "", tool_calls: [createCall] });
+          await store.saveRun(createRun);
+          const createOutcome = await engine.handleToolCalls(createRun, [createCall], "workspace:alpha");
+          if (createOutcome !== "done") throw new Error("Gateway permanent Bot action did not complete");
+          const created = await store.getRun(createRun.run_id);
+          const createTool = JSON.parse(created.messages.at(-1).content);
+          if (createTool?.status !== "succeeded" || createTool?.result?.permanent_bot?.state !== "created") {
+            throw new Error("explicit direct consent did not create the canonical durable Bot");
+          }
+          if (createTool?.result?.permanent_bot?.consent_mode !== "direct_request") {
+            throw new Error("direct-request consent provenance was not preserved");
+          }
+          if (createTool?.execution_binding?.owner !== "ai-verse-multiple-bots") {
+            throw new Error("Multiple Bots owner binding missing");
+          }
+          if (created.usage.actions !== 1) throw new Error("Gateway durable Bot action accounting is incorrect");
+
+          const noConsentRun = await store.createRun({
+            session_id: session.session_id,
+            system_id: "local",
+            workspace_id: "alpha",
+            principal: "operator",
+            runtime: { kind: "deterministic", model: "aiverse" },
+            messages: [{
+              role: "user",
+              content: "We keep doing Client Alpha delivery reviews every week and this repeated work is getting tedious."
+            }],
+            max_turns: 1,
+            budget: { max_tokens: 6000, max_cost: null, max_actions: 4 },
+            deadline_at: new Date(Date.now() + 120000).toISOString()
+          });
+          const noConsentCall = {
+            id: "call_composed_permanent_bot_without_consent",
+            type: "function",
+            function: {
+              name: "aiverse_action",
+              arguments: JSON.stringify({
+                action_class: "modify_canonical_state",
+                operation: "bots.permanent",
+                parameters: {
+                  name: "Unauthorized Reviewer",
+                  role_title: "Delivery Reviewer",
+                  mission: "Review recurring Client Alpha delivery work.",
+                  skill_refs: []
+                },
+                reason: "The model thinks a durable specialist would be useful."
+              })
+            }
+          };
+          noConsentRun.messages.push({ role: "assistant", content: "", tool_calls: [noConsentCall] });
+          await store.saveRun(noConsentRun);
+          const noConsentOutcome = await engine.handleToolCalls(noConsentRun, [noConsentCall], "workspace:alpha");
+          if (noConsentOutcome !== "done") throw new Error("no-consent suppression did not complete normally");
+          const suppressed = await store.getRun(noConsentRun.run_id);
+          const suppressedTool = JSON.parse(suppressed.messages.at(-1).content);
+          if (suppressedTool?.result?.permanent_bot?.state !== "not_created") {
+            throw new Error("repeated need without explicit consent crossed the durable boundary");
+          }
+          if (suppressed.usage.actions !== 0) throw new Error("suppressed durable Bot request reached the host owner");
+
+          console.log("Gateway explicit consent and no-consent suppression: PASS");
+          NODE
+
+      - name: Prove exactly one conservative canonical durable Bot
+        shell: bash
+        run: |
+          set -euo pipefail
+          OS="$(cat "$RUNNER_TEMP/os-repo.txt")"
+          BOTS="$(cat "$RUNNER_TEMP/bots-repo.txt")"
+          OS="$OS" BOTS="$BOTS" node --input-type=module <<'NODE'
+          import path from "node:path";
+          const { CoordinationStore } = await import(process.env.BOTS + "/dist/src/store.js");
+          const store = new CoordinationStore(path.join(process.env.OS, "runtime", "ai-verse-bots", "coordination.db"));
+          try {
+            const bots = store.listObjects("bot", "alpha");
+            const workers = store.listObjects("worker", "alpha");
+            if (bots.length !== 1) throw new Error("consent composition did not leave exactly one durable Bot");
+            if (workers.length !== 0) throw new Error("permanent Bot path unexpectedly created a temporary Worker");
+            const bot = bots[0];
+            if (bot.payload.kind !== "durable" || bot.payload.status !== "active") {
+              throw new Error("canonical identity is not an active durable Bot");
+            }
+            if (bot.payload.scope?.type !== "workspace" || bot.payload.scope?.workspace_id !== "alpha") {
+              throw new Error("durable Bot escaped the requested workspace");
+            }
+            const permissions = bot.payload.permissions ?? {};
+            if (
+              JSON.stringify(permissions.allowed_tools) !== "[]" ||
+              JSON.stringify(permissions.allowed_connections) !== "[]" ||
+              JSON.stringify(permissions.allowed_peers) !== "[]" ||
+              permissions.can_create_workers !== false ||
+              permissions.can_handoff !== false
+            ) {
+              throw new Error("durable Bot silently gained authority");
+            }
+            if (bot.payload.lifecycle?.created_via !== "gateway_explicit_consent") {
+              throw new Error("Gateway consent provenance is missing from canonical Bot state");
+            }
+            if (bot.payload.lifecycle?.consent?.mode !== "direct_request") {
+              throw new Error("canonical Bot does not preserve direct consent mode");
+            }
+            console.log("Gateway -> OS -> Multiple Bots permanent consent composition: PASS");
+          } finally {
+            store.close();
+          }
+          NODE
