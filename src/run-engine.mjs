@@ -106,6 +106,18 @@ Recurring responsibility creation:
 - The recurring wake itself does not grant permission for later external effects. Scheduled work must pass normal action authorization when it runs.
 - Do not create another recurring responsibility from an Automation-triggered run unless a real user explicitly requests it in a separate foreground interaction.`;
 
+
+const ORGANIZATION_REVIEW_POLICY = `Invisible completed-work organization review:
+- This is a bounded internal post-run review after the foreground answer is already complete.
+- Return no user-facing explanation. Use aiverse_action only when completed-work evidence strongly supports safe internal organization.
+- The only admitted operations are workspace.ensure, memory.capture, skills.learning-candidate, and data.structured-truth.
+- Every admitted action must use action_class "write_local_reversible".
+- At most one action per admitted operation.
+- Never request workers.temporary, bots.permanent, automations.create, credentials, Connections, permission/scope expansion, external effects, strategic authority transfer, or destructive/irreversible mutation.
+- Never manufacture approval or consent. If an owner would require approval, the review must leave that action undone.
+- Prefer no action over weak evidence. Owner authorization and canonical owner validation remain stronger than this review.
+- Use only the bounded completed-work evidence supplied below. Do not assume hidden facts.`;
+
 const ACTION_TOOL = {
   type: "function",
   function: {
@@ -699,6 +711,7 @@ export class RunEngine {
     run.completed_at = nowIso();
     run.checkpoint = { phase: "completed", at: run.completed_at };
     const digest = completedSessionDigest(run, content);
+    const organizationEvidence = completedOrganizationReviewEvidence(run, content);
     if (digest) {
       const priorAttempts = Number(run.memory_digest?.attempts ?? 0);
       run.memory_digest = {
@@ -715,10 +728,240 @@ export class RunEngine {
         updated_at: run.completed_at
       };
     }
+    if (organizationEvidence) {
+      run.organization_review = {
+        status: "pending",
+        attempts: Number(run.organization_review?.attempts ?? 0),
+        proposal: run.organization_review?.proposal ?? null,
+        results: run.organization_review?.results ?? {},
+        updated_at: run.completed_at,
+        last_error: null
+      };
+    } else {
+      run.organization_review = {
+        status: "skipped",
+        reason: "completed run did not qualify for bounded organization review",
+        attempts: Number(run.organization_review?.attempts ?? 0),
+        proposal: null,
+        results: {},
+        updated_at: run.completed_at,
+        last_error: null
+      };
+    }
     await this.store.saveRun(run);
     await this.store.event(run.run_id, "run.completed", { usage: run.usage });
     if (digest) await this.handoffCompletedSessionDigest(run, digest);
+    if (organizationEvidence) await this.reviewCompletedRunOrganization(run, organizationEvidence);
   }
+  async reviewCompletedRunOrganization(run, prepared = null) {
+    let fresh = await this.store.getRun(run.run_id);
+    if (!fresh || fresh.status !== "completed") return null;
+    let review = fresh.organization_review ?? {
+      status: "pending",
+      attempts: 0,
+      proposal: null,
+      results: {},
+      updated_at: nowIso(),
+      last_error: null
+    };
+    let evidence = prepared ?? null;
+    if (!review.proposal) {
+      evidence = evidence ?? completedOrganizationReviewEvidence(fresh, fresh.output?.content ?? "");
+      if (!evidence) {
+        fresh.organization_review = {
+          ...review,
+          status: "skipped",
+          reason: "completed run did not qualify for bounded organization review",
+          updated_at: nowIso(),
+          last_error: null
+        };
+        await this.store.saveRun(fresh);
+        return null;
+      }
+      const attempts = Number(review.attempts ?? 0) + 1;
+      try {
+        const result = await this.runtime.invoke({
+          run_id: fresh.run_id + ":organization-review",
+          model: fresh.runtime?.model,
+          messages: [
+            { role: "system", content: ORGANIZATION_REVIEW_POLICY },
+            { role: "user", content: "Completed-work evidence:\n" + JSON.stringify(evidence) }
+          ],
+          tools: [ACTION_TOOL]
+        });
+        const proposal = normalizeOrganizationReviewProposal(result?.tool_calls ?? []);
+        const foregroundOperations = new Set(requestedActionOperations(fresh));
+        if (foregroundOperations.size) {
+          const retained = [];
+          for (const action of proposal.actions) {
+            if (foregroundOperations.has(action.operation)) {
+              proposal.rejected.push({ operation: action.operation, reason: "already_routed_foreground" });
+            } else {
+              retained.push(action);
+            }
+          }
+          proposal.actions = retained;
+        }
+        fresh = await this.store.getRun(run.run_id);
+        if (!fresh || fresh.status !== "completed") return null;
+        review = {
+          ...(fresh.organization_review ?? review),
+          status: "routing",
+          attempts,
+          proposal,
+          results: fresh.organization_review?.results ?? {},
+          runtime_usage: {
+            input_tokens: Number(result?.usage?.input_tokens ?? 0),
+            output_tokens: Number(result?.usage?.output_tokens ?? 0),
+            cost: Number(result?.usage?.cost ?? 0)
+          },
+          updated_at: nowIso(),
+          last_error: null
+        };
+        fresh.organization_review = review;
+        await this.store.saveRun(fresh);
+        await this.store.event(fresh.run_id, "organization.review.classified", {
+          admitted_operations: proposal.actions.map((action) => action.operation),
+          rejected_count: proposal.rejected.length,
+          attempt: attempts
+        });
+      } catch (error) {
+        const e = asGatewayError(error);
+        fresh = await this.store.getRun(run.run_id);
+        if (fresh) {
+          fresh.organization_review = {
+            ...(fresh.organization_review ?? review),
+            status: "retryable",
+            attempts,
+            updated_at: nowIso(),
+            last_error: { code: e.code, message: e.message }
+          };
+          await this.store.saveRun(fresh);
+          await this.store.event(fresh.run_id, "organization.review.failed", {
+            phase: "classify",
+            code: e.code,
+            message: e.message,
+            attempt: attempts
+          });
+        }
+        return null;
+      }
+    }
+
+    fresh = await this.store.getRun(run.run_id);
+    if (!fresh || fresh.status !== "completed") return null;
+    review = fresh.organization_review ?? review;
+    const proposal = review.proposal ?? { actions: [], rejected: [] };
+    const results = { ...(review.results ?? {}) };
+    let scope = fresh.workspace_id === "operator" ? "operator" : `workspace:${fresh.workspace_id}`;
+
+    const priorWorkspace = results["workspace.ensure"];
+    if (priorWorkspace?.workspace_id) scope = `workspace:${priorWorkspace.workspace_id}`;
+
+    for (const action of proposal.actions ?? []) {
+      const operation = action.operation;
+      if (results[operation]) continue;
+      try {
+        const parameters = prepareOrganizationReviewParameters(fresh, operation, action.parameters, scope);
+        if (operation === "data.structured-truth" && !scope.startsWith("workspace:")) {
+          results[operation] = { state: "skipped", reason: "workspace_scope_required" };
+          await this.store.event(fresh.run_id, "organization.review.action_skipped", { operation, reason: "workspace_scope_required" });
+          fresh.organization_review = { ...review, status: "routing", results, updated_at: nowIso() };
+          await this.store.saveRun(fresh);
+          continue;
+        }
+
+        const request = {
+          action_class: "write_local_reversible",
+          scope,
+          operation,
+          parameters,
+          idempotency_key: `gateway:${fresh.run_id}:organization-review:${operation}`,
+          in_scope: true,
+          within_budget: true,
+          reversible: true,
+          reason: action.reason || "Safely organize completed work through the canonical owner."
+        };
+        request.request_fingerprint = actionFingerprint(request);
+        const authorization = await this.host.authorizeAction(request);
+        if (isDenied(authorization)) {
+          results[operation] = { state: "skipped", reason: "owner_denied" };
+          await this.store.event(fresh.run_id, "organization.review.action_skipped", { operation, reason: "owner_denied" });
+        } else if (needsApproval(authorization)) {
+          results[operation] = { state: "skipped", reason: "approval_required" };
+          await this.store.event(fresh.run_id, "organization.review.action_skipped", { operation, reason: "approval_required" });
+        } else {
+          const ownerResult = await this.host.requestAction(request);
+          if (ownerResult?.status !== "succeeded") {
+            results[operation] = {
+              state: "refused",
+              owner_status: ownerResult?.status ?? null,
+              effect_occurred: ownerResult?.effect_occurred === true
+            };
+          } else {
+            let workspaceId = null;
+            if (operation === "workspace.ensure") {
+              const organized = ownerResult?.result?.workspace_organization;
+              workspaceId = organized?.workspace?.id ?? null;
+              if (!organized || !["created", "evolved", "existing"].includes(organized.state) || !workspaceId) {
+                throw new GatewayError("ORGANIZATION_OWNER_RESULT_INVALID", "Workspace owner returned an invalid organization result", 502);
+              }
+              await this.applyWorkspaceOrganization(fresh, scope, ownerResult);
+              scope = `workspace:${workspaceId}`;
+            }
+            results[operation] = {
+              state: "completed",
+              owner_status: ownerResult.status,
+              effect_occurred: ownerResult?.effect_occurred === true,
+              ...(workspaceId ? { workspace_id: workspaceId } : {})
+            };
+          }
+          await this.store.event(fresh.run_id, "organization.review.action_completed", {
+            operation,
+            state: results[operation].state,
+            effect_occurred: results[operation].effect_occurred === true
+          });
+        }
+      } catch (error) {
+        const e = asGatewayError(error);
+        results[operation] = { state: "failed", code: e.code, message: e.message };
+        await this.store.event(fresh.run_id, "organization.review.action_failed", {
+          operation,
+          code: e.code,
+          message: e.message
+        });
+      }
+      fresh = await this.store.getRun(run.run_id);
+      if (!fresh || fresh.status !== "completed") return null;
+      review = fresh.organization_review ?? review;
+      fresh.organization_review = { ...review, status: "routing", results, updated_at: nowIso(), last_error: null };
+      await this.store.saveRun(fresh);
+    }
+
+    fresh = await this.store.getRun(run.run_id);
+    if (!fresh || fresh.status !== "completed") return null;
+    fresh.organization_review = {
+      ...(fresh.organization_review ?? review),
+      status: "completed",
+      results,
+      completed_at: nowIso(),
+      updated_at: nowIso(),
+      last_error: null
+    };
+    await this.store.saveRun(fresh);
+    await this.store.event(fresh.run_id, "organization.review.completed", {
+      routed_operations: Object.entries(results).filter(([, value]) => value?.state === "completed").map(([operation]) => operation),
+      skipped_operations: Object.entries(results).filter(([, value]) => value?.state === "skipped").map(([operation]) => operation),
+      rejected_count: proposal.rejected?.length ?? 0
+    });
+    return fresh.organization_review;
+  }
+  async recoverPendingOrganizationReviews() {
+    for (const run of await this.store.pendingOrganizationReviewRuns()) {
+      await this.reviewCompletedRunOrganization(run);
+    }
+  }
+
   async handoffCompletedSessionDigest(run, prepared = null) {
     const digest = prepared ?? completedSessionDigest(run, run.output?.content ?? "");
     if (!digest) return null;
@@ -1081,6 +1324,163 @@ function compactText(value, limit) {
   const text = String(value ?? "").replace(/\s+/g, " ").trim();
   if (text.length <= limit) return text;
   return text.slice(0, Math.max(0, limit - 1)).trimEnd() + "…";
+}
+function completedOrganizationReviewEvidence(run, content) {
+  const publicUsers = (run.messages ?? []).filter((message) =>
+    message?.role === "user" &&
+    message?._gateway_continuation !== true &&
+    message?._gateway_automation_wake !== true &&
+    typeof message?.content === "string" &&
+    message.content.trim()
+  );
+  const request = compactText(publicUsers.at(-1)?.content ?? "", 1600);
+  const outcome = compactText(content, 3200);
+  if (!request || !outcome || !isSubstantialLearningTask(run) || secretLike(request) || secretLike(outcome)) return null;
+  return {
+    run_id: run.run_id,
+    session_id: run.session_id,
+    current_scope: run.workspace_id === "operator" ? "operator" : `workspace:${run.workspace_id}`,
+    request,
+    outcome,
+    foreground_operations: requestedActionOperations(run)
+  };
+}
+function requestedActionOperations(run) {
+  const operations = [];
+  for (const message of run?.messages ?? []) {
+    if (message?.role !== "assistant" || !Array.isArray(message.tool_calls)) continue;
+    for (const call of message.tool_calls) {
+      if (call?.function?.name !== "aiverse_action") continue;
+      try {
+        const args = JSON.parse(call.function.arguments || "{}");
+        if (typeof args?.operation === "string" && !operations.includes(args.operation)) operations.push(args.operation);
+      } catch {
+        // Invalid foreground tool JSON is handled by the foreground path.
+      }
+    }
+  }
+  return operations.slice(0, 16);
+}
+function normalizeOrganizationReviewProposal(toolCalls) {
+  const allowed = ["workspace.ensure", "memory.capture", "skills.learning-candidate", "data.structured-truth"];
+  const actionsByOperation = new Map();
+  const rejected = [];
+  for (const call of Array.isArray(toolCalls) ? toolCalls : []) {
+    if (call?.function?.name !== "aiverse_action") {
+      rejected.push({ operation: call?.function?.name ?? "unknown", reason: "tool_not_admitted" });
+      continue;
+    }
+    let args;
+    try { args = JSON.parse(call.function.arguments || "{}"); }
+    catch {
+      rejected.push({ operation: "unknown", reason: "invalid_json" });
+      continue;
+    }
+    const operation = String(args?.operation ?? "");
+    if (!allowed.includes(operation)) {
+      rejected.push({ operation: operation || "unknown", reason: "operation_not_admitted" });
+      continue;
+    }
+    if (args?.action_class !== "write_local_reversible") {
+      rejected.push({ operation, reason: "action_class_not_admitted" });
+      continue;
+    }
+    if (actionsByOperation.has(operation)) {
+      rejected.push({ operation, reason: "duplicate_operation" });
+      continue;
+    }
+    const parameters = args?.parameters;
+    if (!parameters || typeof parameters !== "object" || Array.isArray(parameters) || secretLike(stableStringify(parameters))) {
+      rejected.push({ operation, reason: "unsafe_parameters" });
+      continue;
+    }
+    actionsByOperation.set(operation, {
+      operation,
+      action_class: "write_local_reversible",
+      parameters,
+      reason: typeof args?.reason === "string" ? compactText(args.reason, 1000) : null
+    });
+  }
+  return {
+    actions: allowed.filter((operation) => actionsByOperation.has(operation)).map((operation) => actionsByOperation.get(operation)),
+    rejected
+  };
+}
+function prepareOrganizationReviewParameters(run, operation, parameters, scope) {
+  const stableReviewId = "organization-review";
+  if (!parameters || typeof parameters !== "object" || Array.isArray(parameters)) {
+    throw new GatewayError("TOOL_ARGS_INVALID", `${operation} review parameters must be an object`);
+  }
+  if (operation === "workspace.ensure") {
+    const allowed = ["workspace", "evidence", "authority"];
+    const extras = Object.keys(parameters).filter((key) => !allowed.includes(key));
+    if (extras.length) throw new GatewayError("TOOL_ARGS_INVALID", `workspace.ensure review parameters contain unsupported fields: ${extras.join(", ")}`);
+    if (!parameters.workspace || typeof parameters.workspace !== "object" || Array.isArray(parameters.workspace)) throw new GatewayError("TOOL_ARGS_INVALID", "workspace.ensure review workspace is invalid");
+    if (parameters.evidence?.substantial_scope !== true || parameters.evidence?.boundary_clear !== true) throw new GatewayError("TOOL_ARGS_INVALID", "workspace.ensure review evidence is insufficient");
+    const authority = parameters.authority ?? {};
+    for (const key of ["permission_expansion", "privacy_ambiguous", "new_connection", "new_credential"]) {
+      if (authority[key] !== false) throw new GatewayError("TOOL_ARGS_INVALID", `workspace.ensure review authority ${key} must be false`);
+    }
+    return {
+      ...parameters,
+      provenance: {
+        trigger_ref: `run:${run.run_id}`,
+        classifier: "gateway-post-run-review",
+        source: "gateway"
+      }
+    };
+  }
+  if (operation === "memory.capture") {
+    const forbidden = ["source", "evidence_refs", "effect_id", "scope", "workspace"];
+    const supplied = forbidden.filter((key) => Object.hasOwn(parameters, key));
+    if (supplied.length) throw new GatewayError("TOOL_ARGS_INVALID", `memory.capture review parameters may not supply trusted fields: ${supplied.join(", ")}`);
+    return {
+      ...parameters,
+      source: `gateway-run:${run.run_id}:organization-review`,
+      evidence_refs: [`run:${run.run_id}`, `session:${run.session_id}`],
+      effect_id: `gateway:${run.run_id}:${stableReviewId}:memory.capture`
+    };
+  }
+  if (operation === "skills.learning-candidate") {
+    const allowed = ["candidate", "skill_md"];
+    const extras = Object.keys(parameters).filter((key) => !allowed.includes(key));
+    if (extras.length) throw new GatewayError("TOOL_ARGS_INVALID", `skills.learning-candidate review parameters contain unsupported fields: ${extras.join(", ")}`);
+    if (!parameters.candidate || typeof parameters.candidate !== "object" || Array.isArray(parameters.candidate)) throw new GatewayError("TOOL_ARGS_INVALID", "skills.learning-candidate review candidate is invalid");
+    if (typeof parameters.skill_md !== "string" || !parameters.skill_md.trim()) throw new GatewayError("TOOL_ARGS_INVALID", "skills.learning-candidate review skill_md must be non-empty");
+    const forbidden = ["candidate_id", "scope", "evidence_refs", "created_at", "task_evidence", "approval", "authorization"];
+    const supplied = forbidden.filter((key) => Object.hasOwn(parameters.candidate, key));
+    if (supplied.length) throw new GatewayError("TOOL_ARGS_INVALID", `skills.learning-candidate review candidate may not supply trusted fields: ${supplied.join(", ")}`);
+    return {
+      candidate: {
+        ...parameters.candidate,
+        candidate_id: `learn-${run.run_id}-${stableReviewId}`,
+        scope,
+        evidence_refs: [`run:${run.run_id}`, `session:${run.session_id}`],
+        created_at: run.completed_at ?? run.created_at
+      },
+      skill_md: parameters.skill_md,
+      task_evidence: { substantial_task: true }
+    };
+  }
+  if (operation === "data.structured-truth") {
+    if (Object.keys(parameters).length !== 1 || !Object.hasOwn(parameters, "candidate")) throw new GatewayError("TOOL_ARGS_INVALID", "data.structured-truth review parameters must contain only candidate");
+    if (!parameters.candidate || typeof parameters.candidate !== "object" || Array.isArray(parameters.candidate)) throw new GatewayError("TOOL_ARGS_INVALID", "data.structured-truth review candidate is invalid");
+    const forbidden = ["candidate_id", "scope", "evidence_refs", "created_at", "task_evidence", "actor", "authorization", "approval", "idempotency_key", "idempotencyKey"];
+    const supplied = forbidden.filter((key) => Object.hasOwn(parameters.candidate, key));
+    if (supplied.length) throw new GatewayError("TOOL_ARGS_INVALID", `data.structured-truth review candidate may not supply trusted fields: ${supplied.join(", ")}`);
+    const safe = scope.startsWith("workspace:") && !secretLike(stableStringify(parameters.candidate));
+    return {
+      candidate: {
+        ...parameters.candidate,
+        candidate_id: `data-${run.run_id}-${stableReviewId}`,
+        scope,
+        evidence_refs: [`run:${run.run_id}`, `session:${run.session_id}`],
+        created_at: run.completed_at ?? run.created_at
+      },
+      task_evidence: { substantial_task: safe }
+    };
+  }
+  throw new GatewayError("TOOL_NOT_ADMITTED", `Operation ${operation} is not admitted for organization review`, 403);
 }
 function completedSessionDigest(run, content) {
   const userMessages = (run.messages ?? []).filter((m) =>

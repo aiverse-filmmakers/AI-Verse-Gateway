@@ -26,10 +26,13 @@ const dataRoutingRuntimeFixture=path.resolve(here,"..","fixtures","data-routing-
 const dataRoutingForgedRuntimeFixture=path.resolve(here,"..","fixtures","data-routing-forged-runtime.mjs");
 const temporaryWorkerHostFixture=path.resolve(here,"..","fixtures","temporary-worker-host.mjs");
 const automationRecommendationFixture=path.resolve(here,"..","fixtures","automation-recommendation-runtime.mjs");
+const organizationReviewRuntimeFixture=path.resolve(here,"..","fixtures","organization-review-runtime.mjs");
+const organizationReviewHostFixture=path.resolve(here,"..","fixtures","organization-review-host.mjs");
 
 async function base(){const root=await mkdtemp(path.join(os.tmpdir(),"avg-loop-system-"));const home=await mkdtemp(path.join(os.tmpdir(),"avg-loop-home-"));await writeFile(path.join(root,"AI-VERSE.yaml"),"schema_version: 2.0\n");const hostConfig=path.join(root,"host.json");await writeFile(hostConfig,JSON.stringify({transport:"json-subprocess",command:[process.execPath,hostFixture],timeout_seconds:10,max_output_bytes:1048576,max_stderr_bytes:65536,env_names:[],cwd:root}));await installComponent({home});return{root,home,hostConfig};}
 async function fspReadJson(file){return JSON.parse(await readFile(file,"utf8"));}
 async function waitStatus(baseUrl,token,runId,wanted,timeout=5000){const end=Date.now()+timeout;while(Date.now()<end){const r=await fetch(`${baseUrl}/v1/runs/${runId}`,{headers:{authorization:`Bearer ${token}`}});const body=await r.json();if(wanted.includes(body.status))return body;await new Promise(r=>setTimeout(r,25));}throw new Error(`timeout waiting for ${wanted}`);}
+async function waitOrganizationReview(home,runId,wanted=["completed","skipped"],timeout=5000){const end=Date.now()+timeout;while(Date.now()<end){const body=await fspReadJson(path.join(home,"state","runs",`${runId}.json`));if(wanted.includes(body.organization_review?.status))return body;await new Promise(r=>setTimeout(r,25));}throw new Error(`timeout waiting for organization review ${wanted}`);}
 
 test("approval interrupt reauthorizes before tool execution and resumes from checkpoint",async()=>{const f=await base();const setup=await setupComponent({home:f.home,system_root:f.root,host_config:f.hostConfig,runtime:"json-subprocess",runtime_command:JSON.stringify([process.execPath,runtimeFixture])});const live=await startServer(await loadConfig(f.home),f.home,{port:0});const baseUrl=`http://127.0.0.1:${live.port}`;try{const r=await fetch(`${baseUrl}/v1/runs`,{method:"POST",headers:{authorization:`Bearer ${setup.api_token}`,"content-type":"application/json"},body:JSON.stringify({model:"fixture",messages:[{role:"user",content:"use the fixture tool"}]})});assert.equal(r.status,202);const created=await r.json();const pending=await waitStatus(baseUrl,setup.api_token,created.run_id,["awaiting_approval"]);assert.equal(pending.pending_approval.authorization.approval_required,true);const approved=await fetch(`${baseUrl}/v1/runs/${created.run_id}/approval`,{method:"POST",headers:{authorization:`Bearer ${setup.api_token}`,"content-type":"application/json"},body:JSON.stringify({operation_id:"approve-1",decision:"approve"})});assert.equal(approved.status,200);const done=await waitStatus(baseUrl,setup.api_token,created.run_id,["completed"]);assert.equal(done.output.content,"approved tool completed");assert.equal(done.usage.actions,1);}finally{await live.close();}});
 
@@ -1312,4 +1315,189 @@ test("Automation-triggered run cannot recursively create another Automation", as
   const fresh = await env.store.getRun(env.run.run_id);
   assert.equal(fresh.usage.actions, 0);
   assert.equal(JSON.parse(fresh.messages.at(-1).content).result.automation.state, "not_created");
+});
+
+
+test("completed work is invisibly organized through only safe canonical owner routes", async () => {
+  const f = await base();
+  const reviewHostConfig = path.join(f.root, "organization-review-host.json");
+  await writeFile(reviewHostConfig, JSON.stringify({
+    transport: "json-subprocess",
+    command: [process.execPath, organizationReviewHostFixture],
+    timeout_seconds: 10,
+    max_output_bytes: 1048576,
+    max_stderr_bytes: 65536,
+    env_names: [],
+    cwd: f.root
+  }));
+  const setup = await setupComponent({
+    home: f.home,
+    system_root: f.root,
+    host_config: reviewHostConfig,
+    runtime: "json-subprocess",
+    runtime_command: JSON.stringify([process.execPath, organizationReviewRuntimeFixture])
+  });
+  const sessionId = "sess-organization-review";
+  const live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+  const baseUrl = `http://127.0.0.1:${live.port}`;
+  try {
+    const response = await fetch(`${baseUrl}/v1/runs`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${setup.api_token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "fixture",
+        messages: [{
+          role: "user",
+          content: "For Client Alpha, complete the detailed delivery review against the brief, verify every requested item, keep the handoff concise, and use the same workflow that has worked repeatedly. We also confirmed again that Alice at alice@example.test is currently active."
+        }],
+        metadata: { session_id: sessionId }
+      })
+    });
+    assert.equal(response.status, 202);
+    const created = await response.json();
+    const foreground = await waitStatus(baseUrl, setup.api_token, created.run_id, ["completed", "failed"]);
+    assert.equal(foreground.status, "completed");
+    assert.equal(foreground.output.content, "foreground-delivered");
+    assert.equal(foreground.pending_approval, null);
+
+    const reviewed = await waitOrganizationReview(f.home, created.run_id, ["completed"]);
+    assert.equal(reviewed.output.content, "foreground-delivered");
+    assert.equal(reviewed.usage.actions, 0);
+    assert.equal(reviewed.organization_review.status, "completed");
+    assert.equal(reviewed.organization_review.results["workspace.ensure"].state, "completed");
+    assert.equal(reviewed.organization_review.results["workspace.ensure"].workspace_id, "client-alpha");
+    assert.equal(reviewed.organization_review.results["memory.capture"].state, "skipped");
+    assert.equal(reviewed.organization_review.results["memory.capture"].reason, "approval_required");
+    assert.equal(reviewed.organization_review.results["skills.learning-candidate"].state, "completed");
+    assert.equal(reviewed.organization_review.results["data.structured-truth"].state, "completed");
+    assert.ok(reviewed.organization_review.proposal.rejected.some((item) =>
+      item.operation === "bots.permanent" && item.reason === "operation_not_admitted"
+    ));
+
+    assert.equal(reviewed.messages.some((message) => message.role === "tool"), false);
+    assert.equal(reviewed.messages.some((message) =>
+      typeof message.content === "string" && message.content.includes("Completed-work evidence:")
+    ), false);
+    assert.equal(reviewed.messages.some((message) =>
+      typeof message.content === "string" && message.content.includes("internal review text")
+    ), false);
+
+    const session = await fspReadJson(path.join(f.home, "state", "sessions", `${sessionId}.json`));
+    assert.equal(session.workspace_id, "client-alpha");
+
+    const hostState = await fspReadJson(path.join(f.root, ".fixture-organization-review.json"));
+    const operations = hostState.operations.map((entry) => entry.operation);
+    assert.deepEqual(operations, ["workspace.ensure", "skills.learning-candidate", "data.structured-truth"]);
+    assert.equal(operations.includes("bots.permanent"), false);
+    assert.equal(operations.includes("automations.create"), false);
+    assert.equal(operations.includes("workers.temporary"), false);
+    for (const entry of hostState.operations) {
+      assert.equal(entry.action_class, "write_local_reversible");
+      assert.equal(entry.idempotency_key, `gateway:${created.run_id}:organization-review:${entry.operation}`);
+    }
+  } finally {
+    await live.close();
+  }
+});
+
+
+test("durable organization proposal resumes after restart with stable owner idempotency", async () => {
+  const f = await base();
+  const reviewHostConfig = path.join(f.root, "organization-review-recovery-host.json");
+  await writeFile(reviewHostConfig, JSON.stringify({
+    transport: "json-subprocess",
+    command: [process.execPath, organizationReviewHostFixture],
+    timeout_seconds: 10,
+    max_output_bytes: 1048576,
+    max_stderr_bytes: 65536,
+    env_names: [],
+    cwd: f.root
+  }));
+  await setupComponent({
+    home: f.home,
+    system_root: f.root,
+    host_config: reviewHostConfig,
+    runtime: "deterministic"
+  });
+
+  const store = new GatewayStore(f.home);
+  await store.init();
+  const session = await store.createSession({
+    system_id: "local",
+    workspace_id: "alpha",
+    principal: "local-user",
+    session_id: "sess-review-recovery"
+  });
+  const run = await store.createRun({
+    session_id: session.session_id,
+    system_id: "local",
+    workspace_id: "alpha",
+    principal: "local-user",
+    runtime: { kind: "deterministic", model: "fixture" },
+    messages: [{
+      role: "user",
+      content: "Persist the confirmed current Alice contact state for this ongoing Client Alpha workspace."
+    }],
+    max_turns: 1,
+    budget: { max_tokens: null, max_cost: null, max_actions: 16 },
+    deadline_at: new Date(Date.now() + 60000).toISOString()
+  });
+  run.status = "completed";
+  run.output = { content: "Foreground already completed before restart." };
+  run.completed_at = new Date().toISOString();
+  run.memory_digest = { status: "skipped", attempts: 0, updated_at: run.completed_at };
+  run.organization_review = {
+    status: "routing",
+    attempts: 1,
+    proposal: {
+      actions: [{
+        operation: "data.structured-truth",
+        action_class: "write_local_reversible",
+        reason: "Persist confirmed current structured truth.",
+        parameters: {
+          candidate: {
+            suggested_owner: "data",
+            summary: "Current Client Alpha contact status.",
+            confidence: 0.99,
+            repeated_evidence: true,
+            current_truth: true,
+            structured_operational: true,
+            contains_secret: false,
+            privacy_ambiguous: false,
+            permission_expansion: false,
+            destructive: false,
+            structure: { space: "crm", schema: "contacts" },
+            match: { field: "email", value: "alice@example.test" },
+            record: { data: { email: "alice@example.test", name: "Alice", status: "active" } }
+          }
+        }
+      }],
+      rejected: []
+    },
+    results: {},
+    updated_at: run.completed_at,
+    last_error: null
+  };
+  await store.saveRun(run);
+
+  let live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+  try {
+    let reviewed = await waitOrganizationReview(f.home, run.run_id, ["completed"]);
+    assert.equal(reviewed.organization_review.results["data.structured-truth"].state, "completed");
+    let hostState = await fspReadJson(path.join(f.root, ".fixture-organization-review.json"));
+    assert.equal(hostState.operations.filter((entry) => entry.operation === "data.structured-truth").length, 1);
+    assert.equal(
+      hostState.operations.find((entry) => entry.operation === "data.structured-truth").idempotency_key,
+      `gateway:${run.run_id}:organization-review:data.structured-truth`
+    );
+
+    await live.close();
+    live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+    reviewed = await waitOrganizationReview(f.home, run.run_id, ["completed"]);
+    assert.equal(reviewed.organization_review.status, "completed");
+    hostState = await fspReadJson(path.join(f.root, ".fixture-organization-review.json"));
+    assert.equal(hostState.operations.filter((entry) => entry.operation === "data.structured-truth").length, 1);
+  } finally {
+    await live.close();
+  }
 });
