@@ -10,8 +10,8 @@ switch (input.operation) {
   case "list_connections": result=[]; break;
   case "authorize_action": {
     const req=p.request??{};
-    if (req.operation === "workspace.ensure" && !/^[a-f0-9]{64}$/.test(String(req.request_fingerprint ?? ""))) {
-      result={decision:"deny",allowed:false,reason:"workspace.ensure requires a bound request fingerprint"};
+    if (["workspace.ensure","memory.capture"].includes(req.operation) && !/^[a-f0-9]{64}$/.test(String(req.request_fingerprint ?? ""))) {
+      result={decision:"deny",allowed:false,reason:`${req.operation} requires a bound request fingerprint`};
     } else {
       result = req.operation === "needs.approval" && !req.approval ? {decision:"approval_required",approval_required:true} : {decision:"allow",allowed:true};
     }
@@ -38,6 +38,31 @@ switch (input.operation) {
             workspace:{id:workspace.id,name:workspace.name,path:`workspaces/${workspace.id}`}
           }
         }
+      };
+    } else if (req.operation === "memory.capture") {
+      const p=req.parameters??{};
+      const trusted =
+        typeof p.source === "string" && p.source.startsWith("gateway-run:") &&
+        Array.isArray(p.evidence_refs) && p.evidence_refs.length === 2 &&
+        typeof p.effect_id === "string" && p.effect_id.startsWith("gateway:");
+      result=trusted ? {
+        status:"succeeded",
+        effect_occurred:true,
+        result:{
+          memory_capture:{
+            state:"captured",
+            changed:true,
+            memory_id:"mem-fixture",
+            type:p.type,
+            scope:req.scope,
+            source:p.source,
+            evidence_refs:p.evidence_refs
+          }
+        }
+      } : {
+        status:"blocked",
+        effect_occurred:false,
+        result:{memory_capture:{state:"blocked",changed:false,reason:"trusted provenance missing"}}
       };
     } else {
       result={status:"succeeded",effect_occurred:false,result:{fixture:true}};
