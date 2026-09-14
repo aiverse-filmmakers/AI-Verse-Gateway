@@ -93,7 +93,7 @@ export class GatewayStore {
   async createFoldCard(input) { return await createFoldCard(this, input); }
   async getFoldCard(cardId) { return await getFoldCard(this, cardId); }
   async validateFoldCard(cardId) { return await validateFoldCard(this, cardId); }
-  async rebuildFoldCatalog() { return await rebuildFoldCatalog(this); }
+  async rebuildFoldCatalog(options = {}) { return await rebuildFoldCatalog(this, options); }
   async listFoldCards(options = {}) { return await listFoldCards(this, options); }
   async readFoldSource(ref, expectedScope = null) { return await readFoldSource(this, ref, expectedScope); }
   async resolveFoldCardSources(cardId) { return await resolveFoldCardSources(this, cardId); }

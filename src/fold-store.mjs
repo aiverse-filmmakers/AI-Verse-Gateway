@@ -274,7 +274,7 @@ async function resolveSourcesRecursive(store, card, stack) {
   }
 }
 
-export async function rebuildFoldCatalog(store) {
+export async function rebuildFoldCatalog(store, { live_validation = false } = {}) {
   await ensureDir(store.p.foldCards);
   let names = [];
   try { names = await readdir(store.p.foldCards); } catch (error) { if (error?.code !== "ENOENT") throw error; }
@@ -284,6 +284,10 @@ export async function rebuildFoldCatalog(store) {
     const card = await readJson(path.join(store.p.foldCards, name), null);
     if (!card) continue;
     const self = selfValidateCard(card);
+    let live = null;
+    if (live_validation && self.valid && typeof card.card_id === "string") {
+      live = await validateFoldCard(store, card.card_id);
+    }
     cards.push({
       card_id: String(card.card_id ?? ""),
       fingerprint: String(card.fingerprint ?? ""),
@@ -292,6 +296,10 @@ export async function rebuildFoldCatalog(store) {
       created_at: card.created_at ?? null,
       validation_state: self.valid ? String(card.validation_state?.state ?? "unknown") : "invalid",
       validation_errors: self.errors,
+      ...(live_validation ? {
+        live_validation_state: live?.valid === true ? "validated" : "invalid",
+        live_validation_errors: live?.errors ?? (self.valid ? ["live_validation_unavailable"] : self.errors)
+      } : {}),
       child_count: Array.isArray(card.child_refs) ? card.child_refs.length : 0,
       source_count: Array.isArray(card.source_refs) ? card.source_refs.length : 0,
       descendant_message_count: Number(card.coverage?.descendant_message_count ?? 0),
