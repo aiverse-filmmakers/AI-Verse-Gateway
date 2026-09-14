@@ -5,6 +5,15 @@ import { GatewayError } from "./errors.mjs";
 import { atomicJson, appendNdjson, ensureDir, id, nowIso, readJson, sha256, stableStringify } from "./util.mjs";
 import { paths } from "./paths.mjs";
 import { RUN_RECOVERABLE } from "./constants.mjs";
+import {
+  createFoldCard,
+  getFoldCard,
+  listFoldCards,
+  readFoldSource,
+  rebuildFoldCatalog,
+  resolveFoldCardSources,
+  validateFoldCard
+} from "./fold-store.mjs";
 
 export class GatewayStore {
   constructor(home) {
@@ -13,13 +22,14 @@ export class GatewayStore {
     this.bus.setMaxListeners(200);
   }
   async init() {
-    await Promise.all([this.p.sessions, this.p.runs, this.p.events].map(ensureDir));
+    await Promise.all([this.p.sessions, this.p.runs, this.p.events, this.p.foldCards].map(ensureDir));
     const idem = await readJson(this.p.idempotency, null);
     if (!idem) await atomicJson(this.p.idempotency, { schema_version: "1.0", records: {} });
   }
   sessionFile(sessionId) { assertStorageId(sessionId, "session_id"); return path.join(this.p.sessions, `${sessionId}.json`); }
   runFile(runId) { assertStorageId(runId, "run_id"); return path.join(this.p.runs, `${runId}.json`); }
   eventFile(runId) { assertStorageId(runId, "run_id"); return path.join(this.p.events, `${runId}.ndjson`); }
+  foldCardFile(cardId) { assertStorageId(cardId, "fold_card_id"); return path.join(this.p.foldCards, `${cardId}.json`); }
   async createSession({ system_id, workspace_id, principal, title = null, session_id = null }) {
     const sessionId = session_id ?? id("sess");
     const existing = await readJson(this.sessionFile(sessionId), null);
@@ -80,6 +90,13 @@ export class GatewayStore {
     } catch (error) { if (error?.code === "ENOENT") return []; throw error; }
   }
   subscribe(runId, listener) { this.bus.on(`run:${runId}`, listener); return () => this.bus.off(`run:${runId}`, listener); }
+  async createFoldCard(input) { return await createFoldCard(this, input); }
+  async getFoldCard(cardId) { return await getFoldCard(this, cardId); }
+  async validateFoldCard(cardId) { return await validateFoldCard(this, cardId); }
+  async rebuildFoldCatalog() { return await rebuildFoldCatalog(this); }
+  async listFoldCards(options = {}) { return await listFoldCards(this, options); }
+  async readFoldSource(ref, expectedScope = null) { return await readFoldSource(this, ref, expectedScope); }
+  async resolveFoldCardSources(cardId) { return await resolveFoldCardSources(this, cardId); }
   async claimIdempotency(namespace, key, payload, result = undefined) {
     if (!key) return { state: "new" };
     const db = await readJson(this.p.idempotency, { schema_version: "1.0", records: {} });
