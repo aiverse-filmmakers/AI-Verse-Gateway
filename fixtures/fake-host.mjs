@@ -10,7 +10,7 @@ switch (input.operation) {
   case "list_connections": result=[]; break;
   case "authorize_action": {
     const req=p.request??{};
-    if (["workspace.ensure","memory.capture","skills.learning-candidate"].includes(req.operation) && !/^[a-f0-9]{64}$/.test(String(req.request_fingerprint ?? ""))) {
+    if (["workspace.ensure","memory.capture","skills.learning-candidate","memory.session_digest"].includes(req.operation) && !/^[a-f0-9]{64}$/.test(String(req.request_fingerprint ?? ""))) {
       result={decision:"deny",allowed:false,reason:`${req.operation} requires a bound request fingerprint`};
     } else {
       result = req.operation === "needs.approval" && !req.approval ? {decision:"approval_required",approval_required:true} : {decision:"allow",allowed:true};
@@ -63,6 +63,36 @@ switch (input.operation) {
         status:"blocked",
         effect_occurred:false,
         result:{memory_capture:{state:"blocked",changed:false,reason:"trusted provenance missing"}}
+      };
+    } else if (req.operation === "memory.session_digest") {
+      const p=req.parameters??{};
+      const forbidden=["messages","transcript","scope","workspace","effect_id","source_refs","source_version","provenance"];
+      const trusted =
+        forbidden.every((key)=>!Object.hasOwn(p,key)) &&
+        typeof p.session_id === "string" &&
+        typeof p.run_id === "string" &&
+        typeof p.topic === "string" &&
+        typeof p.summary === "string" &&
+        Array.isArray(p.source_coverage) &&
+        p.source_coverage.every((ref)=>typeof ref === "string" && ref.startsWith(`gateway:run:${p.run_id}:`)) &&
+        typeof p.source_fingerprint === "string" && /^sha256:[a-f0-9]{64}$/.test(p.source_fingerprint);
+      result=trusted ? {
+        status:"succeeded",
+        effect_occurred:true,
+        result:{
+          memory_session_digest:{
+            state:"captured",
+            changed:true,
+            digest_id:"sdg-fixture",
+            scope:req.scope,
+            session_id:p.session_id,
+            run_id:p.run_id
+          }
+        }
+      } : {
+        status:"blocked",
+        effect_occurred:false,
+        result:{memory_session_digest:{state:"blocked",changed:false,reason:"untrusted digest payload"}}
       };
     } else if (req.operation === "skills.learning-candidate") {
       const params=req.parameters??{};

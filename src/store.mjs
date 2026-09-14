@@ -103,6 +103,21 @@ export class GatewayStore {
     await appendNdjson(this.p.audit, receipt);
     return receipt;
   }
+  async pendingSessionDigestRuns() {
+    let names = [];
+    try { names = await readdir(this.p.runs); } catch { return []; }
+    const pending = [];
+    for (const name of names) {
+      if (!name.endsWith(".json")) continue;
+      const run = await readJson(path.join(this.p.runs, name), null);
+      if (
+        run?.status === "completed" &&
+        ["pending", "retryable"].includes(run?.memory_digest?.status)
+      ) pending.push(run);
+    }
+    pending.sort((a, b) => String(a.completed_at ?? "").localeCompare(String(b.completed_at ?? "")));
+    return pending;
+  }
   async recoverInterrupted() {
     let names = [];
     try { names = await readdir(this.p.runs); } catch { return []; }

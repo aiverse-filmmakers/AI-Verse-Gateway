@@ -381,7 +381,99 @@ export class RunEngine {
   assertBudgetBeforeTurn(run) { if (run.continuation.turn >= run.continuation.max_turns) throw new GatewayError("TURN_BUDGET_EXCEEDED", "Run turn budget exhausted", 409); }
   assertBudgetAfterUsage(run) { const b = run.budget ?? {}; const tokens = Number(run.usage.input_tokens ?? 0) + Number(run.usage.output_tokens ?? 0); if (Number.isFinite(b.max_tokens) && b.max_tokens !== null && tokens > b.max_tokens) throw new GatewayError("TOKEN_BUDGET_EXCEEDED", "Token budget exceeded", 409); if (Number.isFinite(b.max_cost) && b.max_cost !== null && run.usage.cost > b.max_cost) throw new GatewayError("COST_BUDGET_EXCEEDED", "Cost budget exceeded", 409); if (Number.isFinite(b.max_actions) && run.usage.actions > b.max_actions) throw new GatewayError("ACTION_BUDGET_EXCEEDED", "Action budget exceeded", 409); }
   async emitText(runId, text) { for (let i = 0; i < text.length; i += 256) await this.store.event(runId, "assistant.delta", { text: text.slice(i, i + 256) }); }
-  async complete(run, content) { run.status = "completed"; run.output = { content }; run.completed_at = nowIso(); run.checkpoint = { phase: "completed", at: nowIso() }; await this.store.saveRun(run); await this.store.event(run.run_id, "run.completed", { usage: run.usage }); }
+  async complete(run, content) {
+    run.status = "completed";
+    run.output = { content };
+    run.completed_at = nowIso();
+    run.checkpoint = { phase: "completed", at: run.completed_at };
+    const digest = completedSessionDigest(run, content);
+    if (digest) {
+      const priorAttempts = Number(run.memory_digest?.attempts ?? 0);
+      run.memory_digest = {
+        status: "pending",
+        attempts: priorAttempts,
+        updated_at: run.completed_at,
+        last_error: null
+      };
+    } else {
+      run.memory_digest = {
+        status: "skipped",
+        reason: "completed run did not qualify for a safe compact session digest",
+        attempts: Number(run.memory_digest?.attempts ?? 0),
+        updated_at: run.completed_at
+      };
+    }
+    await this.store.saveRun(run);
+    await this.store.event(run.run_id, "run.completed", { usage: run.usage });
+    if (digest) await this.handoffCompletedSessionDigest(run, digest);
+  }
+  async handoffCompletedSessionDigest(run, prepared = null) {
+    const digest = prepared ?? completedSessionDigest(run, run.output?.content ?? "");
+    if (!digest) return null;
+    const scope = run.workspace_id === "operator" ? "operator" : `workspace:${run.workspace_id}`;
+    const request = {
+      action_class: "write_local_reversible",
+      scope,
+      operation: "memory.session_digest",
+      parameters: digest,
+      idempotency_key: `gateway:${run.run_id}:session-digest`,
+      in_scope: true,
+      within_budget: true,
+      reversible: true,
+      reason: "Persist a compact completed-session digest through the Memory owner."
+    };
+    request.request_fingerprint = actionFingerprint(request);
+    const attempts = Number(run.memory_digest?.attempts ?? 0) + 1;
+    try {
+      const authorization = await this.host.authorizeAction(request);
+      if (isDenied(authorization)) throw new GatewayError("SESSION_DIGEST_DENIED", "OS host denied the completed-session Memory digest", 403);
+      if (needsApproval(authorization)) throw new GatewayError("SESSION_DIGEST_APPROVAL_REQUIRED", "OS host requires approval for the completed-session Memory digest", 409);
+      const result = await this.host.requestAction(request);
+      const owner = result?.result?.memory_session_digest;
+      if (result?.status !== "succeeded" || !owner || !["captured", "existing"].includes(owner.state)) {
+        throw new GatewayError("SESSION_DIGEST_OWNER_REJECTED", "Memory owner did not accept the completed-session digest", 502);
+      }
+      const fresh = await this.store.getRun(run.run_id);
+      if (!fresh) return owner;
+      fresh.memory_digest = {
+        status: owner.state,
+        digest_id: owner.digest_id ?? null,
+        attempts,
+        updated_at: nowIso(),
+        last_error: null
+      };
+      await this.store.saveRun(fresh);
+      await this.store.event(run.run_id, "memory.session_digest.completed", {
+        state: owner.state,
+        digest_id: owner.digest_id ?? null,
+        attempt: attempts
+      });
+      return owner;
+    } catch (error) {
+      const e = asGatewayError(error);
+      const fresh = await this.store.getRun(run.run_id);
+      if (fresh) {
+        fresh.memory_digest = {
+          status: "retryable",
+          attempts,
+          updated_at: nowIso(),
+          last_error: { code: e.code, message: e.message }
+        };
+        await this.store.saveRun(fresh);
+      }
+      await this.store.event(run.run_id, "memory.session_digest.failed", {
+        code: e.code,
+        message: e.message,
+        attempt: attempts
+      });
+      return null;
+    }
+  }
+  async recoverPendingSessionDigests() {
+    const runs = await this.store.pendingSessionDigestRuns();
+    for (const run of runs) await this.handoffCompletedSessionDigest(run);
+    return runs.map((run) => run.run_id);
+  }
 }
 
 function isSubstantialLearningTask(run) {
@@ -400,6 +492,53 @@ function isSubstantialLearningTask(run) {
   );
 }
 
+function secretLike(value) {
+  const text = String(value ?? "");
+  return [
+    /\b(?:password|passwd|api[_ -]?key|access[_ -]?token|refresh[_ -]?token|private[_ -]?key)\s*[:=]\s*[^\s,;]{6,}/i,
+    /\bsk-[A-Za-z0-9_-]{20,}\b/,
+    /-----BEGIN [A-Z ]*PRIVATE KEY-----/
+  ].some((pattern) => pattern.test(text));
+}
+function compactText(value, limit) {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  if (text.length <= limit) return text;
+  return text.slice(0, Math.max(0, limit - 1)).trimEnd() + "…";
+}
+function completedSessionDigest(run, content) {
+  const userMessages = (run.messages ?? []).filter((m) =>
+    m?.role === "user" &&
+    m?._gateway_continuation !== true &&
+    typeof m?.content === "string" &&
+    m.content.trim()
+  );
+  const lastUser = compactText(userMessages.at(-1)?.content ?? "", 900);
+  const outcome = compactText(content, 3200);
+  const meaningful =
+    lastUser.length >= 12 &&
+    outcome.length >= 24 &&
+    (
+      lastUser.length + outcome.length >= 80 ||
+      Number(run.usage?.actions ?? 0) > 0 ||
+      Boolean(run.goal_binding) ||
+      userMessages.length > 1
+    );
+  if (!meaningful || secretLike(lastUser) || secretLike(outcome)) return null;
+
+  const publicMessages = stripInternal(run.messages ?? []);
+  const lastIndex = Math.max(0, publicMessages.length - 1);
+  return {
+    session_id: run.session_id,
+    run_id: run.run_id,
+    topic: compactText(lastUser, 240),
+    summary: `Request: ${compactText(lastUser, 800)}\nOutcome: ${outcome}`,
+    significant_outcomes: [],
+    unresolved_items: [],
+    source_coverage: [`gateway:run:${run.run_id}:messages:0-${lastIndex}`],
+    source_fingerprint: "sha256:" + createHash("sha256").update(stableStringify(publicMessages)).digest("hex"),
+    completed_at: run.completed_at ?? nowIso()
+  };
+}
 function stripInternal(messages) { return messages.map(({ _gateway_context, _gateway_continuation, ...m }) => m); }
 function lastUserText(messages) { const m = [...messages].reverse().find((x) => x.role === "user"); return typeof m?.content === "string" ? m.content : JSON.stringify(m?.content ?? ""); }
 function addUsage(target, usage = {}) { target.input_tokens += Number(usage.input_tokens ?? 0); target.output_tokens += Number(usage.output_tokens ?? 0); target.cost += Number(usage.cost ?? 0); }
