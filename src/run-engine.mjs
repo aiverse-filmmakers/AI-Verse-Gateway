@@ -419,6 +419,14 @@ export class RunEngine {
   }
 }
 
+function secretLike(value) {
+  const text = String(value ?? "");
+  return [
+    /\b(?:password|passwd|api[_ -]?key|access[_ -]?token|refresh[_ -]?token|private[_ -]?key)\s*[:=]\s*[^\s,;]{6,}/i,
+    /\bsk-[A-Za-z0-9_-]{20,}\b/,
+    /-----BEGIN [A-Z ]*PRIVATE KEY-----/
+  ].some((pattern) => pattern.test(text));
+}
 function compactText(value, limit) {
   const text = String(value ?? "").replace(/\s+/g, " ").trim();
   if (text.length <= limit) return text;
@@ -442,7 +450,7 @@ function completedSessionDigest(run, content) {
       Boolean(run.goal_binding) ||
       userMessages.length > 1
     );
-  if (!meaningful) return null;
+  if (!meaningful || secretLike(lastUser) || secretLike(outcome)) return null;
 
   const publicMessages = stripInternal(run.messages ?? []);
   const lastIndex = Math.max(0, publicMessages.length - 1);
