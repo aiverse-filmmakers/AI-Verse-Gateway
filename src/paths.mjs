@@ -15,6 +15,9 @@ export function paths(home) {
     sessions: path.join(home, "state", "sessions"),
     runs: path.join(home, "state", "runs"),
     events: path.join(home, "state", "events"),
+    folds: path.join(home, "state", "folds"),
+    foldCards: path.join(home, "state", "folds", "cards"),
+    foldCatalog: path.join(home, "state", "folds", "catalog.json"),
     idempotency: path.join(home, "state", "idempotency.json"),
     audit: path.join(home, "state", "audit.ndjson")
   };
