@@ -28,7 +28,7 @@ const temporaryWorkerHostFixture=path.resolve(here,"..","fixtures","temporary-wo
 const automationRecommendationFixture=path.resolve(here,"..","fixtures","automation-recommendation-runtime.mjs");
 const organizationReviewRuntimeFixture=path.resolve(here,"..","fixtures","organization-review-runtime.mjs");
 const organizationReviewHostFixture=path.resolve(here,"..","fixtures","organization-review-host.mjs");
-const reviewBudgetRuntimeFixture=path.resolve(here,"..","fixtures","review-budget-runtime.mjs");
+const reviewBudgetRuntimeFixture=path.resolve(here,"..","fixtures","review-budget-runtime.mjs");\nconst outcomeLanguageRuntimeFixture=path.resolve(here,"..","fixtures","outcome-language-runtime.mjs");
 
 async function base(){const root=await mkdtemp(path.join(os.tmpdir(),"avg-loop-system-"));const home=await mkdtemp(path.join(os.tmpdir(),"avg-loop-home-"));await writeFile(path.join(root,"AI-VERSE.yaml"),"schema_version: 2.0\n");const hostConfig=path.join(root,"host.json");await writeFile(hostConfig,JSON.stringify({transport:"json-subprocess",command:[process.execPath,hostFixture],timeout_seconds:10,max_output_bytes:1048576,max_stderr_bytes:65536,env_names:[],cwd:root}));await installComponent({home});return{root,home,hostConfig};}
 async function fspReadJson(file){return JSON.parse(await readFile(file,"utf8"));}
@@ -1640,6 +1640,139 @@ test("over-budget review output is discarded before any canonical owner action",
     assert.equal(events.some((event) => event.type === "organization.review.action_completed"), false);
     assert.equal(events.some((event) => event.type === "organization.review.budget_limited"), true);
     assert.equal(events.some((event) => event.type === "organization.review.budget_limited_completed"), true);
+  } finally {
+    await live.close();
+  }
+});
+
+
+test("ordinary user outcomes hide subsystem jargon while technical receipts remain exact", async () => {
+  const f = await base();
+  const setup = await setupComponent({
+    home: f.home,
+    system_root: f.root,
+    host_config: f.hostConfig,
+    runtime: "json-subprocess",
+    runtime_command: JSON.stringify([process.execPath, outcomeLanguageRuntimeFixture])
+  });
+  const live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+  const baseUrl = `http://127.0.0.1:${live.port}`;
+  try {
+    const response = await fetch(`${baseUrl}/v1/runs`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${setup.api_token}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "fixture",
+        messages: [{
+          role: "user",
+          content: "Please organize the ongoing Client Alpha delivery work automatically and tell me the result in normal language."
+        }]
+      })
+    });
+    assert.equal(response.status, 202);
+    const created = await response.json();
+    const done = await waitStatus(baseUrl, setup.api_token, created.run_id, ["completed", "failed"]);
+    assert.equal(done.status, "completed");
+
+    const forbidden = [
+      "AI-Verse Gateway",
+      "AI-Verse OS",
+      "workspace.ensure",
+      "canonical owner",
+      "canonical state",
+      "execution_binding",
+      "workspace_organization"
+    ];
+    for (const term of forbidden) {
+      assert.equal(done.output.content.includes(term), false, `normal output leaked ${term}`);
+    }
+    assert.match(done.output.content, /the system/i);
+    assert.match(done.output.content, /automatic organization/i);
+    assert.match(done.output.content, /source of truth/i);
+    assert.match(done.output.content, /saved state/i);
+    assert.match(done.output.content, /technical execution details/i);
+    assert.match(done.output.content, /work organization details/i);
+
+    const eventsBody = await readFile(path.join(f.home, "state", "events", `${created.run_id}.ndjson`), "utf8");
+    const events = eventsBody.trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+    const deltas = events
+      .filter((event) => event.type === "assistant.delta")
+      .map((event) => String(event.data?.text ?? ""))
+      .join("");
+    for (const term of forbidden) {
+      assert.equal(deltas.includes(term), false, `streamed assistant output leaked ${term}`);
+    }
+    const normalizedEvents = events.filter((event) => event.type === "assistant.presentation.normalized");
+    assert.ok(normalizedEvents.length >= 2);
+    assert.equal(normalizedEvents.every((event) => event.data?.technical_receipts_preserved === true), true);
+
+    const persisted = await fspReadJson(path.join(f.home, "state", "runs", `${created.run_id}.json`));
+    const toolCallMessage = persisted.messages.find((message) =>
+      message.role === "assistant" &&
+      Array.isArray(message.tool_calls) &&
+      message.tool_calls.some((call) => call?.function?.name === "aiverse_action")
+    );
+    assert.ok(toolCallMessage);
+    const exactArgs = JSON.parse(toolCallMessage.tool_calls[0].function.arguments);
+    assert.equal(exactArgs.operation, "workspace.ensure");
+
+    const toolReceipt = persisted.messages.find((message) =>
+      message.role === "tool" &&
+      message.tool_call_id === "outcome_language_workspace"
+    );
+    assert.ok(toolReceipt);
+    const receipt = JSON.parse(toolReceipt.content);
+    assert.equal(receipt.status, "succeeded");
+    assert.equal(receipt.result.workspace_organization.state, "created");
+    assert.equal(receipt.result.workspace_organization.workspace.id, "client-alpha");
+  } finally {
+    await live.close();
+  }
+});
+
+test("explicit technical inspection preserves exact subsystem language", async () => {
+  const f = await base();
+  const setup = await setupComponent({
+    home: f.home,
+    system_root: f.root,
+    host_config: f.hostConfig,
+    runtime: "json-subprocess",
+    runtime_command: JSON.stringify([process.execPath, outcomeLanguageRuntimeFixture])
+  });
+  const live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+  const baseUrl = `http://127.0.0.1:${live.port}`;
+  try {
+    const response = await fetch(`${baseUrl}/v1/runs`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${setup.api_token}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "fixture",
+        messages: [{
+          role: "user",
+          content: "Show me the raw technical receipt and exact AI-Verse Gateway workspace.ensure details, including canonical owner and canonical state terminology."
+        }]
+      })
+    });
+    assert.equal(response.status, 202);
+    const created = await response.json();
+    const done = await waitStatus(baseUrl, setup.api_token, created.run_id, ["completed", "failed"]);
+    assert.equal(done.status, "completed");
+    assert.match(done.output.content, /AI-Verse Gateway/);
+    assert.match(done.output.content, /workspace\.ensure/);
+    assert.match(done.output.content, /canonical owner/);
+    assert.match(done.output.content, /AI-Verse OS canonical state/);
+    assert.match(done.output.content, /execution_binding/);
+    assert.match(done.output.content, /workspace_organization/);
+
+    const eventsBody = await readFile(path.join(f.home, "state", "events", `${created.run_id}.ndjson`), "utf8");
+    const events = eventsBody.trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+    assert.equal(events.some((event) => event.type === "assistant.presentation.normalized"), false);
   } finally {
     await live.close();
   }
