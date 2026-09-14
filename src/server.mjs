@@ -10,6 +10,9 @@ export async function startServer(config, home, options = {}) {
   if (config.enabled !== true) throw new GatewayError("GATEWAY_DISABLED", "Gateway is disabled", 503);
   const store = new GatewayStore(home); await store.init(); await store.recoverInterrupted();
   const engine = new RunEngine({ store, config });
+  // Completed runs are already canonical before optional Memory digest handoff.
+  // Retry any durable pending/retryable handoff without reopening the run.
+  void engine.recoverPendingSessionDigests();
   const limiter = new RateLimiter(config.server.requests_per_minute);
   const server = createServer((req, res) => void handle(req, res, { config, store, engine, limiter }));
   const host = options.host ?? config.server.host;
