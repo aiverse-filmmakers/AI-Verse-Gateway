@@ -17,6 +17,8 @@ const workspaceRoutingFixture=path.resolve(here,"..","fixtures","workspace-routi
 const memoryRoutingFixture=path.resolve(here,"..","fixtures","memory-routing-runtime.mjs");
 const learningRoutingFixture=path.resolve(here,"..","fixtures","learning-routing-runtime.mjs");
 const learningRoutingInvalidFixture=path.resolve(here,"..","fixtures","learning-routing-invalid-runtime.mjs");
+const learnedSkillPersistenceHostFixture=path.resolve(here,"..","fixtures","learned-skill-persistence-host.mjs");
+const learnedSkillLaterUseRuntimeFixture=path.resolve(here,"..","fixtures","learned-skill-later-use-runtime.mjs");
 
 async function base(){const root=await mkdtemp(path.join(os.tmpdir(),"avg-loop-system-"));const home=await mkdtemp(path.join(os.tmpdir(),"avg-loop-home-"));await writeFile(path.join(root,"AI-VERSE.yaml"),"schema_version: 2.0\n");const hostConfig=path.join(root,"host.json");await writeFile(hostConfig,JSON.stringify({transport:"json-subprocess",command:[process.execPath,hostFixture],timeout_seconds:10,max_output_bytes:1048576,max_stderr_bytes:65536,env_names:[],cwd:root}));await installComponent({home});return{root,home,hostConfig};}
 async function fspReadJson(file){return JSON.parse(await readFile(file,"utf8"));}
@@ -253,6 +255,89 @@ test("runtime cannot forge trusted learning candidate identity or provenance", a
     assert.equal(done.error.code, "TOOL_ARGS_INVALID");
     assert.match(done.error.message, /may not supply trusted fields/);
     assert.equal(done.usage.actions, 0);
+  } finally {
+    await live.close();
+  }
+});
+
+
+test("a later normal run rediscovers and uses a persisted learned Skill after Gateway restart", async () => {
+  const f = await base();
+  const learnedHostConfig = path.join(f.root, "learned-skill-host.json");
+  await writeFile(learnedHostConfig, JSON.stringify({
+    transport: "json-subprocess",
+    command: [process.execPath, learnedSkillPersistenceHostFixture],
+    timeout_seconds: 10,
+    max_output_bytes: 1048576,
+    max_stderr_bytes: 65536,
+    env_names: [],
+    cwd: f.root
+  }));
+  const setup = await setupComponent({
+    home: f.home,
+    system_root: f.root,
+    host_config: learnedHostConfig,
+    runtime: "json-subprocess",
+    runtime_command: JSON.stringify([process.execPath, learnedSkillLaterUseRuntimeFixture])
+  });
+
+  const sessionId = "sess-learned-skill-later-use";
+  let live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+  try {
+    let baseUrl = `http://127.0.0.1:${live.port}`;
+    const first = await fetch(`${baseUrl}/v1/runs`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${setup.api_token}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "fixture",
+        messages: [{
+          role: "user",
+          content: "For Client Alpha, complete the detailed delivery review against the brief, compare every requested item with the finished output, keep the evidence notes concise, verify completion, and preserve the proven internal procedure only if this substantial work genuinely demonstrates one."
+        }],
+        metadata: {
+          session_id: sessionId,
+          workspace_id: "alpha"
+        }
+      })
+    });
+    assert.equal(first.status, 202);
+    const firstCreated = await first.json();
+    const firstDone = await waitStatus(baseUrl, setup.api_token, firstCreated.run_id, ["completed", "failed"]);
+    assert.equal(firstDone.status, "completed");
+    assert.equal(firstDone.output.content, "learned-first-run");
+    assert.equal(firstDone.usage.actions, 1);
+
+    await live.close();
+
+    // Recreate the Gateway process from the same durable home. The next run is
+    // intentionally short: capability reuse comes from owner discovery, not a
+    // repeated long learning prompt or in-process state.
+    live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+    baseUrl = `http://127.0.0.1:${live.port}`;
+    const second = await fetch(`${baseUrl}/v1/runs`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${setup.api_token}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "fixture",
+        messages: [{ role: "user", content: "Do the Client Alpha review again." }],
+        metadata: {
+          session_id: sessionId
+        }
+      })
+    });
+    assert.equal(second.status, 202);
+    const secondCreated = await second.json();
+    assert.equal(secondCreated.workspace_id, "alpha");
+    const secondDone = await waitStatus(baseUrl, setup.api_token, secondCreated.run_id, ["completed", "failed"]);
+    assert.equal(secondDone.status, "completed");
+    assert.equal(secondDone.output.content, "learned-skill-used");
+    assert.equal(secondDone.usage.actions, 1);
   } finally {
     await live.close();
   }
