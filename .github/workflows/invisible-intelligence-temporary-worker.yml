@@ -1,0 +1,206 @@
+name: Invisible Intelligence Temporary Worker Composition
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gateway-os-bots:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      OS_SHA: b598e733df89c496cf5740388a1283dda026eb89
+      BOTS_SHA: ba97408fa14ba7a5823c4376b10e190c887958b4
+
+    steps:
+      - name: Checkout Gateway under test
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Gateway dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Fetch exact accepted owners
+        shell: bash
+        run: |
+          set -euo pipefail
+          OS="$RUNNER_TEMP/AI-Verse-OS"
+          BOTS="$RUNNER_TEMP/AI-Verse-Multiple-Bots"
+          git clone https://github.com/aiverse-filmmakers/AI-Verse-OS.git "$OS"
+          git -C "$OS" checkout --detach "$OS_SHA"
+          test "$(git -C "$OS" rev-parse HEAD)" = "$OS_SHA"
+          git clone https://github.com/aiverse-filmmakers/AI-Verse-Multiple-Bots.git "$BOTS"
+          git -C "$BOTS" checkout --detach "$BOTS_SHA"
+          test "$(git -C "$BOTS" rev-parse HEAD)" = "$BOTS_SHA"
+          npm --prefix "$BOTS" install --no-audit --no-fund
+          npm --prefix "$BOTS" run build
+          printf '%s' "$OS" > "$RUNNER_TEMP/os-repo.txt"
+          printf '%s' "$BOTS" > "$RUNNER_TEMP/bots-repo.txt"
+
+      - name: Prepare real OS workspace and Multiple Bots extension
+        shell: bash
+        run: |
+          set -euo pipefail
+          OS="$(cat "$RUNNER_TEMP/os-repo.txt")"
+          BOTS="$(cat "$RUNNER_TEMP/bots-repo.txt")"
+          mkdir -p "$OS/workspaces/alpha/context"
+          cat > "$OS/workspaces/alpha/WORKSPACE.yaml" <<'YAML'
+          schema_version: "2.0"
+          id: alpha
+          name: Alpha
+          type: project
+          status: active
+          purpose: Gateway automatic temporary specialist acceptance.
+          domains: []
+          owners: []
+          success_criteria: []
+          canonical_sources: []
+          connections: []
+          current_context: context/CURRENT.md
+          YAML
+          cat > "$OS/workspaces/alpha/context/CURRENT.md" <<'MD'
+          # Current Workspace Context
+
+          ## Objective
+
+          Complete the current bounded delivery accurately.
+
+          ## Current state
+
+          The foreground task is active and may use safe internal specialist help.
+          MD
+
+          BOTS="$BOTS" OS="$OS" node --input-type=module <<'NODE'
+          const mod = await import(process.env.BOTS + "/dist/src/ai-verse-os-install.js");
+          const result = mod.installAiVerseOsExtension(process.env.OS);
+          if (!["installed", "unchanged"].includes(result.status)) throw new Error("Multiple Bots install failed");
+          NODE
+
+          python "$OS/scripts/ai_verse_host_adapter.py"             --root "$OS"             --write-config "$RUNNER_TEMP/os-host.json"
+
+      - name: Drive Gateway trusted action path into real owners
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { mkdtemp } from "node:fs/promises";
+          import os from "node:os";
+          import path from "node:path";
+          import { GatewayStore } from "./src/store.mjs";
+          import { RunEngine } from "./src/run-engine.mjs";
+
+          const home = await mkdtemp(path.join(os.tmpdir(), "gateway-temp-worker-composed-"));
+          const store = new GatewayStore(home);
+          await store.init();
+          const config = {
+            host_adapter_config: process.env.RUNNER_TEMP + "/os-host.json",
+            goal_owner_config: null,
+            runtime: { kind: "deterministic" },
+            limits: {
+              max_goal_continuation_turns: 20,
+              no_progress_threshold: 2,
+              wall_clock_seconds: 120,
+              max_actions: 4,
+              max_tokens: 6000,
+              max_cost: null
+            }
+          };
+          const engine = new RunEngine({ store, config });
+          const session = await store.createSession({
+            system_id: "local",
+            workspace_id: "alpha",
+            principal: "operator"
+          });
+          const run = await store.createRun({
+            session_id: session.session_id,
+            system_id: "local",
+            workspace_id: "alpha",
+            principal: "operator",
+            runtime: { kind: "deterministic", model: "aiverse" },
+            messages: [{
+              role: "user",
+              content: "Review this substantial delivery carefully against the brief and prior evidence, independently inspect the result, identify any inconsistency, and return one concise specialist assessment that helps finish the current task accurately."
+            }],
+            max_turns: 1,
+            budget: { max_tokens: 6000, max_cost: null, max_actions: 4 },
+            deadline_at: new Date(Date.now() + 120000).toISOString()
+          });
+          const call = {
+            id: "call_composed_temp_worker",
+            type: "function",
+            function: {
+              name: "aiverse_action",
+              arguments: JSON.stringify({
+                action_class: "write_local_reversible",
+                operation: "workers.temporary",
+                parameters: {
+                  objective: "Independently inspect the bounded delivery and return one concise assessment.",
+                  role_title: "Temporary Reviewer",
+                  reason: "A separate internal review is useful for the current task.",
+                  skill_refs: [],
+                  required_constraints: ["Stay internal", "Do not create durable responsibilities"]
+                },
+                reason: "Use safe internal specialist help for this substantial foreground task."
+              })
+            }
+          };
+          run.messages.push({ role: "assistant", content: "", tool_calls: [call] });
+          await store.saveRun(run);
+          const outcome = await engine.handleToolCalls(run, [call], "workspace:alpha");
+          if (outcome !== "done") throw new Error("Gateway temporary Worker action did not complete");
+          const fresh = await store.getRun(run.run_id);
+          const tool = JSON.parse(fresh.messages.at(-1).content);
+          if (tool?.status !== "succeeded" || tool?.result?.temporary_worker?.state !== "completed") {
+            throw new Error("Real owner path did not complete temporary Worker");
+          }
+          if (tool?.execution_binding?.owner !== "ai-verse-multiple-bots") {
+            throw new Error("Multiple Bots owner binding missing");
+          }
+          if (fresh.usage.actions !== 1) throw new Error("Gateway action accounting is incorrect");
+          console.log("Gateway -> OS -> Multiple Bots temporary Worker composition: PASS");
+          NODE
+
+      - name: Prove non-durable cleanup in canonical coordination state
+        shell: bash
+        run: |
+          set -euo pipefail
+          OS="$(cat "$RUNNER_TEMP/os-repo.txt")"
+          BOTS="$(cat "$RUNNER_TEMP/bots-repo.txt")"
+          OS="$OS" BOTS="$BOTS" node --input-type=module <<'NODE'
+          import path from "node:path";
+          const { CoordinationStore } = await import(process.env.BOTS + "/dist/src/store.js");
+          const store = new CoordinationStore(path.join(process.env.OS, "runtime", "ai-verse-bots", "coordination.db"));
+          try {
+            const bots = store.listObjects("bot");
+            const workers = store.listObjects("worker", "alpha");
+            const runs = store.listObjects("team_run", "alpha");
+            const leases = store.listObjects("capability_lease", "alpha");
+            const artifacts = store.listObjects("artifact", "alpha");
+            if (bots.length !== 0) throw new Error("automatic specialist created a durable Bot");
+            if (workers.length !== 1 || workers[0].payload.kind !== "temporary" || workers[0].payload.status !== "expired") {
+              throw new Error("temporary Worker did not expire");
+            }
+            if (runs.length !== 1 || runs[0].payload.status !== "completed" || runs[0].payload.leader_kind !== "runtime" || runs[0].payload.leader_lifecycle !== "run_scoped") {
+              throw new Error("run-scoped Team Run boundary failed");
+            }
+            if (leases.length !== 1 || typeof leases[0].payload.cleanup_revoked_at !== "string") {
+              throw new Error("temporary capability lease remained active");
+            }
+            if (artifacts.length !== 1 || artifacts[0].payload.provenance?.origin !== "worker_generated") {
+              throw new Error("temporary Worker result provenance missing");
+            }
+            console.log("No durable Bot, no live temporary authority, preserved result: PASS");
+          } finally {
+            store.close();
+          }
+          NODE
