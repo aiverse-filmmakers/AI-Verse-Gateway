@@ -198,9 +198,16 @@ export class RunEngine {
         const result = await this.runtime.invoke({ run_id: runId, model: run.runtime?.model, messages: stripInternal(run.messages), tools: [ACTION_TOOL] }, signal);
         addUsage(run.usage, result.usage);
         this.assertBudgetAfterUsage(run);
-        const assistant = { role: "assistant", content: result.content ?? "" };
+        const presentation = presentAssistantOutcome(run, result.content ?? "");
+        const assistant = { role: "assistant", content: presentation.content };
         if (Array.isArray(result.tool_calls) && result.tool_calls.length) assistant.tool_calls = result.tool_calls;
         run.messages.push(assistant);
+        if (presentation.changed) {
+          await this.store.event(runId, "assistant.presentation.normalized", {
+            replacements: presentation.replacements,
+            technical_receipts_preserved: true
+          });
+        }
         if (assistant.content) await this.emitText(runId, assistant.content);
         await this.store.saveRun(run);
 
@@ -1609,6 +1616,70 @@ function completedSessionDigest(run, content) {
     source_fingerprint: "sha256:" + createHash("sha256").update(stableStringify(publicMessages)).digest("hex"),
     completed_at: run.completed_at ?? nowIso()
   };
+}
+function technicalPresentationRequested(run) {
+  const publicUsers = (run?.messages ?? []).filter((message) =>
+    message?.role === "user" &&
+    message?._gateway_context !== true &&
+    message?._gateway_continuation !== true &&
+    message?._gateway_automation_wake !== true
+  );
+  const text = publicUsers.map((message) =>
+    typeof message?.content === "string" ? message.content : JSON.stringify(message?.content ?? "")
+  ).join("\n");
+  if (!text.trim()) return false;
+  const patterns = [
+    /\b(?:raw|technical|advanced)\s+(?:receipt|details?|output|response|inspection|diagnostics?)\b/i,
+    /\b(?:debug|diagnostic|trace|stack trace|api response|raw json|json response|run events?)\b/i,
+    /\b(?:canonical owner|canonical state|execution[_ -]?binding|request[_ -]?fingerprint)\b/i,
+    /\b(?:AI-Verse Gateway|AI-Verse OS|AI-Verse Memory|AI-Verse Data|AI-Verse Skills|AI-Verse Automations|AI-Verse Multiple Bots|Multiple Bots)\b/i,
+    /\b(?:workspace\.ensure|memory\.capture|skills\.learning-candidate|data\.structured-truth|workers\.temporary|bots\.permanent|automations\.create)\b/i,
+    /\b(?:component|subsystem|runtime adapter|scheduler|cron|tool receipt|owner receipt)\b/i
+  ];
+  return patterns.some((pattern) => pattern.test(text));
+}
+function presentAssistantOutcome(run, value) {
+  const content = String(value ?? "");
+  if (!content || technicalPresentationRequested(run)) {
+    return { content, changed: false, replacements: [] };
+  }
+  const replacements = [
+    { id: "ai-verse-os-canonical-state", pattern: /\bAI-Verse OS canonical state\b/gi, value: "the saved state" },
+    { id: "ai-verse-gateway", pattern: /\bAI-Verse Gateway\b/gi, value: "the system" },
+    { id: "ai-verse-os", pattern: /\bAI-Verse OS\b/gi, value: "the system" },
+    { id: "ai-verse-memory", pattern: /\bAI-Verse Memory\b/gi, value: "saved context" },
+    { id: "ai-verse-data", pattern: /\bAI-Verse Data\b/gi, value: "organized information" },
+    { id: "ai-verse-skills", pattern: /\bAI-Verse Skills\b/gi, value: "reusable workflows" },
+    { id: "ai-verse-automations", pattern: /\bAI-Verse Automations\b/gi, value: "recurring tasks" },
+    { id: "ai-verse-multiple-bots", pattern: /\bAI-Verse Multiple Bots\b/gi, value: "assistants" },
+    { id: "multiple-bots", pattern: /\bMultiple Bots\b/gi, value: "assistants" },
+    { id: "workspace-ensure", pattern: /\bworkspace\.ensure\b/g, value: "automatic organization" },
+    { id: "memory-capture", pattern: /\bmemory\.capture\b/g, value: "remembering this for later" },
+    { id: "skills-learning-candidate", pattern: /\bskills\.learning-candidate\b/g, value: "reusing this workflow later" },
+    { id: "data-structured-truth", pattern: /\bdata\.structured-truth\b/g, value: "keeping this current information organized" },
+    { id: "workers-temporary", pattern: /\bworkers\.temporary\b/g, value: "temporary specialist help" },
+    { id: "bots-permanent", pattern: /\bbots\.permanent\b/g, value: "a dedicated assistant" },
+    { id: "automations-create", pattern: /\bautomations\.create\b/g, value: "a recurring task" },
+    { id: "canonical-owner", pattern: /\bcanonical owner\b/gi, value: "source of truth" },
+    { id: "canonical-state", pattern: /\bcanonical state\b/gi, value: "saved state" },
+    { id: "execution-binding", pattern: /\bexecution[_ -]?binding\b/gi, value: "technical execution details" },
+    { id: "workspace-organization", pattern: /\bworkspace[_ -]?organization\b/gi, value: "work organization details" },
+    { id: "team-run", pattern: /\bTeam Run\b/g, value: "task" },
+    { id: "capability-lease", pattern: /\bcapability lease\b/gi, value: "temporary access" }
+  ];
+  const applied = [];
+  const parts = content.split(/(```[\s\S]*?```)/g);
+  const presented = parts.map((part, index) => {
+    if (index % 2 === 1 && part.startsWith("```")) return part;
+    let next = part;
+    for (const replacement of replacements) {
+      const before = next;
+      next = next.replace(replacement.pattern, replacement.value);
+      if (next !== before && !applied.includes(replacement.id)) applied.push(replacement.id);
+    }
+    return next;
+  }).join("");
+  return { content: presented, changed: presented !== content, replacements: applied };
 }
 function stripInternal(messages) { return messages.map(({ _gateway_context, _gateway_continuation, _gateway_automation_wake, ...m }) => m); }
 function lastUserText(messages) { const m = [...messages].reverse().find((x) => x.role === "user"); return typeof m?.content === "string" ? m.content : JSON.stringify(m?.content ?? ""); }
