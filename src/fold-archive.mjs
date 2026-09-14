@@ -156,7 +156,7 @@ export async function searchFoldArchive(store, options = {}) {
     scope,
     session_id: sessionId,
     precision,
-    status: uniqueStale.length > 0 && cards.length === 0 ? "stale_archive" : "ok",
+    status: uniqueStale.length > 0 ? "stale_archive" : "ok",
     compact_hits: compact,
     exact_hits: exactHits,
     unfolded_card_ids: [...new Set(unfoldedCardIds)],
