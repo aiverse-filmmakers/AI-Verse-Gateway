@@ -1,6 +1,9 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile, appendFile, stat } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile, appendFile, stat, rm } from "node:fs/promises";
 import path from "node:path";
+
+const fileWriteTails = new Map();
+const TRANSIENT_RENAME_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
 
 export function nowIso() { return new Date().toISOString(); }
 export function id(prefix) { return `${prefix}_${randomUUID().replaceAll("-", "")}`; }
@@ -28,10 +31,39 @@ export async function readJson(file, fallback = undefined) {
   catch (error) { if (error?.code === "ENOENT" && fallback !== undefined) return fallback; throw error; }
 }
 export async function atomicJson(file, value) {
-  await ensureDir(path.dirname(file));
-  const tmp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
-  await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-  await rename(tmp, file);
+  const key = path.resolve(file);
+  const prior = fileWriteTails.get(key) ?? Promise.resolve();
+  let release;
+  const current = new Promise((resolve) => { release = resolve; });
+  const tail = prior.catch(() => {}).then(() => current);
+  fileWriteTails.set(key, tail);
+  await prior.catch(() => {});
+  try {
+    await ensureDir(path.dirname(file));
+    const tmp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+    try {
+      await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+      await renameWithTransientRetry(tmp, file);
+    } catch (error) {
+      await rm(tmp, { force: true }).catch(() => {});
+      throw error;
+    }
+  } finally {
+    release();
+    if (fileWriteTails.get(key) === tail) fileWriteTails.delete(key);
+  }
+}
+
+async function renameWithTransientRetry(source, destination) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await rename(source, destination);
+      return;
+    } catch (error) {
+      if (!TRANSIENT_RENAME_CODES.has(error?.code) || attempt >= 7) throw error;
+      await sleep(Math.min(10 * (2 ** attempt), 320));
+    }
+  }
 }
 export async function appendNdjson(file, value) {
   await ensureDir(path.dirname(file));
