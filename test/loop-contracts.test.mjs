@@ -953,3 +953,148 @@ test("one-off work does not produce a recurring responsibility recommendation", 
     await live.close();
   }
 });
+
+
+test("Automations wake ingress creates one ordinary Gateway run and replays by invocation id", async () => {
+  const f = await base();
+  const setup = await setupComponent({
+    home: f.home,
+    system_root: f.root,
+    host_config: f.hostConfig,
+    runtime: "deterministic"
+  });
+  const live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+  const baseUrl = `http://127.0.0.1:${live.port}`;
+  const wake = {
+    schema_version: "1.0",
+    automation_id: "aut_fixture_weekly",
+    trigger_id: "trg_fixture_weekly",
+    invocation_id: "inv_fixture_weekly_001",
+    scope: "workspace:alpha",
+    fired_at: "2026-09-21T06:00:00Z",
+    scheduled_for: "2026-09-21T06:00:00Z",
+    source_kind: "schedule",
+    target_kind: "gateway",
+    target_ref: null,
+    payload: {
+      objective: "Review the Client Alpha delivery checklist and prepare the usual concise summary.",
+      created_via: "gateway_explicit_consent",
+      consent: {
+        explicit: true,
+        mode: "direct_request",
+        user_message_digest: "sha256:" + "a".repeat(64)
+      }
+    }
+  };
+  try {
+    const response = await fetch(`${baseUrl}/v1/automations/invoke`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${setup.api_token}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify(wake)
+    });
+    assert.equal(response.status, 202);
+    const accepted = await response.json();
+    assert.equal(accepted.accepted, true);
+    assert.equal(accepted.replayed, false);
+    assert.equal(accepted.invocation_id, wake.invocation_id);
+
+    const done = await waitStatus(baseUrl, setup.api_token, accepted.run_id, ["completed", "failed"]);
+    assert.equal(done.status, "completed");
+    assert.equal(done.workspace_id, "alpha");
+    assert.deepEqual(done.automation_binding, {
+      automation_id: wake.automation_id,
+      trigger_id: wake.trigger_id,
+      invocation_id: wake.invocation_id,
+      source_kind: "schedule",
+      fired_at: wake.fired_at,
+      scheduled_for: wake.scheduled_for
+    });
+
+    const replayResponse = await fetch(`${baseUrl}/v1/automations/invoke`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${setup.api_token}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify(wake)
+    });
+    assert.equal(replayResponse.status, 200);
+    const replay = await replayResponse.json();
+    assert.equal(replay.replayed, true);
+    assert.equal(replay.run_id, accepted.run_id);
+
+    const changedResponse = await fetch(`${baseUrl}/v1/automations/invoke`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${setup.api_token}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        ...wake,
+        payload: {
+          ...wake.payload,
+          objective: "Changed objective under the same invocation id."
+        }
+      })
+    });
+    assert.equal(changedResponse.status, 409);
+    const changed = await changedResponse.json();
+    assert.equal(changed.error.code, "IDEMPOTENCY_CONFLICT");
+  } finally {
+    await live.close();
+  }
+});
+
+test("Automations wake ingress rejects wrong target and secret-bearing objective", async () => {
+  const f = await base();
+  const setup = await setupComponent({
+    home: f.home,
+    system_root: f.root,
+    host_config: f.hostConfig,
+    runtime: "deterministic"
+  });
+  const live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+  const baseUrl = `http://127.0.0.1:${live.port}`;
+  const baseWake = {
+    schema_version: "1.0",
+    automation_id: "aut_fixture_safe",
+    trigger_id: "trg_fixture_safe",
+    invocation_id: "inv_fixture_safe_001",
+    scope: "operator",
+    fired_at: "2026-09-21T06:00:00Z",
+    source_kind: "manual",
+    target_kind: "gateway",
+    target_ref: null,
+    payload: { objective: "Review the local checklist." }
+  };
+  try {
+    const wrongTarget = await fetch(`${baseUrl}/v1/automations/invoke`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${setup.api_token}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ ...baseWake, target_kind: "brain" })
+    });
+    assert.equal(wrongTarget.status, 400);
+
+    const secret = await fetch(`${baseUrl}/v1/automations/invoke`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${setup.api_token}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        ...baseWake,
+        invocation_id: "inv_fixture_secret_001",
+        payload: { objective: "Use api_key=sk-abcdefghijklmnopqrstuvwxyz1234567890 every Monday." }
+      })
+    });
+    assert.equal(secret.status, 400);
+  } finally {
+    await live.close();
+  }
+});
