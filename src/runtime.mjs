@@ -26,7 +26,15 @@ async function openAICompatible(config, input, signal) {
     if (!secret) throw new GatewayError("RUNTIME_CREDENTIAL_MISSING", `Runtime credential environment variable ${config.api_key_env} is not set`, 503);
     headers.authorization = `Bearer ${secret}`;
   }
-  const body = { model: input.model || config.model, messages: input.messages, stream: false, ...(input.tools?.length ? { tools: input.tools, tool_choice: "auto" } : {}) };
+  const body = {
+    model: input.model || config.model,
+    messages: input.messages,
+    stream: false,
+    ...(Number.isInteger(input.max_output_tokens) && input.max_output_tokens > 0
+      ? { max_tokens: input.max_output_tokens }
+      : {}),
+    ...(input.tools?.length ? { tools: input.tools, tool_choice: "auto" } : {})
+  };
   const response = await fetch(`${base}/v1/chat/completions`, { method: "POST", headers, body: JSON.stringify(body), signal });
   if (!response.ok) throw new GatewayError("RUNTIME_UPSTREAM_ERROR", `Runtime upstream returned HTTP ${response.status}: ${(await response.text()).slice(0, 500)}`, 502);
   const out = await response.json();
