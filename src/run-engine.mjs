@@ -918,8 +918,7 @@ function scheduleMatchesText(text, trigger) {
   };
   if (weekday === "*") return /\b(?:daily|every day|each day)\b/i.test(source);
   if (!Object.hasOwn(names, weekday)) return false;
-  return new RegExp(`\\b(?:every|each|weekly\\s+(?:on\\s+)?)${names[weekday]}\\b`, "i").test(source)
-    || new RegExp(`\\bweekly\\s+on\\s+${names[weekday]}\\b`, "i").test(source);
+  return new RegExp(`\\b(?:(?:every|each)\\s+|weekly\\s+(?:on\\s+)?)${names[weekday]}\\b`, "i").test(source);
 }
 
 function timeMatchesText(text, hour24, minute) {
@@ -1117,7 +1116,7 @@ function completedSessionDigest(run, content) {
     completed_at: run.completed_at ?? nowIso()
   };
 }
-function stripInternal(messages) { return messages.map(({ _gateway_context, _gateway_continuation, ...m }) => m); }
+function stripInternal(messages) { return messages.map(({ _gateway_context, _gateway_continuation, _gateway_automation_wake, ...m }) => m); }
 function lastUserText(messages) { const m = [...messages].reverse().find((x) => x.role === "user"); return typeof m?.content === "string" ? m.content : JSON.stringify(m?.content ?? ""); }
 function addUsage(target, usage = {}) { target.input_tokens += Number(usage.input_tokens ?? 0); target.output_tokens += Number(usage.output_tokens ?? 0); target.cost += Number(usage.cost ?? 0); }
 function progressFingerprint(value) { return createHash("sha256").update(stableStringify(value)).digest("hex"); }
