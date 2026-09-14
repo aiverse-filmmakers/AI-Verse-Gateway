@@ -12,7 +12,7 @@ const lastUser = [...messages].reverse().find((m) => m.role === "user")?.content
 const required = [
   "Recurring responsibility recommendation:",
   "Recommendation alone is advisory.",
-  "do not call aiverse_action",
+  "Do not call aiverse_action",
   "explicit user consent",
   "I can handle this every Monday for you if you want.",
   "Do not mention Automation, scheduler, cron, trigger, job"
