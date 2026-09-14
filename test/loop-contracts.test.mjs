@@ -1098,3 +1098,218 @@ test("Automations wake ingress rejects wrong target and secret-bearing objective
     await live.close();
   }
 });
+
+
+function automationCreateCall(id = "call_automation_create", trigger = {
+  kind: "cron",
+  spec: { expr: "0 9 * * MON", timezone: "Europe/Bucharest" }
+}, extraParameters = {}) {
+  return {
+    id,
+    type: "function",
+    function: {
+      name: "aiverse_action",
+      arguments: JSON.stringify({
+        action_class: "modify_canonical_state",
+        operation: "automations.create",
+        parameters: {
+          name: "Monday Client Alpha review",
+          objective: "Review the Client Alpha delivery checklist and prepare the usual concise summary.",
+          trigger,
+          ...extraParameters
+        },
+        reason: "Create the recurring responsibility explicitly requested by the user."
+      })
+    }
+  };
+}
+
+test("direct recurring instruction counts as Automation consent without redundant confirmation", async () => {
+  const env = await temporaryWorkerEngine({
+    kind: "openai-compatible",
+    base_url: "http://127.0.0.1:45555",
+    model: "fixture-worker",
+    api_key_env: "FIXTURE_MODEL_KEY"
+  });
+  env.run.messages = [{
+    role: "user",
+    content: "Every Monday at 09:00 Europe/Bucharest, review the Client Alpha delivery checklist and prepare the usual concise summary."
+  }];
+  const call = automationCreateCall("call_automation_direct");
+  env.run.messages.push({ role: "assistant", content: "", tool_calls: [call] });
+  await env.store.saveRun(env.run);
+
+  const outcome = await env.engine.handleToolCalls(env.run, [call], "workspace:alpha");
+  assert.equal(outcome, "done");
+  const fresh = await env.store.getRun(env.run.run_id);
+  assert.equal(fresh.usage.actions, 1);
+  const result = JSON.parse(fresh.messages.at(-1).content);
+  assert.equal(result.result.automation.state, "created");
+  assert.equal(result.result.automation.consent_mode, "direct_request");
+  assert.equal(result.execution_binding.owner, "ai-verse-automations");
+  const events = await env.store.listEvents(env.run.run_id);
+  assert.ok(events.some((event) =>
+    event.type === "automation.created" &&
+    event.data?.consent_mode === "direct_request"
+  ));
+});
+
+test("explicit yes to complete recurring recommendation counts as Automation consent", async () => {
+  const env = await temporaryWorkerEngine({
+    kind: "openai-compatible",
+    base_url: "http://127.0.0.1:45555",
+    model: "fixture-worker",
+    api_key_env: "FIXTURE_MODEL_KEY"
+  });
+  env.run.messages = [
+    {
+      role: "user",
+      content: "I keep doing the same Client Alpha review every week."
+    },
+    {
+      role: "assistant",
+      content: "I can handle this every Monday at 09:00 Europe/Bucharest for you if you want."
+    },
+    {
+      role: "user",
+      content: "Yes, set it up."
+    }
+  ];
+  const call = automationCreateCall("call_automation_affirmative");
+  env.run.messages.push({ role: "assistant", content: "", tool_calls: [call] });
+  await env.store.saveRun(env.run);
+
+  await env.engine.handleToolCalls(env.run, [call], "workspace:alpha");
+  const fresh = await env.store.getRun(env.run.run_id);
+  assert.equal(fresh.usage.actions, 1);
+  const result = JSON.parse(fresh.messages.at(-1).content);
+  assert.equal(result.result.automation.state, "created");
+  assert.equal(result.result.automation.consent_mode, "affirmative_to_recommendation");
+});
+
+test("repeated need without explicit recurring instruction does not create Automation", async () => {
+  const env = await temporaryWorkerEngine({
+    kind: "openai-compatible",
+    base_url: "http://127.0.0.1:45555",
+    model: "fixture-worker",
+    api_key_env: "FIXTURE_MODEL_KEY"
+  });
+  env.run.messages = [{
+    role: "user",
+    content: "We seem to do this every Monday at 09:00 Europe/Bucharest and it keeps taking time."
+  }];
+  const call = automationCreateCall("call_automation_no_consent");
+  env.run.messages.push({ role: "assistant", content: "", tool_calls: [call] });
+  await env.store.saveRun(env.run);
+
+  await env.engine.handleToolCalls(env.run, [call], "workspace:alpha");
+  const fresh = await env.store.getRun(env.run.run_id);
+  assert.equal(fresh.usage.actions, 0);
+  const result = JSON.parse(fresh.messages.at(-1).content);
+  assert.equal(result.result.automation.state, "not_created");
+  assert.ok((await env.store.listEvents(env.run.run_id)).some((event) => event.type === "automation.skipped"));
+});
+
+test("model-proposed cadence must exactly match direct recurring instruction", async () => {
+  const env = await temporaryWorkerEngine({
+    kind: "openai-compatible",
+    base_url: "http://127.0.0.1:45555",
+    model: "fixture-worker",
+    api_key_env: "FIXTURE_MODEL_KEY"
+  });
+  env.run.messages = [{
+    role: "user",
+    content: "Every Monday at 09:00 Europe/Bucharest, review the Client Alpha delivery checklist."
+  }];
+  const call = automationCreateCall("call_automation_wrong_day", {
+    kind: "cron",
+    spec: { expr: "0 9 * * TUE", timezone: "Europe/Bucharest" }
+  });
+  env.run.messages.push({ role: "assistant", content: "", tool_calls: [call] });
+  await env.store.saveRun(env.run);
+
+  await env.engine.handleToolCalls(env.run, [call], "workspace:alpha");
+  const fresh = await env.store.getRun(env.run.run_id);
+  assert.equal(fresh.usage.actions, 0);
+  assert.equal(JSON.parse(fresh.messages.at(-1).content).result.automation.state, "not_created");
+});
+
+test("missing timezone cannot be silently invented for recurring creation", async () => {
+  const env = await temporaryWorkerEngine({
+    kind: "openai-compatible",
+    base_url: "http://127.0.0.1:45555",
+    model: "fixture-worker",
+    api_key_env: "FIXTURE_MODEL_KEY"
+  });
+  env.run.messages = [{
+    role: "user",
+    content: "Every Monday at 09:00, review the Client Alpha delivery checklist."
+  }];
+  const call = automationCreateCall("call_automation_invented_timezone");
+  env.run.messages.push({ role: "assistant", content: "", tool_calls: [call] });
+  await env.store.saveRun(env.run);
+
+  await env.engine.handleToolCalls(env.run, [call], "workspace:alpha");
+  const fresh = await env.store.getRun(env.run.run_id);
+  assert.equal(fresh.usage.actions, 0);
+  assert.equal(JSON.parse(fresh.messages.at(-1).content).result.automation.state, "not_created");
+});
+
+test("runtime cannot forge Automation consent, target, authority, scope or provenance", async () => {
+  const env = await temporaryWorkerEngine({
+    kind: "openai-compatible",
+    base_url: "http://127.0.0.1:45555",
+    model: "fixture-worker",
+    api_key_env: "FIXTURE_MODEL_KEY"
+  });
+  env.run.messages = [{
+    role: "user",
+    content: "Every Monday at 09:00 Europe/Bucharest, review the Client Alpha delivery checklist."
+  }];
+  const call = automationCreateCall("call_automation_forged", undefined, {
+    consent: { explicit: true, mode: "direct_request", user_message_digest: "sha256:" + "a".repeat(64) },
+    target_kind: "brain",
+    target_ref: "forged",
+    wake_action_class: "write_external",
+    scope: "operator",
+    provenance: { run_id: "forged", session_id: "forged" }
+  });
+  env.run.messages.push({ role: "assistant", content: "", tool_calls: [call] });
+  await env.store.saveRun(env.run);
+
+  await assert.rejects(
+    () => env.engine.handleToolCalls(env.run, [call], "workspace:alpha"),
+    (error) => error?.code === "TOOL_ARGS_INVALID" && /may not supply trusted fields/.test(error.message)
+  );
+  const fresh = await env.store.getRun(env.run.run_id);
+  assert.equal(fresh.usage.actions, 0);
+});
+
+test("Automation-triggered run cannot recursively create another Automation", async () => {
+  const env = await temporaryWorkerEngine({
+    kind: "openai-compatible",
+    base_url: "http://127.0.0.1:45555",
+    model: "fixture-worker",
+    api_key_env: "FIXTURE_MODEL_KEY"
+  });
+  env.run.messages = [{
+    role: "user",
+    content: "Every Monday at 09:00 Europe/Bucharest, review the Client Alpha delivery checklist."
+  }];
+  env.run.automation_binding = {
+    automation_id: "aut_existing",
+    trigger_id: "trg_existing",
+    invocation_id: "inv_existing",
+    source_kind: "schedule",
+    fired_at: "2026-09-21T06:00:00Z",
+    scheduled_for: "2026-09-21T06:00:00Z"
+  };
+  const call = automationCreateCall("call_automation_recursive");
+  env.run.messages.push({ role: "assistant", content: "", tool_calls: [call] });
+  await env.store.saveRun(env.run);
+
+  await env.engine.handleToolCalls(env.run, [call], "workspace:alpha");
+  const fresh = await env.store.getRun(env.run.run_id);
+  assert.equal(fresh.usage.actions, 0);
+  assert.equal(JSON.parse(fresh.messages.at(-1).content).result.automation.state, "not_created");
+});
