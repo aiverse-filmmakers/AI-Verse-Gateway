@@ -77,9 +77,26 @@ async function chatCompletions(req, res, body, identity, ctx, origin) {
 async function createRun(req, body, identity, ctx) {
   validateMessages(body.messages);
   const systemId = ctx.config.system.id;
-  const workspace = String(body?.metadata?.workspace_id ?? req.headers["x-aiverse-workspace"] ?? ctx.config.system.default_workspace);
-  if (!/^(operator|[a-z0-9][a-z0-9-]{0,127})$/.test(workspace)) throw new GatewayError("WORKSPACE_INVALID", "Invalid workspace binding");
   const requestedSessionId = body?.metadata?.session_id ?? req.headers["x-aiverse-session-id"] ?? null;
+  const explicitWorkspace = body?.metadata?.workspace_id ?? req.headers["x-aiverse-workspace"] ?? null;
+  let workspace;
+  if (explicitWorkspace != null) {
+    workspace = String(explicitWorkspace);
+  } else if (requestedSessionId) {
+    const existingSession = await ctx.store.getSession(String(requestedSessionId));
+    if (existingSession) {
+      if (existingSession.system_id !== systemId || existingSession.principal !== identity.principal) {
+        throw new GatewayError("SESSION_BINDING_MISMATCH", "Existing session binding does not match the authenticated request", 409);
+      }
+      workspace = existingSession.workspace_id;
+    } else {
+      workspace = ctx.config.system.default_workspace;
+    }
+  } else {
+    workspace = ctx.config.system.default_workspace;
+  }
+  workspace = String(workspace);
+  if (!/^(operator|[a-z0-9][a-z0-9-]{0,127})$/.test(workspace)) throw new GatewayError("WORKSPACE_INVALID", "Invalid workspace binding");
   const payload = { system_id: systemId, workspace_id: workspace, requested_session_id: requestedSessionId, messages: body.messages, goal_id: body?.metadata?.goal_id ?? null, model: body.model ?? null };
   const idemKey = req.headers["idempotency-key"];
   const idem = await ctx.store.claimIdempotency("run", typeof idemKey === "string" ? idemKey : null, payload);

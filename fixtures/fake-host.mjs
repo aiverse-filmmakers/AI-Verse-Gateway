@@ -10,9 +10,40 @@ switch (input.operation) {
   case "list_connections": result=[]; break;
   case "authorize_action": {
     const req=p.request??{};
-    result = req.operation === "needs.approval" && !req.approval ? {decision:"approval_required",approval_required:true} : {decision:"allow",allowed:true}; break;
+    if (req.operation === "workspace.ensure" && !/^[a-f0-9]{64}$/.test(String(req.request_fingerprint ?? ""))) {
+      result={decision:"deny",allowed:false,reason:"workspace.ensure requires a bound request fingerprint"};
+    } else {
+      result = req.operation === "needs.approval" && !req.approval ? {decision:"approval_required",approval_required:true} : {decision:"allow",allowed:true};
+    }
+    break;
   }
-  case "request_action": result={status:"succeeded",effect_occurred:false,result:{fixture:true}}; break;
+  case "request_action": {
+    const req=p.request??{};
+    if (req.operation === "workspace.ensure") {
+      const workspace=req.parameters?.workspace??{};
+      result={
+        status:"succeeded",
+        effect_occurred:true,
+        result:{
+          workspace_organization:{
+            schema_version:1,
+            state:"created",
+            changed:true,
+            user_confirmation_required:false,
+            permission_expanded:false,
+            connection_created:false,
+            credential_created:false,
+            automation_created:false,
+            permanent_bot_created:false,
+            workspace:{id:workspace.id,name:workspace.name,path:`workspaces/${workspace.id}`}
+          }
+        }
+      };
+    } else {
+      result={status:"succeeded",effect_occurred:false,result:{fixture:true}};
+    }
+    break;
+  }
   default: process.stdout.write(JSON.stringify({protocol:input.protocol,request_id:input.request_id,ok:false,error:{message:"unsupported"}})); process.exit(0);
 }
 process.stdout.write(JSON.stringify({protocol:input.protocol,request_id:input.request_id,ok:true,result}));
