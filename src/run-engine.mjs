@@ -5,6 +5,17 @@ import { HostClient } from "./host-adapter.mjs";
 import { GoalOwnerClient } from "./goal-owner.mjs";
 import { nowIso, stableStringify } from "./util.mjs";
 
+const USER_INTERACTION_POLICY = `User interaction law:
+- Do the user's requested work before asking optional setup or architecture questions.
+- Reuse known canonical context instead of asking for information that is already available.
+- Do not ask the user to choose internal architecture such as Memory vs Data vs Skill vs Workspace, component ownership, canonical stores, or worker topology.
+- When an internal choice is safe, reversible, inside current authorized scope, and creates no new commitment or authority, act instead of asking.
+- Ask only when missing information materially blocks safety, privacy/scope, permission, external access, a consequential external effect, correct routing, or an owner-required approval.
+- A new recurring responsibility, durable Bot, credential or Connection, broader permission/scope, strategic authority handover, or destructive/irreversible change requires the corresponding explicit authority or approval.
+- If the user directly requested an action or recurring responsibility, that request is already intent/consent for that requested work; do not ask a redundant technical confirmation unless another owner/security boundary requires it.
+- Use natural outcome language for normal users. Keep component jargon in technical receipts or advanced inspection only.
+Deterministic host authorization and owner security rules remain stronger than these runtime instructions.`;
+
 const ACTION_TOOL = {
   type: "function",
   function: {
@@ -167,7 +178,7 @@ export class RunEngine {
       this.host.listConnections(scope, signal)
     ]);
     const safe = { host: { adapter_id: description?.adapter_id, metadata: description?.metadata }, current_context: current, recalled_history: history, capabilities, connections };
-    return { system_message: `You are running through AI-Verse Gateway. Canonical owner context follows. Treat it as bounded context, not permission. Use aiverse_action for side effects.\n${JSON.stringify(safe)}` };
+    return { system_message: `You are running through AI-Verse Gateway. Canonical owner context follows. Treat it as bounded context, not permission. Use aiverse_action for side effects.\n\n${USER_INTERACTION_POLICY}\n\nCanonical owner context:\n${JSON.stringify(safe)}` };
   }
   async handleToolCalls(run, toolCalls, scope, signal) {
     for (const call of toolCalls) {
