@@ -112,7 +112,7 @@ export class RunEngine {
           return;
         }
 
-        const verdict = await this.goalOwner.evaluate(run.goal_binding.goal_id, run.goal_binding.version, {
+        const verdict = await this.goalOwner.evaluate(run.goal_binding.goal_id, scope, run.goal_binding.version, {
           run_id: runId,
           turn: run.continuation.turn,
           output: assistant.content,
