@@ -62,7 +62,18 @@ Structured current Data:
 - Do not use automatic Data organization on a trivial turn, ambiguous private material, secrets, uncertain current truth, destructive/narrowing schema changes, or one-off unstructured information.
 - Canonical owner context may contain a compact structured_data orientation. When a later user task needs current structured truth, inspect the relevant schema with read_local data.schema.get when needed, then use bounded read_local data.query/data.record.get/data.record.list/data.aggregate rather than guessing from Memory.
 - A Data owner refusal, ambiguity, migration requirement, or concurrency conflict is not permission to widen the mutation. Continue the foreground task without silently changing authority.
-- Keep Data/schema/record jargon out of normal user-facing language unless advanced inspection was requested.`;
+- Keep Data/schema/record jargon out of normal user-facing language unless advanced inspection was requested.
+
+Temporary specialist help:
+- For substantial workspace-bound work, you may use one temporary internal specialist when an independent review, focused analysis, or bounded parallel reasoning step is genuinely useful to the user's current request.
+- Do not ask the user whether to create temporary help. This is an internal reversible execution choice inside current authority.
+- Temporary help is not a durable employee. Never use this route to create, imply, or promise a permanent Bot, recurring responsibility, new credential, Connection, broader permission, or external effect.
+- Use action_class "write_local_reversible", operation "workers.temporary".
+- Runtime parameters may contain only: objective, role_title, reason, optional skill_refs, optional required_constraints.
+- Do not provide runtime configuration, tools, Connections, budget, trusted provenance, task evidence, scope, approval, authorization, Worker IDs, Team Run IDs, or Bot IDs. Gateway supplies the trusted execution/runtime binding and owners enforce the final boundary.
+- Use this only when the specialist can work with no new tools or Connections. Existing already-authorized Skills may be referenced when useful.
+- At most one automatic temporary specialist is admitted per foreground run. If the route is unavailable or declined, continue the user's task normally instead of exposing backend limitations.
+- After the temporary result returns, use it as bounded supporting evidence and deliver the user-facing outcome naturally. Do not mention Worker, Team Run, lease, Multiple Bots, or subsystem mechanics unless advanced inspection was requested.`;
 
 const ACTION_TOOL = {
   type: "function",
@@ -303,6 +314,56 @@ export class RunEngine {
           }
         };
       }
+      if (args.operation === "workers.temporary") {
+        if (!parameters || typeof parameters !== "object" || Array.isArray(parameters)) throw new GatewayError("TOOL_ARGS_INVALID", "workers.temporary parameters must be an object");
+        const allowed = ["objective", "role_title", "reason", "skill_refs", "required_constraints"];
+        const extras = Object.keys(parameters).filter((key) => !allowed.includes(key));
+        if (extras.length) throw new GatewayError("TOOL_ARGS_INVALID", `workers.temporary runtime parameters may not supply trusted fields: ${extras.join(", ")}`);
+        for (const [key, limit] of [["objective", 4000], ["role_title", 160], ["reason", 1000]]) {
+          if (typeof parameters[key] !== "string" || !parameters[key].trim() || parameters[key].trim().length > limit) {
+            throw new GatewayError("TOOL_ARGS_INVALID", `workers.temporary ${key} is invalid`);
+          }
+        }
+        const skillRefs = parameters.skill_refs ?? [];
+        const constraints = parameters.required_constraints ?? [];
+        if (!Array.isArray(skillRefs) || skillRefs.length > 12 || skillRefs.some((item) => typeof item !== "string" || !item.startsWith("aiverse-skills:"))) {
+          throw new GatewayError("TOOL_ARGS_INVALID", "workers.temporary skill_refs are invalid");
+        }
+        if (!Array.isArray(constraints) || constraints.length > 32 || constraints.some((item) => typeof item !== "string" || !item.trim() || item.length > 1000)) {
+          throw new GatewayError("TOOL_ARGS_INVALID", "workers.temporary required_constraints are invalid");
+        }
+        const workerRuntime = temporaryWorkerRuntime(this.config, run);
+        const workerBudget = temporaryWorkerBudget(run);
+        const firstWorkerRequest = countOperationRequests(run, "workers.temporary") <= 1;
+        const substantial = scope.startsWith("workspace:") && isSubstantialLearningTask(run);
+        const secret = secretLike(stableStringify({
+          objective: parameters.objective,
+          role_title: parameters.role_title,
+          reason: parameters.reason,
+          required_constraints: constraints
+        }));
+        const admitted = Boolean(workerRuntime && workerBudget && firstWorkerRequest && substantial && !secret);
+        parameters = {
+          objective: parameters.objective.trim(),
+          role_title: parameters.role_title.trim(),
+          reason: parameters.reason.trim(),
+          runtime: workerRuntime,
+          skill_refs: [...new Set(skillRefs)],
+          required_constraints: [...new Set(constraints.map((item) => item.trim()))],
+          budget: workerBudget,
+          task_evidence: {
+            substantial_task: substantial,
+            temporary_help_useful: admitted,
+            permission_expansion: false,
+            durable_commitment: false,
+            external_effect: false
+          },
+          provenance: {
+            run_id: run.run_id,
+            session_id: run.session_id
+          }
+        };
+      }
       if (args.operation === "skills.learning-candidate" && parameters?.task_evidence?.substantial_task !== true) {
         const result = {
           status: "succeeded",
@@ -343,6 +404,25 @@ export class RunEngine {
         await this.store.saveRun(run);
         continue;
       }
+      if (args.operation === "workers.temporary" && parameters?.task_evidence?.temporary_help_useful !== true) {
+        const result = {
+          status: "succeeded",
+          effect_occurred: false,
+          result: {
+            temporary_worker: {
+              state: "ignored",
+              reason: "Gateway suppressed temporary specialist help because the task, runtime, scope, budget, secret boundary, or one-per-run gate was not eligible"
+            }
+          }
+        };
+        run.messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
+        await this.store.event(run.run_id, "temporary_worker.skipped", {
+          tool_call_id: call.id,
+          reason: "not_safe_supported_or_substantial"
+        });
+        await this.store.saveRun(run);
+        continue;
+      }
 
       const request = {
         action_class: args.action_class,
@@ -368,6 +448,15 @@ export class RunEngine {
         return "approval";
       }
       const result = await this.host.requestAction(request, signal);
+      if (request.operation === "workers.temporary") {
+        const workerUsage = result?.result?.temporary_worker?.usage;
+        if (workerUsage && typeof workerUsage === "object" && !Array.isArray(workerUsage)) addUsage(run.usage, workerUsage);
+        await this.store.event(run.run_id, "temporary_worker.completed", {
+          tool_call_id: call.id,
+          state: result?.result?.temporary_worker?.state ?? null,
+          effect_occurred: result?.effect_occurred === true
+        });
+      }
       run.usage.actions += 1;
       this.assertBudgetAfterUsage(run);
       if (request.operation === "workspace.ensure") await this.applyWorkspaceOrganization(run, scope, result);
@@ -529,6 +618,64 @@ export class RunEngine {
     for (const run of runs) await this.handoffCompletedSessionDigest(run);
     return runs.map((run) => run.run_id);
   }
+}
+
+function temporaryWorkerRuntime(config, run) {
+  const runtime = config?.runtime ?? {};
+  if (runtime.kind === "deterministic") return { adapter: "deterministic" };
+  if (runtime.kind !== "openai-compatible") return null;
+  const base = String(runtime.base_url ?? "").replace(/\/$/, "");
+  const model = run?.runtime?.model ?? runtime.model ?? null;
+  if (!/^https?:\/\/[^\s]+$/.test(base) || typeof model !== "string" || !model.trim()) return null;
+  const mapped = {
+    adapter: "openai-compatible",
+    endpoint: `${base}/v1/chat/completions`,
+    model: model.trim()
+  };
+  if (typeof runtime.api_key_env === "string" && /^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(runtime.api_key_env)) {
+    mapped.api_key_env = runtime.api_key_env;
+  }
+  return mapped;
+}
+
+function temporaryWorkerBudget(run) {
+  const deadlineMs = Date.parse(String(run?.deadline_at ?? ""));
+  const remainingSeconds = Number.isFinite(deadlineMs) ? Math.floor((deadlineMs - Date.now()) / 1000) : 120;
+  if (remainingSeconds < 2) return null;
+
+  const budget = run?.budget ?? {};
+  const usedTokens = Number(run?.usage?.input_tokens ?? 0) + Number(run?.usage?.output_tokens ?? 0);
+  const maxTokens = Number.isFinite(budget.max_tokens) && budget.max_tokens !== null ? Number(budget.max_tokens) : null;
+  const remainingTokens = maxTokens === null ? 4096 : Math.floor(maxTokens - usedTokens);
+  if (remainingTokens < 1) return null;
+
+  const result = {
+    token_limit: Math.min(4096, remainingTokens),
+    wall_clock_seconds: Math.min(120, remainingSeconds)
+  };
+  if (Number.isFinite(budget.max_cost) && budget.max_cost !== null) {
+    const remainingCost = Number(budget.max_cost) - Number(run?.usage?.cost ?? 0);
+    if (!(remainingCost > 0)) return null;
+    result.cost_limit = remainingCost;
+  }
+  return result;
+}
+
+function countOperationRequests(run, operation) {
+  let count = 0;
+  for (const message of run?.messages ?? []) {
+    if (message?.role !== "assistant" || !Array.isArray(message.tool_calls)) continue;
+    for (const call of message.tool_calls) {
+      if (call?.function?.name !== "aiverse_action") continue;
+      try {
+        const args = JSON.parse(call.function.arguments || "{}");
+        if (args?.operation === operation) count += 1;
+      } catch {
+        // Invalid JSON is rejected by the normal tool-call path.
+      }
+    }
+  }
+  return count;
 }
 
 function isSubstantialLearningTask(run) {
