@@ -28,6 +28,7 @@ const temporaryWorkerHostFixture=path.resolve(here,"..","fixtures","temporary-wo
 const automationRecommendationFixture=path.resolve(here,"..","fixtures","automation-recommendation-runtime.mjs");
 const organizationReviewRuntimeFixture=path.resolve(here,"..","fixtures","organization-review-runtime.mjs");
 const organizationReviewHostFixture=path.resolve(here,"..","fixtures","organization-review-host.mjs");
+const reviewBudgetRuntimeFixture=path.resolve(here,"..","fixtures","review-budget-runtime.mjs");
 
 async function base(){const root=await mkdtemp(path.join(os.tmpdir(),"avg-loop-system-"));const home=await mkdtemp(path.join(os.tmpdir(),"avg-loop-home-"));await writeFile(path.join(root,"AI-VERSE.yaml"),"schema_version: 2.0\n");const hostConfig=path.join(root,"host.json");await writeFile(hostConfig,JSON.stringify({transport:"json-subprocess",command:[process.execPath,hostFixture],timeout_seconds:10,max_output_bytes:1048576,max_stderr_bytes:65536,env_names:[],cwd:root}));await installComponent({home});return{root,home,hostConfig};}
 async function fspReadJson(file){return JSON.parse(await readFile(file,"utf8"));}
@@ -1497,6 +1498,148 @@ test("durable organization proposal resumes after restart with stable owner idem
     assert.equal(reviewed.organization_review.status, "completed");
     hostState = await fspReadJson(path.join(f.root, ".fixture-organization-review.json"));
     assert.equal(hostState.operations.filter((entry) => entry.operation === "data.structured-truth").length, 1);
+  } finally {
+    await live.close();
+  }
+});
+
+
+test("trivial completed turns do not invoke the invisible organization review runtime", async () => {
+  const f = await base();
+  const setup = await setupComponent({
+    home: f.home,
+    system_root: f.root,
+    host_config: f.hostConfig,
+    runtime: "json-subprocess",
+    runtime_command: JSON.stringify([process.execPath, reviewBudgetRuntimeFixture]),
+    runtime_cwd: f.root
+  });
+  const live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+  const baseUrl = `http://127.0.0.1:${live.port}`;
+  try {
+    const response = await fetch(`${baseUrl}/v1/runs`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${setup.api_token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "fixture",
+        messages: [{ role: "user", content: "Thanks." }]
+      })
+    });
+    assert.equal(response.status, 202);
+    const created = await response.json();
+    const done = await waitStatus(baseUrl, setup.api_token, created.run_id, ["completed", "failed"]);
+    assert.equal(done.status, "completed");
+    assert.equal(done.output.content, "You're welcome.");
+
+    const persisted = await fspReadJson(path.join(f.home, "state", "runs", `${created.run_id}.json`));
+    assert.equal(persisted.organization_review.status, "skipped");
+    assert.equal(persisted.organization_review.attempts, 0);
+
+    const runtimeState = await fspReadJson(path.join(f.root, ".fixture-review-budget-runtime.json"));
+    assert.equal(runtimeState.invocations, 1, "trivial turn must not pay for a second review model call");
+    assert.deepEqual(runtimeState.reviews, []);
+  } finally {
+    await live.close();
+  }
+});
+
+test("substantial completed work gets one explicitly capped review call", async () => {
+  const f = await base();
+  const setup = await setupComponent({
+    home: f.home,
+    system_root: f.root,
+    host_config: f.hostConfig,
+    runtime: "json-subprocess",
+    runtime_command: JSON.stringify([process.execPath, reviewBudgetRuntimeFixture]),
+    runtime_cwd: f.root
+  });
+  const live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+  const baseUrl = `http://127.0.0.1:${live.port}`;
+  try {
+    const response = await fetch(`${baseUrl}/v1/runs`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${setup.api_token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "fixture",
+        messages: [{
+          role: "user",
+          content: "Review the completed Client Alpha delivery against the full brief, compare the final result with the previously accepted version, verify every requested item carefully, check the evidence for inconsistencies, keep the findings concise, and prepare a final handoff that can be reused confidently for the next delivery review."
+        }],
+        metadata: { workspace_id: "alpha" }
+      })
+    });
+    assert.equal(response.status, 202);
+    const created = await response.json();
+    const done = await waitStatus(baseUrl, setup.api_token, created.run_id, ["completed", "failed"]);
+    assert.equal(done.status, "completed");
+
+    const reviewed = await waitOrganizationReview(f.home, created.run_id, ["completed"]);
+    assert.equal(reviewed.organization_review.attempts, 1);
+    assert.equal(reviewed.organization_review.budget.state, "within");
+    assert.equal(reviewed.organization_review.budget.max_evidence_chars, 5600);
+    assert.equal(reviewed.organization_review.budget.max_output_tokens, 768);
+    assert.equal(reviewed.organization_review.budget.max_actions, 4);
+    assert.equal(reviewed.organization_review.budget.max_reported_cost, 0.02);
+    assert.equal(reviewed.organization_review.runtime_usage.output_tokens, 32);
+    assert.equal(reviewed.organization_review.runtime_usage.cost, 0.004);
+
+    const runtimeState = await fspReadJson(path.join(f.root, ".fixture-review-budget-runtime.json"));
+    assert.equal(runtimeState.invocations, 2, "substantial work should get exactly one foreground call plus one review call");
+    assert.equal(runtimeState.reviews.length, 1);
+    assert.equal(runtimeState.reviews[0].max_output_tokens, 768);
+    assert.ok(runtimeState.reviews[0].evidence_chars <= 5650);
+  } finally {
+    await live.close();
+  }
+});
+
+test("over-budget review output is discarded before any canonical owner action", async () => {
+  const f = await base();
+  const setup = await setupComponent({
+    home: f.home,
+    system_root: f.root,
+    host_config: f.hostConfig,
+    runtime: "json-subprocess",
+    runtime_command: JSON.stringify([process.execPath, reviewBudgetRuntimeFixture]),
+    runtime_cwd: f.root
+  });
+  const sessionId = "sess-review-budget-limit";
+  const live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+  const baseUrl = `http://127.0.0.1:${live.port}`;
+  try {
+    const response = await fetch(`${baseUrl}/v1/runs`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${setup.api_token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "fixture",
+        messages: [{
+          role: "user",
+          content: "OVESPEND_REVIEW_TEST Review this substantial completed project carefully, verify the full delivery against every requested requirement and prior accepted evidence, identify any reusable organization opportunity, keep the result safe and internal, and prepare a concise final handoff without changing permissions or creating any durable responsibility."
+        }],
+        metadata: { session_id: sessionId }
+      })
+    });
+    assert.equal(response.status, 202);
+    const created = await response.json();
+    const done = await waitStatus(baseUrl, setup.api_token, created.run_id, ["completed", "failed"]);
+    assert.equal(done.status, "completed");
+
+    const reviewed = await waitOrganizationReview(f.home, created.run_id, ["budget_limited"]);
+    assert.equal(reviewed.organization_review.budget.state, "exceeded");
+    assert.equal(reviewed.organization_review.proposal.actions.length, 0);
+    assert.ok(reviewed.organization_review.proposal.rejected.some((item) =>
+      item.operation === "review" && item.reason === "review_budget_exceeded"
+    ));
+    assert.deepEqual(reviewed.organization_review.results, {});
+
+    const session = await fspReadJson(path.join(f.home, "state", "sessions", `${sessionId}.json`));
+    assert.equal(session.workspace_id, "operator", "over-budget proposal must not reach workspace owner mutation");
+
+    const eventsBody = await readFile(path.join(f.home, "state", "events", `${created.run_id}.ndjson`), "utf8");
+    const events = eventsBody.trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+    assert.equal(events.some((event) => event.type === "organization.review.action_completed"), false);
+    assert.equal(events.some((event) => event.type === "organization.review.budget_limited"), true);
+    assert.equal(events.some((event) => event.type === "organization.review.budget_limited_completed"), true);
   } finally {
     await live.close();
   }
