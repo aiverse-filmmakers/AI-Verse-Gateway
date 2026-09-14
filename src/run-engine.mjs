@@ -49,7 +49,20 @@ Reusable Skill learning:
 - Do not provide candidate_id, scope, evidence_refs, created_at, task_evidence, approval, authorization, or trusted provenance. Gateway supplies trusted run identity/evidence and independently determines whether the task was substantial enough to route.
 - A new capability, dependency, credential, Connection, permission expansion, risky/ambiguous package, protected/user/upstream overwrite, or uncertain scope must not be silently promoted. Owner gates remain stronger than model suggestions.
 - Do not call this route merely because a procedure could hypothetically be reusable. There must be concrete evidence from the current completed work.
-- After a successful internal learning route, continue the user's work naturally. Do not expose Skill/proposal/generation jargon unless advanced inspection was requested.`;
+- After a successful internal learning route, continue the user's work naturally. Do not expose Skill/proposal/generation jargon unless advanced inspection was requested.
+
+Structured current Data:
+- Use Data for repeated/current operational truth that is naturally structured, not for historical narrative, preferences, procedures, credentials, or transient chat details.
+- Do not ask the user whether information should go into Data or which schema to create when the structure is clear, internal, additive, reversible, workspace-bound, and does not expand authority.
+- For safe automatic organization use action_class "write_local_reversible", operation "data.structured-truth".
+- Runtime parameters must contain only:
+  candidate: { suggested_owner:"data", summary, confidence, repeated_evidence, current_truth, structured_operational, contains_secret:false, privacy_ambiguous:false, permission_expansion:false, destructive:false, structure:{space,schema}, match:{field,value}, record:{data} }
+- match must be a stable natural key already present in record.data and the proposed schema. Never invent credentials, permission grants, destructive migrations, or cross-workspace identifiers.
+- Do not provide candidate_id, scope, evidence_refs, created_at, task_evidence, actor, authorization, approval, or idempotency fields. Gateway supplies trusted run identity/evidence; Brain and Data enforce owner rules.
+- Do not use automatic Data organization on a trivial turn, ambiguous private material, secrets, uncertain current truth, destructive/narrowing schema changes, or one-off unstructured information.
+- Canonical owner context may contain a compact structured_data orientation. When a later user task needs current structured truth, inspect the relevant schema with read_local data.schema.get when needed, then use bounded read_local data.query/data.record.get/data.record.list/data.aggregate rather than guessing from Memory.
+- A Data owner refusal, ambiguity, migration requirement, or concurrency conflict is not permission to widen the mutation. Continue the foreground task without silently changing authority.
+- Keep Data/schema/record jargon out of normal user-facing language unless advanced inspection was requested.`;
 
 const ACTION_TOOL = {
   type: "function",
@@ -268,6 +281,28 @@ export class RunEngine {
           }
         };
       }
+      if (args.operation === "data.structured-truth") {
+        if (!parameters || typeof parameters !== "object" || Array.isArray(parameters)) throw new GatewayError("TOOL_ARGS_INVALID", "data.structured-truth parameters must be an object");
+        if (Object.keys(parameters).length !== 1 || !Object.hasOwn(parameters, "candidate")) throw new GatewayError("TOOL_ARGS_INVALID", "data.structured-truth runtime parameters must contain only candidate");
+        if (!parameters.candidate || typeof parameters.candidate !== "object" || Array.isArray(parameters.candidate)) throw new GatewayError("TOOL_ARGS_INVALID", "data.structured-truth candidate must be an object");
+        const forbiddenCandidate = ["candidate_id", "scope", "evidence_refs", "created_at", "task_evidence", "actor", "authorization", "approval", "idempotency_key", "idempotencyKey"];
+        const suppliedTrusted = forbiddenCandidate.filter((key) => Object.hasOwn(parameters.candidate, key));
+        if (suppliedTrusted.length) throw new GatewayError("TOOL_ARGS_INVALID", `data.structured-truth runtime candidate may not supply trusted fields: ${suppliedTrusted.join(", ")}`);
+        const substantial = scope.startsWith("workspace:") && isSubstantialLearningTask(run);
+        const secret = secretLike(stableStringify(parameters.candidate));
+        parameters = {
+          candidate: {
+            ...parameters.candidate,
+            candidate_id: `data-${run.run_id}-${call.id}`,
+            scope,
+            evidence_refs: [`run:${run.run_id}`, `session:${run.session_id}`],
+            created_at: run.created_at
+          },
+          task_evidence: {
+            substantial_task: substantial && !secret
+          }
+        };
+      }
       if (args.operation === "skills.learning-candidate" && parameters?.task_evidence?.substantial_task !== true) {
         const result = {
           status: "succeeded",
@@ -284,6 +319,26 @@ export class RunEngine {
         await this.store.event(run.run_id, "learning.review.skipped", {
           tool_call_id: call.id,
           reason: "not_substantial"
+        });
+        await this.store.saveRun(run);
+        continue;
+      }
+      if (args.operation === "data.structured-truth" && parameters?.task_evidence?.substantial_task !== true) {
+        const result = {
+          status: "succeeded",
+          effect_occurred: false,
+          result: {
+            data_candidate: {
+              state: "ignored",
+              reason: "Gateway suppressed automatic Data organization for a trivial, non-workspace, or secret-bearing turn",
+              suggested_owner: "none"
+            }
+          }
+        };
+        run.messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
+        await this.store.event(run.run_id, "data.organization.skipped", {
+          tool_call_id: call.id,
+          reason: "not_safe_or_substantial"
         });
         await this.store.saveRun(run);
         continue;
