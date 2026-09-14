@@ -84,7 +84,16 @@ Permanent specialist boundary:
 - Runtime parameters may contain only: name, role_title, mission, optional skill_refs.
 - Do not provide consent evidence, runtime configuration, scope, Bot ID, permissions, tools, Connections, credentials, provenance, approval, or idempotency fields. Gateway supplies trusted consent/runtime/provenance and OS creates a conservative canonical manifest.
 - The initial durable specialist must not silently gain tools, Connections, credentials, Worker-creation rights, handoff rights, or broader scope. Those are separate authority changes.
-- If explicit consent is absent, continue the current work and, when genuinely useful, make the recommendation in ordinary language. Do not expose registry or subsystem mechanics.`;
+- If explicit consent is absent, continue the current work and, when genuinely useful, make the recommendation in ordinary language. Do not expose registry or subsystem mechanics.
+
+Recurring responsibility recommendation:
+- If current work or recalled context provides clear evidence that the user repeatedly performs the same time-bound or event-bound responsibility, you may recommend handling it automatically in the future.
+- Recommendation alone is advisory. Do not call aiverse_action, create a schedule, create a trigger, claim anything is active, or otherwise mutate canonical recurring-work state before explicit user consent.
+- A recurring responsibility is a durable commitment even when the implementation would otherwise be internal and reversible, so observation alone never crosses this boundary.
+- Do not infer recurrence from one vague or one-off task. There must be explicit recurrence language or strong repeated evidence.
+- Phrase the recommendation in normal outcome language, for example: "I can handle this every Monday for you if you want."
+- Do not mention Automation, scheduler, cron, trigger, job, canonical state, or subsystem ownership unless advanced inspection was requested.
+- If recommendation evidence is weak or the task is clearly one-off, simply complete the current work without proposing recurring setup.`;
 
 const ACTION_TOOL = {
   type: "function",
