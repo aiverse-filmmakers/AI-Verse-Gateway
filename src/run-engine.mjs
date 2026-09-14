@@ -73,7 +73,18 @@ Temporary specialist help:
 - Do not provide runtime configuration, tools, Connections, budget, trusted provenance, task evidence, scope, approval, authorization, Worker IDs, Team Run IDs, or Bot IDs. Gateway supplies the trusted execution/runtime binding and owners enforce the final boundary.
 - Use this only when the specialist can work with no new tools or Connections. Existing already-authorized Skills may be referenced when useful.
 - At most one automatic temporary specialist is admitted per foreground run. If the route is unavailable or declined, continue the user's task normally instead of exposing backend limitations.
-- After the temporary result returns, use it as bounded supporting evidence and deliver the user-facing outcome naturally. Do not mention Worker, Team Run, lease, Multiple Bots, or subsystem mechanics unless advanced inspection was requested.`;
+- After the temporary result returns, use it as bounded supporting evidence and deliver the user-facing outcome naturally. Do not mention Worker, Team Run, lease, Multiple Bots, or subsystem mechanics unless advanced inspection was requested.
+
+Permanent specialist boundary:
+- You may naturally recommend a dedicated ongoing specialist when repeated work strongly suggests it would help, but recommendation alone must not create anything durable.
+- Do not call bots.permanent merely because a permanent specialist seems useful. A durable specialist requires explicit user consent.
+- A direct user request such as "create me a bot", "set up a dedicated agent", or equivalent already counts as consent for that requested durable specialist. Do not ask a redundant confirmation.
+- A short affirmative such as "yes, set it up" counts only when it directly follows your own clear recommendation to create a dedicated/permanent ongoing specialist.
+- When explicit consent exists, use action_class "modify_canonical_state", operation "bots.permanent".
+- Runtime parameters may contain only: name, role_title, mission, optional skill_refs.
+- Do not provide consent evidence, runtime configuration, scope, Bot ID, permissions, tools, Connections, credentials, provenance, approval, or idempotency fields. Gateway supplies trusted consent/runtime/provenance and OS creates a conservative canonical manifest.
+- The initial durable specialist must not silently gain tools, Connections, credentials, Worker-creation rights, handoff rights, or broader scope. Those are separate authority changes.
+- If explicit consent is absent, continue the current work and, when genuinely useful, make the recommendation in ordinary language. Do not expose registry or subsystem mechanics.`;
 
 const ACTION_TOOL = {
   type: "function",
@@ -364,6 +375,48 @@ export class RunEngine {
           }
         };
       }
+      if (args.operation === "bots.permanent") {
+        if (args.action_class !== "modify_canonical_state") {
+          throw new GatewayError("TOOL_ARGS_INVALID", "bots.permanent requires modify_canonical_state");
+        }
+        if (!parameters || typeof parameters !== "object" || Array.isArray(parameters)) {
+          throw new GatewayError("TOOL_ARGS_INVALID", "bots.permanent parameters must be an object");
+        }
+        const allowed = ["name", "role_title", "mission", "skill_refs"];
+        const extras = Object.keys(parameters).filter((key) => !allowed.includes(key));
+        if (extras.length) {
+          throw new GatewayError("TOOL_ARGS_INVALID", `bots.permanent runtime parameters may not supply trusted fields: ${extras.join(", ")}`);
+        }
+        for (const [key, limit] of [["name", 160], ["role_title", 160], ["mission", 2000]]) {
+          if (typeof parameters[key] !== "string" || !parameters[key].trim() || parameters[key].trim().length > limit) {
+            throw new GatewayError("TOOL_ARGS_INVALID", `bots.permanent ${key} is invalid`);
+          }
+        }
+        const skillRefs = parameters.skill_refs ?? [];
+        if (!Array.isArray(skillRefs) || skillRefs.length > 12 || skillRefs.some((item) => typeof item !== "string" || !item.startsWith("aiverse-skills:"))) {
+          throw new GatewayError("TOOL_ARGS_INVALID", "bots.permanent skill_refs are invalid");
+        }
+        const runtime = temporaryWorkerRuntime(this.config, run);
+        const consent = permanentBotConsentEvidence(run);
+        const secret = secretLike(stableStringify({
+          name: parameters.name,
+          role_title: parameters.role_title,
+          mission: parameters.mission
+        }));
+        parameters = {
+          name: parameters.name.trim(),
+          role_title: parameters.role_title.trim(),
+          mission: parameters.mission.trim(),
+          skill_refs: [...new Set(skillRefs)],
+          runtime,
+          consent,
+          provenance: {
+            run_id: run.run_id,
+            session_id: run.session_id
+          }
+        };
+        if (!runtime || !consent || secret) parameters._gateway_permanent_bot_admitted = false;
+      }
       if (args.operation === "skills.learning-candidate" && parameters?.task_evidence?.substantial_task !== true) {
         const result = {
           status: "succeeded",
@@ -423,6 +476,26 @@ export class RunEngine {
         await this.store.saveRun(run);
         continue;
       }
+      if (args.operation === "bots.permanent" && parameters?._gateway_permanent_bot_admitted === false) {
+        const result = {
+          status: "succeeded",
+          effect_occurred: false,
+          result: {
+            permanent_bot: {
+              state: "not_created",
+              reason: "explicit_user_consent_or_supported_safe_runtime_missing"
+            }
+          }
+        };
+        run.messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
+        await this.store.event(run.run_id, "permanent_bot.skipped", {
+          tool_call_id: call.id,
+          reason: "consent_or_safe_runtime_missing"
+        });
+        await this.store.saveRun(run);
+        continue;
+      }
+      if (args.operation === "bots.permanent") delete parameters._gateway_permanent_bot_admitted;
 
       const request = {
         action_class: args.action_class,
@@ -454,6 +527,14 @@ export class RunEngine {
         await this.store.event(run.run_id, "temporary_worker.completed", {
           tool_call_id: call.id,
           state: result?.result?.temporary_worker?.state ?? null,
+          effect_occurred: result?.effect_occurred === true
+        });
+      }
+      if (request.operation === "bots.permanent") {
+        await this.store.event(run.run_id, "permanent_bot.created", {
+          tool_call_id: call.id,
+          state: result?.result?.permanent_bot?.state ?? null,
+          consent_mode: parameters?.consent?.mode ?? null,
           effect_occurred: result?.effect_occurred === true
         });
       }
@@ -618,6 +699,67 @@ export class RunEngine {
     for (const run of runs) await this.handoffCompletedSessionDigest(run);
     return runs.map((run) => run.run_id);
   }
+}
+
+function permanentBotConsentEvidence(run) {
+  const messages = (run?.messages ?? []).filter((message) =>
+    ["user", "assistant"].includes(message?.role) &&
+    message?._gateway_context !== true &&
+    message?._gateway_continuation !== true
+  );
+  let userIndex = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]?.role === "user") {
+      userIndex = index;
+      break;
+    }
+  }
+  if (userIndex < 0) return null;
+  const userText = typeof messages[userIndex]?.content === "string"
+    ? messages[userIndex].content.trim()
+    : JSON.stringify(messages[userIndex]?.content ?? "").trim();
+  if (!userText || userText.length > 4000) return null;
+  const lower = userText.toLowerCase();
+
+  const negated = /\b(?:do not|don't|dont|never|no)\s+(?:create|make|add|build|set\s*up)\b/i.test(userText);
+  const temporaryOnly = /\b(?:temporary|one[- ]off|for this task only|just for this task)\b/i.test(userText);
+  const adviceQuestion = /\b(?:should i|should we|do you think|would it make sense)\b/i.test(userText);
+  const directCreate = /\b(?:create|make|add|build|set\s*up|setup|give me)\b[\s\S]{0,120}\b(?:bot|agent|assistant|employee|specialist)\b/i.test(userText)
+    || /\b(?:i want|i need)\b[\s\S]{0,80}\b(?:a|an|my)?\s*(?:dedicated|permanent|ongoing|durable)?\s*(?:bot|agent|assistant|employee|specialist)\b/i.test(userText);
+  if (directCreate && !negated && !temporaryOnly && !adviceQuestion) {
+    return {
+      explicit: true,
+      mode: "direct_request",
+      user_message_digest: "sha256:" + createHash("sha256").update(userText).digest("hex")
+    };
+  }
+
+  const affirmative = userText.length <= 160 && /^(?:yes|yes please|yep|yeah|do it|go ahead|set it up|create it|make it|make it permanent|sounds good[,. ]*do it|please do)[.! ]*$/i.test(userText);
+  if (!affirmative) return null;
+
+  let priorAssistant = null;
+  for (let index = userIndex - 1; index >= 0; index -= 1) {
+    if (messages[index]?.role === "assistant") {
+      priorAssistant = messages[index];
+      break;
+    }
+    if (messages[index]?.role === "user") break;
+  }
+  const recommendation = typeof priorAssistant?.content === "string"
+    ? priorAssistant.content.trim()
+    : JSON.stringify(priorAssistant?.content ?? "").trim();
+  if (!recommendation || recommendation.length > 6000) return null;
+  const recommendsDurable = /\b(?:bot|agent|assistant|employee|specialist)\b/i.test(recommendation)
+    && /\b(?:dedicated|permanent|ongoing|durable)\b/i.test(recommendation)
+    && /\b(?:would you like|want me to|shall i|should i|i can)\b[\s\S]{0,120}\b(?:create|make|set\s*up|setup)\b/i.test(recommendation);
+  if (!recommendsDurable) return null;
+
+  return {
+    explicit: true,
+    mode: "affirmative_to_recommendation",
+    user_message_digest: "sha256:" + createHash("sha256").update(userText).digest("hex"),
+    recommendation_message_digest: "sha256:" + createHash("sha256").update(recommendation).digest("hex")
+  };
 }
 
 function temporaryWorkerRuntime(config, run) {
