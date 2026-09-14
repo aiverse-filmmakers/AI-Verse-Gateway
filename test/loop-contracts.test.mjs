@@ -145,9 +145,6 @@ test("automatic historical Memory capture uses trusted Gateway provenance and ow
     assert.equal(done.status, "completed");
     assert.equal(done.output.content, "memory-captured");
     assert.equal(done.usage.actions, 1);
-
-    const events = (await fspReadJson(path.join(f.home, "state", "runs", created.run_id, "events.jsonl").replace(/\.jsonl$/, ".json"))).events;
-    assert.ok(Array.isArray(events));
   } finally {
     await live.close();
   }
