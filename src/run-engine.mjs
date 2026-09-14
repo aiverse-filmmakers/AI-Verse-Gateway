@@ -844,7 +844,7 @@ function automationConsentEvidence(run, trigger) {
   const advice = /\b(?:should i|should we|do you think|would it make sense)\b/i.test(userText);
   const explicitImperative =
     /^(?:please\s+)?(?:review|check|send|prepare|do|handle|run|summarize|remind|schedule|set\s+up)\b[\s\S]*\b(?:every|each|daily|weekly)\b/i.test(userText)
-    || /\b(?:can you|could you|please|i want you to|i need you to|remind me|schedule this|set this up|do this|handle this|run this)\b[\s\S]*\b(?:every|each|daily|weekly)\b/i.test(userText)
+    || /\b(?:can you|could you|please|i want you to|i need you to|remind me|schedule this|set this up)\b[\s\S]*\b(?:every|each|daily|weekly)\b/i.test(userText)
     || /^(?:every|each)\b[\s\S]{0,180},\s*(?:review|check|send|prepare|do|handle|run|summarize|remind)\b/i.test(userText);
 
   if (explicitImperative && !negated && !advice && scheduleMatchesText(userText, trigger)) {
