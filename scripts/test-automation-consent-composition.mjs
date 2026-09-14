@@ -76,6 +76,7 @@ assert(tool?.result?.automation?.state === "created", "canonical Automation was 
 assert(tool?.result?.automation?.consent_mode === "direct_request", "direct consent provenance was lost");
 assert(tool?.execution_binding?.owner === "ai-verse-automations", "canonical Automations owner binding missing");
 const automationId = tool.result.automation.automation_id;
+const triggerId = tool.result.automation.trigger_id;
 
 const noConsent = await store.createRun({
   session_id: session.session_id,
@@ -151,7 +152,7 @@ const changedResponse = await fetch(`${baseUrl}/v1/automations/invoke`, {
 assert(changedResponse.status === 409, "changed wake replay was not rejected");
 await live.close();
 
-await verifyCanonicalState(automationState, automationId);
+await verifyCanonicalState(automationState, automationId, triggerId);
 console.log("Gateway -> OS -> Automations -> Gateway recurring consent composition: PASS");
 
 function requiredEnv(name) {
@@ -291,7 +292,7 @@ async function findScheduledRun(home, invocationId) {
   return null;
 }
 
-async function verifyCanonicalState(state, automationId) {
+async function verifyCanonicalState(state, automationId, triggerId) {
   await execFileAsync("python", ["-c", `
 import os
 from pathlib import Path
@@ -306,12 +307,17 @@ assert automation["target_kind"]=="gateway"
 assert automation["action_class"]=="read_local"
 assert automation["wake"]["created_via"]=="gateway_explicit_consent"
 assert automation["wake"]["consent"]["mode"]=="direct_request"
-triggers=store.list_triggers(automation["id"])
-assert len(triggers)==1, triggers
-assert triggers[0]["kind"]=="cron"
-assert triggers[0]["spec"]=={"expr":"0 9 * * MON","timezone":"Europe/Bucharest"}
+trigger=store.get_trigger(os.environ["TRIGGER_ID"])
+assert trigger["automation_id"]==automation["id"], trigger
+assert trigger["kind"]=="cron"
+assert trigger["spec"]=={"expr":"0 9 * * MON","timezone":"Europe/Bucharest"}
 `], {
-    env: { ...process.env, AUTOMATIONS_STATE: state, AUTOMATION_ID: automationId }
+    env: {
+      ...process.env,
+      AUTOMATIONS_STATE: state,
+      AUTOMATION_ID: automationId,
+      TRIGGER_ID: triggerId
+    }
   });
 }
 
