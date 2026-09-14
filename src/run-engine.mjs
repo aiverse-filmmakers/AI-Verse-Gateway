@@ -14,7 +14,19 @@ const USER_INTERACTION_POLICY = `User interaction law:
 - A new recurring responsibility, durable Bot, credential or Connection, broader permission/scope, strategic authority handover, or destructive/irreversible change requires the corresponding explicit authority or approval.
 - If the user directly requested an action or recurring responsibility, that request is already intent/consent for that requested work; do not ask a redundant technical confirmation unless another owner/security boundary requires it.
 - Use natural outcome language for normal users. Keep component jargon in technical receipts or advanced inspection only.
-Deterministic host authorization and owner security rules remain stronger than these runtime instructions.`;
+Deterministic host authorization and owner security rules remain stronger than these runtime instructions.
+
+Workspace organization:
+- If current work plus canonical context provides strong evidence of a substantial durable client, project, case, practice, team, or personal area that should stay isolated, you may organize it automatically through the existing aiverse_action tool.
+- Do not create a workspace for a trivial one-off task. Reuse an existing matching scope when the evidence points to one.
+- Only request automatic organization when the boundary is clear, privacy is not materially ambiguous, and no new permission, credential, Connection, external effect, recurring responsibility, or strategic authority transfer is needed.
+- Use action_class "write_local_reversible", operation "workspace.ensure", with parameters containing:
+  workspace: { id, name, type, purpose, domains, canonical_sources }
+  evidence: { substantial_scope: true, boundary_clear: true, reason }
+  authority: { permission_expansion: false, privacy_ambiguous: false, new_connection: false, new_credential: false }
+- Do not invent source references. Omit unknown optional arrays or use empty arrays.
+- If a real privacy or scope boundary is ambiguous, ask only the natural question needed to resolve that boundary instead of making the workspace mutation.
+- After successful internal organization, continue the user's work and use natural outcome language if mentioning it. Do not expose OS schema or component jargon.`;
 
 const ACTION_TOOL = {
   type: "function",
@@ -185,7 +197,30 @@ export class RunEngine {
       if (call?.function?.name !== "aiverse_action") throw new GatewayError("TOOL_NOT_ADMITTED", `Tool ${call?.function?.name ?? "unknown"} is not admitted`, 403);
       let args;
       try { args = JSON.parse(call.function.arguments || "{}"); } catch { throw new GatewayError("TOOL_ARGS_INVALID", "Tool arguments are invalid JSON"); }
-      const request = { action_class: args.action_class, scope, operation: args.operation, parameters: args.parameters ?? {}, idempotency_key: `${run.run_id}:${call.id}`, in_scope: true, within_budget: true, reversible: false, reason: args.reason ?? "Runtime requested action through Gateway" };
+      let parameters = args.parameters ?? {};
+      if (args.operation === "workspace.ensure") {
+        if (!parameters || typeof parameters !== "object" || Array.isArray(parameters)) throw new GatewayError("TOOL_ARGS_INVALID", "workspace.ensure parameters must be an object");
+        parameters = {
+          ...parameters,
+          provenance: {
+            trigger_ref: `run:${run.run_id}`,
+            classifier: "gateway-runtime",
+            source: "gateway"
+          }
+        };
+      }
+      const request = {
+        action_class: args.action_class,
+        scope,
+        operation: args.operation,
+        parameters,
+        idempotency_key: `${run.run_id}:${call.id}`,
+        in_scope: true,
+        within_budget: true,
+        reversible: args.action_class === "write_local_reversible",
+        reason: args.reason ?? "Runtime requested action through Gateway"
+      };
+      request.request_fingerprint = actionFingerprint(request);
       const authorization = await this.host.authorizeAction(request, signal);
       await this.store.event(run.run_id, "tool.authorized", { tool_call_id: call.id, decision: summarizeDecision(authorization) });
       if (isDenied(authorization)) throw new GatewayError("ACTION_DENIED", "OS host denied the requested action", 403);
@@ -200,11 +235,35 @@ export class RunEngine {
       const result = await this.host.requestAction(request, signal);
       run.usage.actions += 1;
       this.assertBudgetAfterUsage(run);
+      if (request.operation === "workspace.ensure") await this.applyWorkspaceOrganization(run, scope, result);
       run.messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
       await this.store.event(run.run_id, "tool.completed", { tool_call_id: call.id, operation: request.operation, status: result?.status ?? null });
       await this.store.saveRun(run);
     }
     return "done";
+  }
+  async applyWorkspaceOrganization(run, scope, result) {
+    const organized = result?.result?.workspace_organization;
+    if (!organized || !["created", "evolved", "existing"].includes(organized.state)) return;
+    const workspaceId = organized?.workspace?.id;
+    if (typeof workspaceId !== "string" || !/^[a-z0-9][a-z0-9-]{0,127}$/.test(workspaceId)) throw new GatewayError("WORKSPACE_OWNER_RESULT_INVALID", "OS workspace owner returned an invalid workspace binding", 502);
+    const currentWorkspace = scope === "operator" ? "operator" : scope.slice("workspace:".length);
+    if (currentWorkspace !== "operator" && currentWorkspace !== workspaceId) throw new GatewayError("WORKSPACE_SCOPE_CONFLICT", "OS workspace result conflicts with the run's bound workspace", 409);
+
+    const session = await this.store.getSession(run.session_id);
+    if (!session) throw new GatewayError("SESSION_NOT_FOUND", "Run session is missing", 409);
+    if (session.system_id !== run.system_id || session.principal !== run.principal || session.workspace_id !== run.workspace_id) {
+      throw new GatewayError("SESSION_BINDING_MISMATCH", "Session changed while workspace organization was being applied", 409);
+    }
+    if (session.workspace_id === workspaceId) return;
+
+    session.workspace_id = workspaceId;
+    await this.store.saveSession(session);
+    await this.store.event(run.run_id, "workspace.bound", {
+      workspace_id: workspaceId,
+      owner_state: organized.state,
+      applies_to: "subsequent_session_runs"
+    });
   }
   async approve(runId, principal, decision, operationId) {
     const run = await this.store.getRun(runId);
@@ -249,6 +308,10 @@ function stripInternal(messages) { return messages.map(({ _gateway_context, _gat
 function lastUserText(messages) { const m = [...messages].reverse().find((x) => x.role === "user"); return typeof m?.content === "string" ? m.content : JSON.stringify(m?.content ?? ""); }
 function addUsage(target, usage = {}) { target.input_tokens += Number(usage.input_tokens ?? 0); target.output_tokens += Number(usage.output_tokens ?? 0); target.cost += Number(usage.cost ?? 0); }
 function progressFingerprint(value) { return createHash("sha256").update(stableStringify(value)).digest("hex"); }
+function actionFingerprint(request) {
+  const { request_fingerprint, ...material } = request;
+  return createHash("sha256").update(stableStringify(material)).digest("hex");
+}
 function summarizeDecision(x) { return x?.decision ?? x?.status ?? (x?.allowed === true ? "allow" : x?.allowed === false ? "deny" : "unknown"); }
 function isDenied(x) { return x?.allowed === false || ["deny", "denied", "forbidden"].includes(String(x?.decision ?? x?.status ?? "").toLowerCase()); }
 function needsApproval(x) { return x?.approval_required === true || ["approval", "approval_required", "require_approval"].includes(String(x?.decision ?? x?.status ?? "").toLowerCase()); }
