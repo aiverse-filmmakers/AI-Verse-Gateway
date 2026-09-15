@@ -258,6 +258,111 @@ test("legacy hosts perform no history read for ordinary turns and one bounded co
   assert.equal(historical.safe.context_ladder.owner_history.legacy[0].marker, "LEGACY-HISTORY-MARKER");
 });
 
+test("session-digest exact fallback prefers bounded source_coverage over broad external owner refs", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "avg-g1-real-digest-source-"));
+  const store = new GatewayStore(home);
+  await store.init();
+  await store.createSession({
+    system_id: "local",
+    workspace_id: "alpha",
+    principal: "operator",
+    session_id: "sess_real_digest_source"
+  });
+  const messages = [
+    { role: "user", content: "Broad ref fixture." },
+    { role: "assistant", content: "Exact COMET-77 source evidence." }
+  ];
+  const sourceRun = await store.createRun({
+    run_id: "run_real_digest_source",
+    session_id: "sess_real_digest_source",
+    system_id: "local",
+    workspace_id: "alpha",
+    principal: "operator",
+    runtime: { kind: "deterministic" },
+    messages,
+    max_turns: 1,
+    budget: { max_actions: 1, max_tokens: null, max_cost: null },
+    deadline_at: new Date(Date.now() + 60_000).toISOString()
+  });
+  sourceRun.status = "completed";
+  sourceRun.completed_at = "2026-09-15T12:00:00.000Z";
+  await store.saveRun(sourceRun);
+
+  const expectedFingerprint = "sha256:" + sha256(stableStringify(messages));
+  const host = new ProgressiveHost({ sourceMode: "session" });
+  host.retrieveHistoryProgressive = async function(payload) {
+    this.calls.push({ op: "progressive", depth: payload.depth, payload });
+    if (payload.depth === "catalog") {
+      return {
+        schema_version: 1,
+        api_version: PROGRESSIVE_HISTORY_VERSION,
+        depth: "catalog",
+        scope: payload.scope,
+        catalog: { counts: { atomic_memory: 0, indexed_sources: 0, session_digests: 1 } }
+      };
+    }
+    if (payload.depth === "summary" || payload.depth === "detail") {
+      return {
+        schema_version: 1,
+        api_version: PROGRESSIVE_HISTORY_VERSION,
+        depth: payload.depth,
+        scope: payload.scope,
+        items: [{
+          record_type: "session_digest",
+          id: "sdg-real",
+          scope: payload.scope,
+          summary: "COMET-77 prior session",
+          deeper_evidence_available: true,
+          evidence: {
+            path: "memory/session/sdg-real.json",
+            canonical_version: "sha256:canonical",
+            digest_fingerprint: "sha256:digest"
+          }
+        }]
+      };
+    }
+    if (payload.depth === "source") {
+      return {
+        schema_version: 1,
+        api_version: PROGRESSIVE_HISTORY_VERSION,
+        depth: "source",
+        scope: payload.scope,
+        status: "external_source_required",
+        exact_evidence: false,
+        evidence: {
+          source_fingerprint: expectedFingerprint,
+          external_source_refs: [
+            "gateway:session:sess_real_digest_source",
+            "gateway:run:run_real_digest_source"
+          ],
+          source_coverage: [
+            "gateway:run:run_real_digest_source:messages:0-1"
+          ]
+        }
+      };
+    }
+    throw new Error("unexpected depth");
+  };
+
+  const query = "What exact source says COMET-77?";
+  const assembled = await assembleProgressiveOwnerContext({
+    host,
+    store,
+    run: fixtureRun([{ role: "user", content: query }]),
+    scope: "workspace:alpha",
+    query
+  });
+
+  assert.equal(assembled.safe.context_ladder.owner_history.gateway_exact_source.status, "ok");
+  assert.equal(assembled.diagnostics.gateway_source_range_reads, 1);
+  assert.equal(
+    assembled.safe.context_ladder.owner_history.gateway_exact_source.messages.some((m) =>
+      m.content.includes("COMET-77")
+    ),
+    true
+  );
+});
+
 test("session-digest exact fallback revalidates Gateway scope and source fingerprint before returning raw evidence", async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "avg-g1-external-source-"));
   const store = new GatewayStore(home);
