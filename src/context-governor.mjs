@@ -63,6 +63,7 @@ export async function governInvocationContext({
         pressure_after: beforePressure,
         estimated_tokens_before: beforeTokens,
         estimated_tokens_after: beforeTokens,
+        tokens_by_layer: rawLayerTokens(input, policy, beforeTokens),
         raw_tail_messages: input.length,
         prefix_messages: 0,
         fold_scheduled: !skipped,
