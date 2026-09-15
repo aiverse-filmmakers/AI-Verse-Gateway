@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 35
     env:
-      OS_SHA: 3eeb27e78829abce4651cb0067957a77b1b6078f
+      OS_SHA: 924a21a3dc1094d0fb6cc422f55fdfc714634e4d
       MEMORY_SHA: 406b14fb4398eb1b16dd5f30e50520e8c3540972
 
     steps:
