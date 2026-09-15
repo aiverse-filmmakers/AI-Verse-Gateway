@@ -68,6 +68,7 @@ export async function searchFoldArchive(store, options = {}) {
 
   let exactHits = [];
   let unfoldedCardIds = [];
+  let unfoldedSourceRefs = [];
   let truncated = false;
   let rawBytes = 0;
 
@@ -102,6 +103,7 @@ export async function searchFoldArchive(store, options = {}) {
 
       for (const source of sources) {
         const ref = source.source_ref;
+        unfoldedSourceRefs.push(`gateway:run:${ref.run_id}:messages:${ref.start_index}-${ref.end_index}`);
         for (let offset = 0; offset < source.messages.length; offset += 1) {
           const message = source.messages[offset];
           const messageIndex = Number(ref.start_index) + offset;
@@ -155,6 +157,7 @@ export async function searchFoldArchive(store, options = {}) {
     compact,
     exactHits,
     unfoldedCardIds,
+    unfoldedSourceRefs,
     staleCardIds: uniqueStale
   });
 
@@ -275,7 +278,7 @@ export async function unfoldFoldCard(store, options = {}) {
   };
 }
 
-function buildArchiveDiagnostics({ precision, cards, compact, exactHits, unfoldedCardIds, staleCardIds }) {
+function buildArchiveDiagnostics({ precision, cards, compact, exactHits, unfoldedCardIds, unfoldedSourceRefs, staleCardIds }) {
   const uniqueUnfolded = [...new Set(unfoldedCardIds)];
   const cardsUsed = uniqueUnfolded.length > 0
     ? uniqueUnfolded
@@ -287,8 +290,8 @@ function buildArchiveDiagnostics({ precision, cards, compact, exactHits, unfolde
   ]).filter(Boolean);
   const sourceRefs = [...new Set(
     exactHits.length > 0
-      ? exactHits.map((hit) => hit.source_ref)
-      : compactSourceRefs
+      ? [...exactHits.map((hit) => hit.source_ref), ...(unfoldedSourceRefs ?? [])]
+      : (unfoldedSourceRefs?.length > 0 ? unfoldedSourceRefs : compactSourceRefs)
   )];
   let exactFallbackReason = "not_requested";
   if (precision) {
