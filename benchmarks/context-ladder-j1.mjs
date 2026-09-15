@@ -9,6 +9,8 @@ import { governInvocationContext, estimateInvocationTokens } from "../src/contex
 import { stableStringify } from "../src/util.mjs";
 
 export const J1_GATEWAY_BENCHMARK_VERSION = "gateway.context-ladder-j1.v1";
+export const J1_LONG_HISTORY_MIN_REDUCTION = 0.75;
+export const J1_LARGE_INVOCATION_MIN_REDUCTION = 0.90;
 
 function scope(workspaceId = "alpha") {
   return { system_id: "local", workspace_id: workspaceId, principal: "operator" };
@@ -221,7 +223,7 @@ async function benchmarkFoldArchive(store, history) {
     fold_cards_created: created.length,
     fold_latency_ms: Number(foldLatency.toFixed(3)),
     retrieval_latency_ms: Number(searchLatency.toFixed(3)),
-    source_reads: Array.isArray(exact.unfolded_source_refs) ? exact.unfolded_source_refs.length : 0,
+    source_reads: Array.isArray(exact.diagnostics?.source_refs) ? exact.diagnostics.source_refs.length : 0,
     exact_fact_recovered: recovered,
     canonical_raw_history_unchanged: canonicalUnchanged,
     catalog_card_count: catalog.cards.length,
@@ -303,6 +305,15 @@ export async function runGatewayJ1Benchmark() {
     schema_version: "1.0",
     benchmark_version: J1_GATEWAY_BENCHMARK_VERSION,
     owner: "ai-verse-gateway",
+    frozen_thresholds: {
+      long_history_min_context_reduction_ratio: J1_LONG_HISTORY_MIN_REDUCTION,
+      very_large_invocation_min_token_reduction_ratio: J1_LARGE_INVOCATION_MIN_REDUCTION,
+      frozen_after_measurement: true,
+      measured_reference: {
+        long_history_context_reduction_ratio: 0.809934,
+        very_large_invocation_token_reduction_ratio: 0.931241
+      }
+    },
     candidate: {
       total_scenarios: scenarios.length,
       correct_scenarios: correct,
