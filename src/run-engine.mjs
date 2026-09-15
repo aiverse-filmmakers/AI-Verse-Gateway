@@ -4,7 +4,7 @@ import { RuntimeRegistry } from "./runtime.mjs";
 import { HostClient } from "./host-adapter.mjs";
 import { GoalOwnerClient } from "./goal-owner.mjs";
 import { governInvocationContext } from "./context-governor.mjs";
-import { assembleProgressiveOwnerContext } from "./progressive-context.mjs";
+import { assembleProgressiveOwnerContext, PROGRESSIVE_CONTEXT_VERSION } from "./progressive-context.mjs";
 import { nowIso, stableStringify } from "./util.mjs";
 
 const USER_INTERACTION_POLICY = `User interaction law:
@@ -190,8 +190,24 @@ export class RunEngine {
       const scope = run.workspace_id === "operator" ? "operator" : `workspace:${run.workspace_id}`;
       if (run.goal_binding?.goal_id && !Number.isInteger(run.goal_binding.version)) run.goal_binding = await this.initialGoalBinding(run.goal_binding.goal_id, scope, signal);
       const context = await this.assembleContext(run, scope, signal);
+      const retrievalDiagnostics = context.diagnostics ?? {
+        schema_version: "1.0",
+        api_version: PROGRESSIVE_CONTEXT_VERSION,
+        query_fingerprint: null,
+        requested_depth: null,
+        realized_depths: [],
+        progressive_available: false,
+        intent_class: "unavailable",
+        exact_sensitive: false,
+        source_reads: 0,
+        gateway_source_range_reads: 0,
+        legacy_reads: 0,
+        fallback_reason: "context_diagnostics_unavailable",
+        bytes_by_depth: {},
+        item_counts: {}
+      };
       run.context_retrieval = {
-        ...context.diagnostics,
+        ...retrievalDiagnostics,
         evaluated_at: nowIso()
       };
       if (context.system_message && !run.messages.some((m) => m.role === "system" && m._gateway_context === true)) {
@@ -199,16 +215,16 @@ export class RunEngine {
       }
       await this.store.saveRun(run);
       await this.store.event(runId, "context.retrieval.assembled", {
-        requested_depth: context.diagnostics.requested_depth,
-        realized_depths: context.diagnostics.realized_depths,
-        progressive_available: context.diagnostics.progressive_available,
-        exact_sensitive: context.diagnostics.exact_sensitive,
-        source_reads: context.diagnostics.source_reads,
-        gateway_source_range_reads: context.diagnostics.gateway_source_range_reads,
-        legacy_reads: context.diagnostics.legacy_reads,
-        fallback_reason: context.diagnostics.fallback_reason,
-        bytes_by_depth: context.diagnostics.bytes_by_depth,
-        item_counts: context.diagnostics.item_counts
+        requested_depth: retrievalDiagnostics.requested_depth,
+        realized_depths: retrievalDiagnostics.realized_depths,
+        progressive_available: retrievalDiagnostics.progressive_available,
+        exact_sensitive: retrievalDiagnostics.exact_sensitive,
+        source_reads: retrievalDiagnostics.source_reads,
+        gateway_source_range_reads: retrievalDiagnostics.gateway_source_range_reads,
+        legacy_reads: retrievalDiagnostics.legacy_reads,
+        fallback_reason: retrievalDiagnostics.fallback_reason,
+        bytes_by_depth: retrievalDiagnostics.bytes_by_depth,
+        item_counts: retrievalDiagnostics.item_counts
       });
 
       while (true) {
