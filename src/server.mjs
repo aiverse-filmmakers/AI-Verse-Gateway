@@ -107,7 +107,8 @@ async function createRun(req, body, identity, ctx) {
   }
   workspace = String(workspace);
   if (!/^(operator|[a-z0-9][a-z0-9-]{0,127})$/.test(workspace)) throw new GatewayError("WORKSPACE_INVALID", "Invalid workspace binding");
-  const payload = { system_id: systemId, workspace_id: workspace, requested_session_id: requestedSessionId, messages: body.messages, goal_id: body?.metadata?.goal_id ?? null, model: body.model ?? null };
+  const contextPolicy = { cache_sensitive: body?.metadata?.cache_sensitive_context === true };
+  const payload = { system_id: systemId, workspace_id: workspace, requested_session_id: requestedSessionId, messages: body.messages, goal_id: body?.metadata?.goal_id ?? null, model: body.model ?? null, context_policy: contextPolicy };
   const idemKey = req.headers["idempotency-key"];
   const idem = await ctx.store.claimIdempotency("run", typeof idemKey === "string" ? idemKey : null, payload);
   if (idem.state === "replay" && idem.record.result?.run_id) {
@@ -116,7 +117,7 @@ async function createRun(req, body, identity, ctx) {
   }
   const session = await ctx.store.createSession({ system_id: systemId, workspace_id: workspace, principal: identity.principal, session_id: requestedSessionId });
   const limits = intersectBudget(ctx.config.limits, body?.metadata?.budget ?? {});
-  const run = await ctx.store.createRun({ session_id: session.session_id, system_id: systemId, workspace_id: workspace, principal: identity.principal, runtime: { kind: ctx.config.runtime.kind, model: body.model ?? ctx.config.runtime.model ?? null }, messages: body.messages, goal_binding: payload.goal_id ? { goal_id: payload.goal_id } : null, max_turns: payload.goal_id ? limits.max_goal_continuation_turns : 1, budget: { max_tokens: limits.max_tokens, max_cost: limits.max_cost, max_actions: limits.max_actions }, deadline_at: new Date(Date.now() + limits.wall_clock_seconds * 1000).toISOString() });
+  const run = await ctx.store.createRun({ session_id: session.session_id, system_id: systemId, workspace_id: workspace, principal: identity.principal, runtime: { kind: ctx.config.runtime.kind, model: body.model ?? ctx.config.runtime.model ?? null }, messages: body.messages, goal_binding: payload.goal_id ? { goal_id: payload.goal_id } : null, context_policy: contextPolicy, max_turns: payload.goal_id ? limits.max_goal_continuation_turns : 1, budget: { max_tokens: limits.max_tokens, max_cost: limits.max_cost, max_actions: limits.max_actions }, deadline_at: new Date(Date.now() + limits.wall_clock_seconds * 1000).toISOString() });
   session.active_run_id = run.run_id; await ctx.store.saveSession(session);
   await ctx.store.commitIdempotency(idem.mapKey, { run_id: run.run_id });
   await ctx.engine.start(run.run_id);
