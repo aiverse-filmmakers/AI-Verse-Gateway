@@ -156,6 +156,10 @@ export async function getFoldCard(store, cardId) {
   if (!self.valid) {
     throw new GatewayError("INVALID_FOLD_CARD", `Fold card ${cardId} failed self-validation: ${self.errors.join("; ")}`, 409);
   }
+  const live = await validateFoldCard(store, cardId);
+  if (!live.valid) {
+    throw new GatewayError("INVALID_FOLD_CARD", `Fold card ${cardId} failed live validation: ${live.errors.join("; ")}`, 409);
+  }
   return card;
 }
 
@@ -193,18 +197,37 @@ async function validateRecursive(store, cardId, errors, visited) {
   }
 
   if (card.level === 1) {
+    let actualCoveredBytes = 0;
+    let priorOrder = null;
     for (const ref of card.source_refs) {
       try {
-        await readFoldSource(store, ref, card.scope);
+        const resolved = await readFoldSource(store, ref, card.scope);
+        actualCoveredBytes += Buffer.byteLength(stableStringify(resolved.messages), "utf8");
+        const run = await store.getRun(ref.run_id);
+        if (!run) {
+          errors.push(`${cardId}:source_missing_run:${ref.run_id}`);
+          continue;
+        }
+        const currentOrder = runOrderKey(run, ref.start_index);
+        if (priorOrder && compareOrderKey(priorOrder, currentOrder) >= 0) errors.push(`${cardId}:source_order`);
+        priorOrder = runOrderKey(run, ref.end_index);
       } catch (error) {
         errors.push(`${cardId}:source:${error?.code ?? error?.message ?? "invalid"}`);
       }
     }
+    if (actualCoveredBytes > 0 && card.size_estimate.covered_bytes !== actualCoveredBytes) errors.push(`${cardId}:covered_bytes_mismatch`);
   } else {
+    const children = [];
+    let priorBoundary = null;
     for (const ref of card.child_refs) {
       const child = await readJson(store.foldCardFile(ref.card_id), null);
       if (!child) {
         errors.push(`${cardId}:child_missing:${ref.card_id}`);
+        continue;
+      }
+      const childSelf = selfValidateCard(child);
+      if (!childSelf.valid) {
+        for (const error of childSelf.errors) errors.push(`${cardId}:child_invalid:${ref.card_id}:${error}`);
         continue;
       }
       if (child.fingerprint !== ref.fingerprint) {
@@ -213,10 +236,71 @@ async function validateRecursive(store, cardId, errors, visited) {
       }
       if (child.level !== card.level - 1) errors.push(`${cardId}:child_level_mismatch:${ref.card_id}`);
       if (stableStringify(child.scope) !== stableStringify(card.scope)) errors.push(`${cardId}:child_scope_mismatch:${ref.card_id}`);
+
+      const boundary = await cardBoundaryOrder(store, child);
+      if (!boundary) {
+        errors.push(`${cardId}:child_boundary_invalid:${ref.card_id}`);
+      } else {
+        if (priorBoundary && compareOrderKey(priorBoundary, boundary.first) >= 0) errors.push(`${cardId}:child_order`);
+        priorBoundary = boundary.last;
+      }
+
+      children.push(child);
       await validateRecursive(store, ref.card_id, errors, visited);
+    }
+
+    if (children.length === card.child_refs.length && children.length > 0) {
+      const expectedCoveredBytes = children.reduce((sum, child) => sum + child.size_estimate.covered_bytes, 0);
+      const expectedSources = children.reduce((sum, child) => sum + child.coverage.descendant_source_count, 0);
+      const expectedMessages = children.reduce((sum, child) => sum + child.coverage.descendant_message_count, 0);
+      if (card.size_estimate.covered_bytes !== expectedCoveredBytes) errors.push(`${cardId}:covered_bytes_mismatch`);
+      if (
+        card.coverage.descendant_source_count !== expectedSources ||
+        card.coverage.descendant_message_count !== expectedMessages ||
+        card.coverage.first_source_ref !== children[0].coverage.first_source_ref ||
+        card.coverage.last_source_ref !== children[children.length - 1].coverage.last_source_ref
+      ) errors.push(`${cardId}:coverage_mismatch`);
     }
   }
   visited.delete(cardId);
+}
+
+async function cardBoundaryOrder(store, card) {
+  const first = parseSourcePointer(card.coverage?.first_source_ref);
+  const last = parseSourcePointer(card.coverage?.last_source_ref);
+  if (!first || !last) return null;
+  const [firstRun, lastRun] = await Promise.all([store.getRun(first.run_id), store.getRun(last.run_id)]);
+  if (!firstRun || !lastRun) return null;
+  return {
+    first: runOrderKey(firstRun, first.start_index),
+    last: runOrderKey(lastRun, last.end_index)
+  };
+}
+
+function parseSourcePointer(value) {
+  if (typeof value !== "string") return null;
+  const match = value.match(/^gateway:run:(.+):messages:(\d+)-(\d+)$/);
+  if (!match) return null;
+  return {
+    run_id: match[1],
+    start_index: Number(match[2]),
+    end_index: Number(match[3])
+  };
+}
+
+function runOrderKey(run, messageIndex) {
+  return {
+    at: String(run.completed_at ?? run.created_at ?? ""),
+    run_id: String(run.run_id ?? ""),
+    message_index: Number(messageIndex)
+  };
+}
+
+function compareOrderKey(a, b) {
+  if (a.run_id === b.run_id) return a.message_index - b.message_index;
+  const byTime = a.at.localeCompare(b.at);
+  if (byTime !== 0) return byTime;
+  return a.run_id.localeCompare(b.run_id);
 }
 
 export async function readFoldSource(store, ref, expectedScope = null) {
@@ -513,7 +597,11 @@ function validateCoverageShape(card, errors) {
   if (typeof first !== "string" || typeof last !== "string" || !first.startsWith("gateway:run:") || !last.startsWith("gateway:run:")) errors.push("coverage");
 
   if (card.level === 1 && Array.isArray(card.source_refs)) {
-    const messageCount = card.source_refs.reduce((sum, ref) => sum + (Number.isInteger(ref?.message_count) ? ref.message_count : 0), 0);
+    if (card.source_refs.length === 0 || !card.source_refs.every(validSourceRefShape)) {
+      errors.push("coverage");
+      return;
+    }
+    const messageCount = card.source_refs.reduce((sum, ref) => sum + ref.message_count, 0);
     if (
       coverage.direct_source_count !== card.source_refs.length ||
       coverage.direct_message_count !== messageCount ||
