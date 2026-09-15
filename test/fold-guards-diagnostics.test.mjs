@@ -259,7 +259,7 @@ async function serverFixture() {
     system_root: root,
     host_config: hostConfig,
     runtime: "deterministic",
-    context_window_tokens: 4096,
+    context_window_tokens: 65536,
     context_soft_pressure_ratio: 0.6,
     context_hard_pressure_ratio: 0.85,
     context_recent_raw_tail_messages: 4
