@@ -1,6 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { runGatewayJ1Benchmark, J1_GATEWAY_BENCHMARK_VERSION } from "../benchmarks/context-ladder-j1.mjs";
+import {
+  runGatewayJ1Benchmark,
+  J1_GATEWAY_BENCHMARK_VERSION,
+  J1_LONG_HISTORY_MIN_REDUCTION,
+  J1_LARGE_INVOCATION_MIN_REDUCTION
+} from "../benchmarks/context-ladder-j1.mjs";
 
 test("J1 Gateway benchmark is machine-readable and covers accepted Gateway-owned scenarios", async () => {
   const result = await runGatewayJ1Benchmark();
@@ -16,8 +21,10 @@ test("J1 Gateway benchmark is machine-readable and covers accepted Gateway-owned
   assert.equal(result.safety.canonical_raw_history_unchanged, true);
   assert.equal(result.durability.restart_archive_recovery, true);
   assert.equal(result.durability.fold_catalog_rebuild_equivalent, true);
-  assert.ok(result.candidate.long_history_context_reduction_ratio > 0);
-  assert.ok(result.candidate.very_large_invocation_token_reduction_ratio > 0);
+  assert.ok(result.candidate.long_history_context_reduction_ratio >= J1_LONG_HISTORY_MIN_REDUCTION);
+  assert.ok(result.candidate.very_large_invocation_token_reduction_ratio >= J1_LARGE_INVOCATION_MIN_REDUCTION);
+  assert.equal(result.frozen_thresholds.frozen_after_measurement, true);
+  assert.ok(result.candidate.source_reads > 0);
 
   const ids = new Set(result.scenarios.map((row) => row.scenario_id));
   assert.deepEqual(ids, new Set([
