@@ -9,6 +9,7 @@ import { RunEngine } from "../src/run-engine.mjs";
 import { foldOldestHistory } from "../src/fold-engine.mjs";
 import { governInvocationContext } from "../src/context-governor.mjs";
 import {
+  assembleProgressiveOwnerContext,
   retrieveRuntimeDeepContext,
   PROGRESSIVE_HISTORY_VERSION
 } from "../src/progressive-context.mjs";
@@ -397,7 +398,14 @@ async function main() {
       { role: "user", content: "What should I focus on today?" }
     ]
   });
-  const ordinary = await engine.assembleContext(
+  const ordinary = await assembleProgressiveOwnerContext({
+    host: engine.host,
+    store,
+    run: ordinaryRun,
+    scope: scopeName(),
+    query: "What should I focus on today?"
+  });
+  const ordinaryRuntime = await engine.assembleContext(
     ordinaryRun,
     scopeName()
   );
@@ -407,6 +415,10 @@ async function main() {
   );
   assert.equal(ordinary.diagnostics.source_reads, 0);
   assert.equal(hasRawAtomicText(ordinary.safe), false);
+  assert.doesNotMatch(
+    ordinaryRuntime.system_message,
+    /J2-NYX target port is 7[12]00/
+  );
   const catalog =
     ordinary.safe.context_ladder.owner_history.catalog;
   assert.ok(
@@ -451,10 +463,14 @@ async function main() {
         "What exact source wording from the prior J2 session says COMET-77?"
     }]
   });
-  const exact = await engine.assembleContext(
-    exactRun,
-    scopeName()
-  );
+  const exact = await assembleProgressiveOwnerContext({
+    host: engine.host,
+    store,
+    run: exactRun,
+    scope: scopeName(),
+    query:
+      "What exact source wording from the prior J2 session says COMET-77?"
+  });
   assert.equal(exact.diagnostics.requested_depth, "source");
   assert.deepEqual(
     exact.diagnostics.realized_depths,
@@ -767,10 +783,14 @@ async function main() {
     }]
   });
   const restartExact =
-    await restartedEngine.assembleContext(
-      restartRun,
-      scopeName()
-    );
+    await assembleProgressiveOwnerContext({
+      host: restartedEngine.host,
+      store: restartedStore,
+      run: restartRun,
+      scope: scopeName(),
+      query:
+        "What exact source wording from the prior J2 session says COMET-77?"
+    });
   assert.equal(
     restartExact.safe.context_ladder.owner_history
       .gateway_exact_source.status,
