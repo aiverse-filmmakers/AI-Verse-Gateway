@@ -387,24 +387,170 @@ function cardFingerprint(cardLike) {
 
 function selfValidateCard(card) {
   const errors = [];
-  if (!card || typeof card !== "object") return { valid: false, errors: ["not_object"] };
+  if (!card || typeof card !== "object" || Array.isArray(card)) return { valid: false, errors: ["not_object"] };
   if (card.schema_version !== CARD_SCHEMA) errors.push("schema_version");
   if (card.kind !== CARD_KIND) errors.push("kind");
   if (!Number.isInteger(card.level) || card.level < 1 || card.level > MAX_LEVEL) errors.push("level");
   try { normalizeScope(card.scope); } catch { errors.push("scope"); }
-  if (!Array.isArray(card.child_refs) || !Array.isArray(card.source_refs)) errors.push("refs");
-  if (typeof card.summary !== "string" || card.summary.length === 0) errors.push("summary");
-  if (typeof card.created_at !== "string" || card.created_at.length === 0) errors.push("created_at");
+
+  const childRefs = Array.isArray(card.child_refs) ? card.child_refs : null;
+  const sourceRefs = Array.isArray(card.source_refs) ? card.source_refs : null;
+  if (!childRefs || !sourceRefs) errors.push("refs");
+  if (typeof card.summary !== "string" || card.summary.length === 0 || card.summary.length > MAX_SUMMARY_CHARS) errors.push("summary");
+  if (typeof card.created_at !== "string" || !Number.isFinite(Date.parse(card.created_at))) errors.push("created_at");
   if (typeof card.card_id !== "string" || !/^fold_[a-f0-9]{40}$/.test(card.card_id)) errors.push("card_id");
   if (typeof card.fingerprint !== "string" || !/^sha256:[a-f0-9]{64}$/.test(card.fingerprint)) errors.push("fingerprint");
-  if (card.validation_state?.state !== "validated") errors.push("validation_state");
+
+  validateGeneratorShape(card.generator, errors);
+  validateValidationState(card.validation_state, card.level, errors);
+
+  if (childRefs && sourceRefs && Number.isInteger(card.level)) {
+    if (card.level === 1) {
+      if (sourceRefs.length === 0 || childRefs.length !== 0) errors.push("ref_mode");
+      const seen = new Set();
+      let priorSameRun = null;
+      for (const ref of sourceRefs) {
+        if (!validSourceRefShape(ref)) {
+          errors.push("source_ref_shape");
+          continue;
+        }
+        const key = sourceRefKey(ref);
+        if (seen.has(key)) errors.push("source_ref_duplicate");
+        seen.add(key);
+        if (priorSameRun && priorSameRun.run_id === ref.run_id && ref.start_index <= priorSameRun.end_index) errors.push("source_ref_order");
+        priorSameRun = ref;
+      }
+    } else if (card.level > 1) {
+      if (childRefs.length === 0 || sourceRefs.length !== 0) errors.push("ref_mode");
+      const seen = new Set();
+      for (const ref of childRefs) {
+        if (!validChildRefShape(ref)) {
+          errors.push("child_ref_shape");
+          continue;
+        }
+        if (seen.has(ref.card_id)) errors.push("child_ref_duplicate");
+        seen.add(ref.card_id);
+      }
+    }
+  }
+
+  validateCoverageShape(card, errors);
+  validateSizeShape(card, errors);
+
   if (errors.length === 0) {
     const expectedFingerprint = cardFingerprint(card);
     if (expectedFingerprint !== card.fingerprint) errors.push("fingerprint_mismatch");
     const expectedId = `fold_${expectedFingerprint.slice("sha256:".length, "sha256:".length + 40)}`;
     if (expectedId !== card.card_id) errors.push("identity_mismatch");
   }
-  return { valid: errors.length === 0, errors };
+  return { valid: errors.length === 0, errors: [...new Set(errors)] };
+}
+
+function validateGeneratorShape(generator, errors) {
+  if (!generator || typeof generator !== "object" || Array.isArray(generator)) {
+    errors.push("generator");
+    return;
+  }
+  for (const key of ["kind", "version"]) {
+    if (typeof generator[key] !== "string" || generator[key].trim().length === 0 || generator[key].length > 512) errors.push("generator");
+  }
+  for (const key of ["provider", "model", "prompt_fingerprint"]) {
+    if (generator[key] !== undefined && generator[key] !== null && (typeof generator[key] !== "string" || generator[key].trim().length === 0 || generator[key].length > 512)) errors.push("generator");
+  }
+}
+
+function validateValidationState(state, level, errors) {
+  if (!state || typeof state !== "object" || state.state !== "validated" || !Array.isArray(state.checks)) {
+    errors.push("validation_state");
+    return;
+  }
+  const required = ["structure", "scope", "ordered_refs", level === 1 ? "source_fingerprints" : "child_fingerprints", "content_fingerprint"];
+  if (state.checks.some((item) => typeof item !== "string") || required.some((item) => !state.checks.includes(item))) errors.push("validation_state");
+}
+
+function validSourceRefShape(ref) {
+  return Boolean(
+    ref &&
+    typeof ref === "object" &&
+    ref.kind === "run_messages" &&
+    safeStoredId(ref.run_id) &&
+    safeStoredId(ref.session_id) &&
+    Number.isInteger(ref.start_index) &&
+    Number.isInteger(ref.end_index) &&
+    ref.start_index >= 0 &&
+    ref.end_index >= ref.start_index &&
+    Number.isInteger(ref.message_count) &&
+    ref.message_count === ref.end_index - ref.start_index + 1 &&
+    typeof ref.fingerprint === "string" &&
+    /^sha256:[a-f0-9]{64}$/.test(ref.fingerprint)
+  );
+}
+
+function validChildRefShape(ref) {
+  return Boolean(
+    ref &&
+    typeof ref === "object" &&
+    typeof ref.card_id === "string" &&
+    /^fold_[a-f0-9]{40}$/.test(ref.card_id) &&
+    typeof ref.fingerprint === "string" &&
+    /^sha256:[a-f0-9]{64}$/.test(ref.fingerprint)
+  );
+}
+
+function validateCoverageShape(card, errors) {
+  const coverage = card.coverage;
+  if (!coverage || typeof coverage !== "object" || Array.isArray(coverage)) {
+    errors.push("coverage");
+    return;
+  }
+  const keys = ["direct_source_count", "direct_message_count", "child_count", "descendant_source_count", "descendant_message_count"];
+  if (keys.some((key) => !Number.isInteger(coverage[key]) || coverage[key] < 0)) {
+    errors.push("coverage");
+    return;
+  }
+  const first = coverage.first_source_ref;
+  const last = coverage.last_source_ref;
+  if (typeof first !== "string" || typeof last !== "string" || !first.startsWith("gateway:run:") || !last.startsWith("gateway:run:")) errors.push("coverage");
+
+  if (card.level === 1 && Array.isArray(card.source_refs)) {
+    const messageCount = card.source_refs.reduce((sum, ref) => sum + (Number.isInteger(ref?.message_count) ? ref.message_count : 0), 0);
+    if (
+      coverage.direct_source_count !== card.source_refs.length ||
+      coverage.direct_message_count !== messageCount ||
+      coverage.child_count !== 0 ||
+      coverage.descendant_source_count !== card.source_refs.length ||
+      coverage.descendant_message_count !== messageCount ||
+      coverage.first_source_ref !== sourcePointer(card.source_refs[0]) ||
+      coverage.last_source_ref !== sourcePointer(card.source_refs[card.source_refs.length - 1])
+    ) errors.push("coverage");
+  } else if (card.level > 1 && Array.isArray(card.child_refs)) {
+    if (
+      coverage.direct_source_count !== 0 ||
+      coverage.direct_message_count !== 0 ||
+      coverage.child_count !== card.child_refs.length ||
+      coverage.descendant_source_count < card.child_refs.length ||
+      coverage.descendant_message_count < coverage.descendant_source_count
+    ) errors.push("coverage");
+  }
+}
+
+function validateSizeShape(card, errors) {
+  const size = card.size_estimate;
+  if (!size || typeof size !== "object" || Array.isArray(size)) {
+    errors.push("size_estimate");
+    return;
+  }
+  const summaryBytes = typeof card.summary === "string" ? Buffer.byteLength(card.summary, "utf8") : -1;
+  if (
+    !Number.isInteger(size.covered_bytes) || size.covered_bytes <= 0 ||
+    !Number.isInteger(size.summary_bytes) || size.summary_bytes !== summaryBytes ||
+    !Number.isInteger(size.estimated_covered_tokens) || size.estimated_covered_tokens !== estimateTokens(size.covered_bytes) ||
+    !Number.isInteger(size.estimated_summary_tokens) || size.estimated_summary_tokens !== estimateTokens(size.summary_bytes)
+  ) errors.push("size_estimate");
+}
+
+function safeStoredId(value) {
+  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value);
 }
 
 function normalizeScope(scope) {
