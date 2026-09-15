@@ -211,11 +211,8 @@ async function main() {
       type: "fact",
       importance: 4,
       confidence: 0.99,
-      source: "j2-integrated",
       why: "Historical configuration evidence.",
       tags: "j2,nyx,target,port",
-      evidence_refs: ["gateway:j2:old-port"],
-      effect_id: "j2:capture:old-port",
       admission: admission()
     }
   });
@@ -237,8 +234,6 @@ async function main() {
       type: "fact",
       confidence: 0.99,
       source: "j2-integrated",
-      evidence_refs: ["gateway:j2:temporary-aside"],
-      effect_id: "j2:capture:temporary-aside",
       admission: admission({ durable: false })
     }
   });
@@ -263,8 +258,6 @@ async function main() {
       source: "j2-integrated",
       why: "Explicit correction of the historical port.",
       tags: "j2,nyx,target,port,correction",
-      evidence_refs: ["gateway:j2:port-correction"],
-      effect_id: "j2:capture:port-correction",
       supersedes: oldMemoryId,
       admission: admission()
     }
@@ -598,8 +591,6 @@ async function main() {
       type: "fact",
       confidence: 0.99,
       source: "j2-integrated",
-      evidence_refs: ["gateway:j2:beta-private"],
-      effect_id: "j2:capture:beta-private",
       admission: admission()
     }
   });
