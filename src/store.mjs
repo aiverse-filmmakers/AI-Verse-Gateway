@@ -25,6 +25,7 @@ export class GatewayStore {
     await Promise.all([this.p.sessions, this.p.runs, this.p.events, this.p.foldCards].map(ensureDir));
     const idem = await readJson(this.p.idempotency, null);
     if (!idem) await atomicJson(this.p.idempotency, { schema_version: "1.0", records: {} });
+    await rebuildFoldCatalog(this, { live_validation: true });
   }
   sessionFile(sessionId) { assertStorageId(sessionId, "session_id"); return path.join(this.p.sessions, `${sessionId}.json`); }
   runFile(runId) { assertStorageId(runId, "run_id"); return path.join(this.p.runs, `${runId}.json`); }
@@ -151,6 +152,18 @@ export class GatewayStore {
       ) pending.push(run);
     }
     pending.sort((a, b) => String(a.completed_at ?? "").localeCompare(String(b.completed_at ?? "")));
+    return pending;
+  }
+  async pendingFoldWorkRuns() {
+    let names = [];
+    try { names = await readdir(this.p.runs); } catch { return []; }
+    const pending = [];
+    for (const name of names) {
+      if (!name.endsWith(".json")) continue;
+      const run = await readJson(path.join(this.p.runs, name), null);
+      if (run?.context_governor?.fold_work?.state === "scheduled_for_safe_boundary") pending.push(run);
+    }
+    pending.sort((a, b) => String(a.updated_at ?? a.created_at ?? "").localeCompare(String(b.updated_at ?? b.created_at ?? "")));
     return pending;
   }
   async recoverInterrupted() {
