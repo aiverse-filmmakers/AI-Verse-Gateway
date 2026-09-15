@@ -61,6 +61,8 @@ export class GatewayStore {
       error: null,
       goal_binding: input.goal_binding ?? null,
       automation_binding: input.automation_binding ?? null,
+      context_policy: input.context_policy ?? { cache_sensitive: false },
+      context_governor: null,
       continuation: { turn: 0, max_turns: input.max_turns ?? 1, fingerprints: [], no_progress_count: 0 },
       usage: { input_tokens: 0, output_tokens: 0, cost: 0, actions: 0 },
       budget: input.budget,
