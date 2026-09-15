@@ -30,6 +30,8 @@ const organizationReviewRuntimeFixture=path.resolve(here,"..","fixtures","organi
 const organizationReviewHostFixture=path.resolve(here,"..","fixtures","organization-review-host.mjs");
 const reviewBudgetRuntimeFixture=path.resolve(here,"..","fixtures","review-budget-runtime.mjs");
 const outcomeLanguageRuntimeFixture=path.resolve(here,"..","fixtures","outcome-language-runtime.mjs");
+const migrationDropHostFixture=path.resolve(here,"..","fixtures","migration-drop-host.mjs");
+const migrationDropRuntimeFixture=path.resolve(here,"..","fixtures","migration-drop-runtime.mjs");
 
 async function base(){const root=await mkdtemp(path.join(os.tmpdir(),"avg-loop-system-"));const home=await mkdtemp(path.join(os.tmpdir(),"avg-loop-home-"));await writeFile(path.join(root,"AI-VERSE.yaml"),"schema_version: 2.0\n");const hostConfig=path.join(root,"host.json");await writeFile(hostConfig,JSON.stringify({transport:"json-subprocess",command:[process.execPath,hostFixture],timeout_seconds:10,max_output_bytes:1048576,max_stderr_bytes:65536,env_names:[],cwd:root}));await installComponent({home});return{root,home,hostConfig};}
 async function fspReadJson(file){return JSON.parse(await readFile(file,"utf8"));}
@@ -128,6 +130,118 @@ test("automatic workspace organization rebinds the durable session for later tur
       })
     });
     assert.equal(explicitOverride.status, 409, "existing session binding must not be silently overridden");
+  } finally {
+    await live.close();
+  }
+});
+
+
+test("Gateway migration drop binds the exact user source and routes one owner action from operator scope", async () => {
+  const f = await base();
+  const migrationHostConfig = path.join(f.root, "migration-drop-host.json");
+  await writeFile(migrationHostConfig, JSON.stringify({
+    transport: "json-subprocess",
+    command: [process.execPath, migrationDropHostFixture],
+    timeout_seconds: 10,
+    max_output_bytes: 1048576,
+    max_stderr_bytes: 65536,
+    env_names: [],
+    cwd: f.root
+  }));
+  const setup = await setupComponent({
+    home: f.home,
+    system_root: f.root,
+    host_config: migrationHostConfig,
+    runtime: "json-subprocess",
+    runtime_command: JSON.stringify([process.execPath, migrationDropRuntimeFixture])
+  });
+  const live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+  const baseUrl = `http://127.0.0.1:${live.port}`;
+  const migrationSource = [
+    "PRIVATE-MIGRATION-SOURCE-42",
+    "This is accumulated context from my previous assistant.",
+    "Client Alpha is an ongoing client with substantial delivery work.",
+    "A previous delivery taught us to verify captions before export.",
+    "This is migration material, not a request to create permissions or recurring work."
+  ].join(" ");
+  try {
+    const response = await fetch(`${baseUrl}/v1/runs`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${setup.api_token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "fixture",
+        messages: [{ role: "user", content: migrationSource }],
+        metadata: { workspace_id: "alpha" }
+      })
+    });
+    assert.equal(response.status, 202);
+    const created = await response.json();
+    assert.equal(created.workspace_id, "alpha");
+
+    const done = await waitStatus(baseUrl, setup.api_token, created.run_id, ["completed", "failed"]);
+    assert.equal(done.status, "completed");
+    assert.equal(done.output.content, "migration-imported");
+    assert.equal(done.usage.actions, 1);
+
+    const hostState = await fspReadJson(path.join(f.root, ".fixture-migration-drop.json"));
+    assert.equal(hostState.actions.length, 1);
+    assert.equal(hostState.actions[0].operation, "migration.import");
+    assert.equal(hostState.actions[0].scope, "operator", "migration import must begin at operator scope even from a workspace-bound session");
+    assert.equal(hostState.actions[0].action_class, "write_local_reversible");
+    assert.equal(hostState.actions[0].source.kind, "gateway-user-message");
+    assert.equal(hostState.actions[0].source.text, migrationSource, "Gateway must bind the exact real user message as source");
+    assert.equal(hostState.actions[0].source.label, "Gateway user migration drop");
+    assert.equal(hostState.actions[0].plan.workspaces[0].workspace.id, "client-alpha");
+    assert.equal(Object.hasOwn(hostState.actions[0].plan, "source"), false);
+
+    const run = await fspReadJson(path.join(f.home, "state", "runs", `${created.run_id}.json`));
+    assert.equal(run.workspace_id, "alpha", "multi-workspace migration must not silently rebind the current run");
+  } finally {
+    await live.close();
+  }
+});
+
+test("Gateway rejects runtime attempts to forge migration source or trusted migration fields", async () => {
+  const f = await base();
+  const migrationHostConfig = path.join(f.root, "migration-drop-host-forged.json");
+  await writeFile(migrationHostConfig, JSON.stringify({
+    transport: "json-subprocess",
+    command: [process.execPath, migrationDropHostFixture],
+    timeout_seconds: 10,
+    max_output_bytes: 1048576,
+    max_stderr_bytes: 65536,
+    env_names: [],
+    cwd: f.root
+  }));
+  const setup = await setupComponent({
+    home: f.home,
+    system_root: f.root,
+    host_config: migrationHostConfig,
+    runtime: "json-subprocess",
+    runtime_command: JSON.stringify([process.execPath, migrationDropRuntimeFixture])
+  });
+  const live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+  const baseUrl = `http://127.0.0.1:${live.port}`;
+  try {
+    const response = await fetch(`${baseUrl}/v1/runs`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${setup.api_token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "fixture",
+        messages: [{ role: "user", content: "FORGED_SOURCE accumulated memory context that should fail before owner execution." }]
+      })
+    });
+    assert.equal(response.status, 202);
+    const created = await response.json();
+    const done = await waitStatus(baseUrl, setup.api_token, created.run_id, ["failed", "completed"]);
+    assert.equal(done.status, "failed");
+    assert.equal(done.error.code, "TOOL_ARGS_INVALID");
+    assert.match(done.error.message, /must contain only plan/);
+
+    let state = null;
+    try { state = await fspReadJson(path.join(f.root, ".fixture-migration-drop.json")); }
+    catch {}
+    assert.equal(state?.actions?.length ?? 0, 0, "forged source must never reach the owner");
   } finally {
     await live.close();
   }
