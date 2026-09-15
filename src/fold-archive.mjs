@@ -1,5 +1,5 @@
 import { GatewayError } from "./errors.mjs";
-import { atomicJson, sha256, stableStringify } from "./util.mjs";
+import { atomicJson, nowIso, sha256, stableStringify } from "./util.mjs";
 
 export const FOLD_ARCHIVE_VERSION = "gateway.fold-archive.e3.v1";
 export const DEFAULT_MAX_HITS = 5;
@@ -149,6 +149,24 @@ export async function searchFoldArchive(store, options = {}) {
     stale_card_ids: uniqueStale
   });
 
+  const archiveDiagnostics = buildArchiveDiagnostics({
+    precision,
+    cards,
+    compact,
+    exactHits,
+    unfoldedCardIds,
+    staleCardIds: uniqueStale
+  });
+
+  if (options.run_id != null) {
+    const diagnosticRunId = requiredText(options.run_id, "run_id", 128);
+    const diagnosticRun = await store.getRun(diagnosticRunId);
+    if (!diagnosticRun) throw new GatewayError("RUN_NOT_FOUND", "Archive diagnostic run was not found", 404);
+    if (!sameScope(diagnosticRun, scope)) throw new GatewayError("FOLD_SCOPE_MISMATCH", "Archive diagnostic run is outside requested scope", 403);
+    diagnosticRun.archive_diagnostics = { ...archiveDiagnostics, updated_at: nowIso() };
+    await store.saveRun(diagnosticRun);
+  }
+
   return {
     schema_version: "1.0",
     api_version: FOLD_ARCHIVE_VERSION,
@@ -169,7 +187,8 @@ export async function searchFoldArchive(store, options = {}) {
     },
     raw_bytes_returned: exactHits.reduce((sum, hit) => sum + Buffer.byteLength(hit.content, "utf8"), 0),
     truncated,
-    catalog_fingerprint: refreshedCatalog.fingerprint
+    catalog_fingerprint: refreshedCatalog.fingerprint,
+    diagnostics: archiveDiagnostics
   };
 }
 
@@ -194,7 +213,15 @@ export async function unfoldFoldCard(store, options = {}) {
       stale_card_ids: [cardId],
       messages: [],
       truncated: false,
-      validation_errors: validation.errors
+      validation_errors: validation.errors,
+      diagnostics: {
+        cards_used: [cardId],
+        source_refs: [],
+        retrieval_depth: Number(card.level ?? 0),
+        exact_fallback_reason: "stale_source",
+        raw_content_included: false,
+        chain_of_thought_included: false
+      }
     };
   }
 
@@ -233,7 +260,48 @@ export async function unfoldFoldCard(store, options = {}) {
     fingerprint: card.fingerprint,
     messages,
     raw_bytes_returned: rawBytes,
-    truncated
+    truncated,
+    diagnostics: {
+      cards_used: [cardId],
+      source_refs: [...new Set(messages.map((message) => message.source_ref))],
+      retrieval_depth: card.level,
+      exact_fallback_reason: "explicit_unfold",
+      raw_content_included: false,
+      chain_of_thought_included: false
+    }
+  };
+}
+
+function buildArchiveDiagnostics({ precision, cards, compact, exactHits, unfoldedCardIds, staleCardIds }) {
+  const uniqueUnfolded = [...new Set(unfoldedCardIds)];
+  const cardsUsed = uniqueUnfolded.length > 0
+    ? uniqueUnfolded
+    : [...new Set(compact.map((hit) => hit.card_id))];
+  const levels = new Map(cards.map((card) => [card.card_id, Number(card.level ?? 0)]));
+  const compactSourceRefs = compact.flatMap((hit) => [
+    hit.coverage?.first_source_ref,
+    hit.coverage?.last_source_ref
+  ]).filter(Boolean);
+  const sourceRefs = [...new Set(
+    exactHits.length > 0
+      ? exactHits.map((hit) => hit.source_ref)
+      : compactSourceRefs
+  )];
+  let exactFallbackReason = "not_requested";
+  if (precision) {
+    if (staleCardIds.length > 0) exactFallbackReason = "stale_source";
+    else if (exactHits.length > 0) exactFallbackReason = "precision_intent";
+    else if (uniqueUnfolded.length > 0) exactFallbackReason = "unfolded_no_exact_match";
+    else if (compact.length > 0) exactFallbackReason = "no_matching_root";
+    else exactFallbackReason = "no_matching_card";
+  }
+  return {
+    cards_used: cardsUsed,
+    source_refs: sourceRefs,
+    retrieval_depth: cardsUsed.reduce((max, cardId) => Math.max(max, levels.get(cardId) ?? 0), 0),
+    exact_fallback_reason: exactFallbackReason,
+    raw_content_included: false,
+    chain_of_thought_included: false
   };
 }
 
