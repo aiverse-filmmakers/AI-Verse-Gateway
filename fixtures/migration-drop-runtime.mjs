@@ -20,11 +20,34 @@ if (latestUser.includes("Completed-work evidence:")) {
     finish_reason: "stop",
     usage: { input_tokens: 1, output_tokens: 1, cost: 0 }
   };
-} else if (!system.includes("Migration and prior-assistant context drops:")) {
+} else if (
+  !system.includes("Migration and prior-assistant context drops:") ||
+  !system.includes("Classify by semantic real-world meaning.") ||
+  !system.includes('Never ask "Should I create a workspace?"') ||
+  !system.includes('operation "migration.pending"')
+) {
   result = {
     content: "migration-policy-missing",
     tool_calls: [],
     finish_reason: "stop",
+    usage: { input_tokens: 1, output_tokens: 1, cost: 0 }
+  };
+} else if (!hasTool && latestUser.includes("RESUME_MIGRATION")) {
+  result = {
+    content: "",
+    tool_calls: [{
+      id: "call_migration_pending",
+      type: "function",
+      function: {
+        name: "aiverse_action",
+        arguments: JSON.stringify({
+          action_class: "read_local",
+          operation: "migration.pending",
+          parameters: { limit: 64 }
+        })
+      }
+    }],
+    finish_reason: "tool_calls",
     usage: { input_tokens: 1, output_tokens: 1, cost: 0 }
   };
 } else if (!hasTool) {
@@ -96,8 +119,9 @@ if (latestUser.includes("Completed-work evidence:")) {
 } else {
   const tool = messages.find((m) => m.role === "tool");
   const parsed = tool?.content ? JSON.parse(tool.content) : {};
+  const pending = parsed?.result?.migration_pending;
   result = {
-    content: parsed?.result?.migration_import ? "migration-imported" : "migration-import-failed",
+    content: pending?.items?.[0]?.question ?? (parsed?.result?.migration_import ? "migration-imported" : "migration-import-failed"),
     tool_calls: [],
     finish_reason: "stop",
     usage: { input_tokens: 1, output_tokens: 1, cost: 0 }

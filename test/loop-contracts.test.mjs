@@ -201,6 +201,55 @@ test("Gateway migration drop binds the exact user source and routes one owner ac
   }
 });
 
+test("Gateway resumes pending migration clarifications from operator scope in normal user language", async () => {
+  const f = await base();
+  const migrationHostConfig = path.join(f.root, "migration-drop-host-pending.json");
+  await writeFile(migrationHostConfig, JSON.stringify({
+    transport: "json-subprocess",
+    command: [process.execPath, migrationDropHostFixture],
+    timeout_seconds: 10,
+    max_output_bytes: 1048576,
+    max_stderr_bytes: 65536,
+    env_names: [],
+    cwd: f.root
+  }));
+  const setup = await setupComponent({
+    home: f.home,
+    system_root: f.root,
+    host_config: migrationHostConfig,
+    runtime: "json-subprocess",
+    runtime_command: JSON.stringify([process.execPath, migrationDropRuntimeFixture])
+  });
+  const live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+  const baseUrl = `http://127.0.0.1:${live.port}`;
+  try {
+    const response = await fetch(`${baseUrl}/v1/runs`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${setup.api_token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "fixture",
+        messages: [{ role: "user", content: "RESUME_MIGRATION continue the context transfer from earlier." }],
+        metadata: { workspace_id: "alpha" }
+      })
+    });
+    assert.equal(response.status, 202);
+    const created = await response.json();
+    const done = await waitStatus(baseUrl, setup.api_token, created.run_id, ["completed", "failed"]);
+    assert.equal(done.status, "completed");
+    assert.equal(done.output.content, "Is TUI a current client, a past client, or a one-off project?");
+    assert.doesNotMatch(done.output.content.toLowerCase(), /\b(workspace|memory|data|skill|owner|canonical|scope)\b/);
+
+    const hostState = await fspReadJson(path.join(f.root, ".fixture-migration-drop.json"));
+    const pendingAction = hostState.actions.find((item) => item.operation === "migration.pending");
+    assert.ok(pendingAction, "runtime should inspect existing pending migration state");
+    assert.equal(pendingAction.scope, "operator", "pending migration state is operator-owned even from workspace-bound runs");
+    assert.equal(pendingAction.action_class, "read_local");
+    assert.equal(pendingAction.parameters.limit, 64);
+  } finally {
+    await live.close();
+  }
+});
+
 test("Gateway rejects runtime attempts to forge migration source or trusted migration fields", async () => {
   const f = await base();
   const migrationHostConfig = path.join(f.root, "migration-drop-host-forged.json");
