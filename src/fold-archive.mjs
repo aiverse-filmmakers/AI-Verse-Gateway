@@ -163,8 +163,11 @@ export async function searchFoldArchive(store, options = {}) {
     const diagnosticRun = await store.getRun(diagnosticRunId);
     if (!diagnosticRun) throw new GatewayError("RUN_NOT_FOUND", "Archive diagnostic run was not found", 404);
     if (!sameScope(diagnosticRun, scope)) throw new GatewayError("FOLD_SCOPE_MISMATCH", "Archive diagnostic run is outside requested scope", 403);
-    diagnosticRun.archive_diagnostics = { ...archiveDiagnostics, updated_at: nowIso() };
-    await store.saveRun(diagnosticRun);
+    await store.mutateRun(diagnosticRunId, (draft) => {
+      if (!sameScope(draft, scope)) throw new GatewayError("FOLD_SCOPE_MISMATCH", "Archive diagnostic run moved outside requested scope", 403);
+      draft.archive_diagnostics = { ...archiveDiagnostics, updated_at: nowIso() };
+      return draft;
+    });
   }
 
   return {
