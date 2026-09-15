@@ -302,7 +302,10 @@ test("scope boundaries fail closed and referenced-card tampering is detected ins
     parentValidation.errors.some((item) => item.includes(alpha.card_id) && item.includes("fingerprint_mismatch")),
     true
   );
-  assert.equal((await store.getFoldCard(parent.card_id)).fingerprint, parent.fingerprint);
+  await assert.rejects(
+    () => store.getFoldCard(parent.card_id),
+    (error) => error instanceof GatewayError && error.code === "INVALID_FOLD_CARD"
+  );
 });
 
 test("fold source must be a completed canonical run", async () => {
