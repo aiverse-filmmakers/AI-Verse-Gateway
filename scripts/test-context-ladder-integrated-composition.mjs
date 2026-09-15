@@ -454,6 +454,22 @@ async function main() {
     /RAW-J2-PRIVATE-TRANSCRIPT/
   );
 
+  const digestDetail =
+    await engine.host.retrieveHistoryProgressive({
+      version: PROGRESSIVE_HISTORY_VERSION,
+      depth: "detail",
+      scope: scopeName(),
+      query: "J2 prior session COMET-77",
+      limit: 4,
+      max_bytes: 12288
+    });
+  const digestEvidence = (digestDetail.items ?? [])
+    .find((item) => item.id === digestId);
+  assert.ok(
+    digestEvidence,
+    "session digest detail evidence was not recoverable"
+  );
+
   const exactRun = await createRun(store, {
     workspaceId: "alpha",
     sessionId: alpha.session_id,
@@ -477,14 +493,39 @@ async function main() {
     ["catalog", "summary", "detail", "source"]
   );
   assert.equal(exact.diagnostics.source_reads, 1);
-  assert.ok(exact.diagnostics.gateway_source_range_reads >= 1);
-  const gatewayExact =
-    exact.safe.context_ladder.owner_history.gateway_exact_source;
-  assert.equal(gatewayExact.status, "ok");
-  assert.equal(gatewayExact.exact_evidence, true);
-  assert.match(stableStringify(gatewayExact), /COMET-77/);
+
+  const digestExact = await retrieveRuntimeDeepContext({
+    host: engine.host,
+    store,
+    run: exactRun,
+    scope: scopeName(),
+    depth: "source",
+    query: "exact J2 prior session COMET-77 launch phrase",
+    evidence_ref: digestEvidence,
+    limit: 1,
+    max_bytes: 16384
+  });
+  assert.equal(
+    digestExact.result.owner_result.status,
+    "external_source_required"
+  );
+  assert.equal(
+    digestExact.result.gateway_exact_source.status,
+    "ok"
+  );
+  assert.equal(
+    digestExact.result.gateway_exact_source.exact_evidence,
+    true
+  );
+  assert.ok(
+    digestExact.diagnostics.gateway_source_range_reads >= 1
+  );
   assert.match(
-    stableStringify(gatewayExact),
+    stableStringify(digestExact.result.gateway_exact_source),
+    /COMET-77/
+  );
+  assert.match(
+    stableStringify(digestExact.result.gateway_exact_source),
     /RAW-J2-PRIVATE-TRANSCRIPT/
   );
 
@@ -782,24 +823,24 @@ async function main() {
         "What exact source wording from the prior J2 session says COMET-77?"
     }]
   });
-  const restartExact =
-    await assembleProgressiveOwnerContext({
-      host: restartedEngine.host,
-      store: restartedStore,
-      run: restartRun,
-      scope: scopeName(),
-      query:
-        "What exact source wording from the prior J2 session says COMET-77?"
-    });
+  const restartExact = await retrieveRuntimeDeepContext({
+    host: restartedEngine.host,
+    store: restartedStore,
+    run: restartRun,
+    scope: scopeName(),
+    depth: "source",
+    query: "exact J2 prior session COMET-77 launch phrase",
+    evidence_ref: digestEvidence,
+    limit: 1,
+    max_bytes: 16384
+  });
   assert.equal(
-    restartExact.safe.context_ladder.owner_history
-      .gateway_exact_source.status,
+    restartExact.result.gateway_exact_source.status,
     "ok"
   );
   assert.match(
     stableStringify(
-      restartExact.safe.context_ladder.owner_history
-        .gateway_exact_source
+      restartExact.result.gateway_exact_source
     ),
     /COMET-77/
   );
@@ -835,7 +876,7 @@ async function main() {
       promoted_durable: promotion.captured,
       ignored_transient: promotion.ignored,
       exact_gateway_source_range_reads:
-        exact.diagnostics.gateway_source_range_reads,
+        digestExact.diagnostics.gateway_source_range_reads,
       fold_cards_after_restart:
         restartedCatalog.cards.length
     }
