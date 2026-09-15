@@ -233,7 +233,6 @@ async function main() {
       text: "J2 temporary aside must never become durable Memory.",
       type: "fact",
       confidence: 0.99,
-      source: "j2-integrated",
       admission: admission({ durable: false })
     }
   });
@@ -255,7 +254,6 @@ async function main() {
       type: "correction",
       importance: 5,
       confidence: 0.99,
-      source: "j2-integrated",
       why: "Explicit correction of the historical port.",
       tags: "j2,nyx,target,port,correction",
       supersedes: oldMemoryId,
@@ -590,7 +588,6 @@ async function main() {
         "BETA-J2-PRIVATE client instruction must never appear in Alpha.",
       type: "fact",
       confidence: 0.99,
-      source: "j2-integrated",
       admission: admission()
     }
   });
