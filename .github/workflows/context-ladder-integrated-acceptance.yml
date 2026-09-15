@@ -1,0 +1,109 @@
+name: Context Ladder Integrated Acceptance
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gateway-os-memory-context-ladder:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      OS_SHA: 3eeb27e78829abce4651cb0067957a77b1b6078f
+      MEMORY_SHA: 406b14fb4398eb1b16dd5f30e50520e8c3540972
+
+    steps:
+      - name: Checkout Gateway under test
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Gateway dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Fetch exact accepted OS and Memory owners
+        shell: bash
+        run: |
+          set -euo pipefail
+          OS="$RUNNER_TEMP/AI-Verse-OS"
+          MEMORY="$RUNNER_TEMP/AI-Verse-Memory"
+          git clone https://github.com/aiverse-filmmakers/AI-Verse-OS.git "$OS"
+          git -C "$OS" checkout --detach "$OS_SHA"
+          test "$(git -C "$OS" rev-parse HEAD)" = "$OS_SHA"
+          git clone https://github.com/aiverse-filmmakers/AI-Verse-Memory.git "$MEMORY"
+          git -C "$MEMORY" checkout --detach "$MEMORY_SHA"
+          test "$(git -C "$MEMORY" rev-parse HEAD)" = "$MEMORY_SHA"
+          printf '%s' "$OS" > "$RUNNER_TEMP/os-repo.txt"
+          printf '%s' "$MEMORY" > "$RUNNER_TEMP/memory-repo.txt"
+
+      - name: Prepare real OS workspaces before Memory indexing
+        shell: bash
+        run: |
+          set -euo pipefail
+          OS="$(cat "$RUNNER_TEMP/os-repo.txt")"
+          for workspace in alpha beta; do
+            mkdir -p "$OS/workspaces/$workspace/context"
+            if [ "$workspace" = "alpha" ]; then
+              NAME="Alpha"
+            else
+              NAME="Beta"
+            fi
+            cat > "$OS/workspaces/$workspace/WORKSPACE.yaml" <<YAML
+          schema_version: "2.0"
+          id: "$workspace"
+          name: "$NAME"
+          type: project
+          status: active
+          purpose: "J2 Context Ladder integrated acceptance."
+          domains: []
+          owners: []
+          success_criteria: []
+          canonical_sources: []
+          connections: []
+          current_context: context/CURRENT.md
+          YAML
+          done
+          cat > "$OS/workspaces/alpha/context/CURRENT.md" <<'MD'
+          # Current Workspace Context
+
+          ## Objective
+
+          Prove Context Ladder composition across Gateway, OS, and Memory.
+
+          ## Current state
+
+          J2-CANONICAL-SOURCE-ALPHA render profile is ACEScg.
+          MD
+          cat > "$OS/workspaces/beta/context/CURRENT.md" <<'MD'
+          # Current Workspace Context
+
+          ## Current state
+
+          Beta workspace is isolated from Alpha.
+          MD
+
+      - name: Install accepted Memory into real OS and build host config
+        shell: bash
+        run: |
+          set -euo pipefail
+          OS="$(cat "$RUNNER_TEMP/os-repo.txt")"
+          MEMORY="$(cat "$RUNNER_TEMP/memory-repo.txt")"
+          python "$MEMORY/scripts/install.py" --target "$OS" --source-dir "$MEMORY"
+          python "$OS/scripts/ai_verse_host_adapter.py"             --root "$OS"             --write-config "$RUNNER_TEMP/os-host.json"
+          test -f "$OS/scripts/ai-verse-memory/memory.py"
+          grep -Fq 'ai-verse-memory' "$OS/.aiverse/extensions/registry.json"
+
+      - name: Run composed Context Ladder J2 acceptance
+        env:
+          OS_ROOT: ${{ runner.temp }}/AI-Verse-OS
+          HOST_CONFIG: ${{ runner.temp }}/os-host.json
+        run: node scripts/test-context-ladder-integrated-composition.mjs
