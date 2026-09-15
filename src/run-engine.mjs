@@ -3,6 +3,7 @@ import { GatewayError, asGatewayError } from "./errors.mjs";
 import { RuntimeRegistry } from "./runtime.mjs";
 import { HostClient } from "./host-adapter.mjs";
 import { GoalOwnerClient } from "./goal-owner.mjs";
+import { governInvocationContext } from "./context-governor.mjs";
 import { nowIso, stableStringify } from "./util.mjs";
 
 const USER_INTERACTION_POLICY = `User interaction law:
@@ -195,7 +196,59 @@ export class RunEngine {
         await this.store.saveRun(run);
         await this.store.event(runId, "run.turn.started", { turn: run.continuation.turn });
 
-        const result = await this.runtime.invoke({ run_id: runId, model: run.runtime?.model, messages: stripInternal(run.messages), tools: [ACTION_TOOL] }, signal);
+        const governed = await governInvocationContext({
+          messages: stripInternal(run.messages),
+          config: this.config.context,
+          cache_sensitive: run.context_policy?.cache_sensitive === true,
+          summarize: async ({ messages, max_output_tokens, covered_message_count, recent_raw_tail_messages }) => {
+            const summaryResult = await this.runtime.invoke({
+              run_id: `${runId}:context-fold:${run.continuation.turn}`,
+              model: run.runtime?.model,
+              max_output_tokens,
+              messages: [
+                {
+                  role: "system",
+                  content: "Compact the supplied older conversation into concise factual context for the next model invocation. Preserve decisions, constraints, identifiers, corrections, unresolved items, and source-relevant facts. Do not add facts. Do not provide chain-of-thought or hidden reasoning. Return only the compact context."
+                },
+                {
+                  role: "user",
+                  content: stableStringify({
+                    covered_message_count,
+                    recent_raw_tail_messages,
+                    older_messages: messages
+                  })
+                }
+              ],
+              tools: []
+            }, signal);
+            addUsage(run.usage, summaryResult.usage);
+            this.assertBudgetAfterUsage(run);
+            return { summary: summaryResult.content ?? "" };
+          }
+        });
+        run.context_governor = {
+          ...governed.diagnostic,
+          evaluated_at: nowIso(),
+          fold_work: governed.diagnostic.fold_scheduled
+            ? { state: "scheduled_for_safe_boundary", reason: governed.diagnostic.status }
+            : { state: "not_scheduled", reason: governed.diagnostic.status }
+        };
+        await this.store.saveRun(run);
+        await this.store.event(runId, "context.pressure.evaluated", {
+          status: governed.diagnostic.status,
+          configured: governed.diagnostic.configured,
+          pressure_before: governed.diagnostic.pressure_before,
+          pressure_after: governed.diagnostic.pressure_after,
+          estimated_tokens_before: governed.diagnostic.estimated_tokens_before,
+          estimated_tokens_after: governed.diagnostic.estimated_tokens_after,
+          raw_tail_messages: governed.diagnostic.raw_tail_messages,
+          prefix_messages: governed.diagnostic.prefix_messages,
+          fold_scheduled: governed.diagnostic.fold_scheduled,
+          cache_sensitive_skip: governed.diagnostic.cache_sensitive_skip,
+          emergency_tail_shrink: governed.diagnostic.emergency_tail_shrink === true
+        });
+
+        const result = await this.runtime.invoke({ run_id: runId, model: run.runtime?.model, messages: governed.messages, tools: [ACTION_TOOL] }, signal);
         addUsage(run.usage, result.usage);
         this.assertBudgetAfterUsage(run);
         const presentation = presentAssistantOutcome(run, result.content ?? "");
