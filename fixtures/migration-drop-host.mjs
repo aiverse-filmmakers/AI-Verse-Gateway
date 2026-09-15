@@ -17,7 +17,9 @@ function readState() {
   catch { return { authorizations: [], actions: [] }; }
 }
 function saveState(state) {
-  fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+  const tempPath = `${statePath}.${process.pid}.tmp`;
+  fs.writeFileSync(tempPath, JSON.stringify(state, null, 2), "utf8");
+  fs.renameSync(tempPath, statePath);
 }
 
 let result;
