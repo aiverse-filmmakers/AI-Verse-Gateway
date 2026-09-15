@@ -50,11 +50,15 @@ async function handle(req, res, ctx) {
       const body = await readJsonBody(req, ctx.config.server.max_body_bytes);
       return await automationWake(res, body, identity, ctx);
     }
-    const match = url.pathname.match(/^\/v1\/runs\/([^/]+)(?:\/(events|cancel|pause|resume|approval))?$/);
+    const match = url.pathname.match(/^\/v1\/runs\/([^/]+)(?:\/(events|diagnostics|cancel|pause|resume|approval))?$/);
     if (match) {
       const runId = match[1], action = match[2];
       if (!action && req.method === "GET") return json(res, 200, sanitizeRun(await ownedRun(ctx.store, runId, identity.principal)));
       if (action === "events" && req.method === "GET") { await ownedRun(ctx.store, runId, identity.principal); return sseRun(res, runId, ctx.store, origin); }
+      if (action === "diagnostics" && req.method === "GET") {
+        const run = await ownedRun(ctx.store, runId, identity.principal);
+        return json(res, 200, await advancedRunDiagnostics(ctx.store, run));
+      }
       if (["cancel", "pause", "resume", "approval"].includes(action) && req.method === "POST") {
         const body = await readJsonBody(req, ctx.config.server.max_body_bytes);
         return await controlRun(res, runId, action, body, identity, ctx);
@@ -293,5 +297,73 @@ function preflight(res, origin) { res.writeHead(204, corsHeaders(origin, { "acce
 function json(res, status, body) { if (res.writableEnded) return; res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify(body)); }
 function publicStatus(config) { return { component: "ai-verse-gateway", version: VERSION, state: config.enabled ? "ready" : "disabled", system_id: config.system.id, runtime: config.runtime.kind, binding: config.server.host, remote: config.server.allow_remote === true, goal_owner_configured: Boolean(config.goal_owner_config), at: nowIso() }; }
 function sanitizeRun(run) { if (!run) return run; const { messages, ...publicRun } = run; return publicRun; }
+
+async function advancedRunDiagnostics(store, run) {
+  const scope = {
+    system_id: run.system_id,
+    workspace_id: run.workspace_id,
+    principal: run.principal
+  };
+  const catalog = await store.rebuildFoldCatalog({ live_validation: true });
+  const scopedCards = catalog.cards.filter((card) =>
+    card.scope?.system_id === scope.system_id &&
+    card.scope?.workspace_id === scope.workspace_id &&
+    card.scope?.principal === scope.principal
+  );
+  const pendingFoldRuns = await store.pendingFoldWorkRuns();
+  const governor = run.context_governor ?? null;
+  const archive = run.archive_diagnostics ?? {
+    cards_used: [],
+    source_refs: [],
+    retrieval_depth: 0,
+    exact_fallback_reason: "no_archive_retrieval_recorded",
+    raw_content_included: false,
+    chain_of_thought_included: false
+  };
+  return {
+    schema_version: "1.0",
+    kind: "gateway_advanced_diagnostics",
+    run_id: run.run_id,
+    session_id: run.session_id,
+    status: run.status,
+    scope,
+    context: governor ? {
+      status: governor.status ?? null,
+      configured: governor.configured === true,
+      window_tokens: governor.window_tokens ?? null,
+      pressure_before: governor.pressure_before ?? null,
+      pressure_after: governor.pressure_after ?? null,
+      estimated_tokens_before: governor.estimated_tokens_before ?? null,
+      estimated_tokens_after: governor.estimated_tokens_after ?? null,
+      tokens_by_layer: governor.tokens_by_layer ?? null,
+      raw_tail_messages: governor.raw_tail_messages ?? null,
+      prefix_messages: governor.prefix_messages ?? null,
+      fold_scheduled: governor.fold_scheduled === true,
+      cache_sensitive_skip: governor.cache_sensitive_skip === true,
+      emergency_tail_shrink: governor.emergency_tail_shrink === true,
+      fold_work: governor.fold_work ?? null
+    } : null,
+    archive: {
+      cards_used: Array.isArray(archive.cards_used) ? archive.cards_used : [],
+      source_refs: Array.isArray(archive.source_refs) ? archive.source_refs : [],
+      retrieval_depth: Number(archive.retrieval_depth ?? 0),
+      exact_fallback_reason: archive.exact_fallback_reason ?? null,
+      raw_content_included: false,
+      chain_of_thought_included: false
+    },
+    folds: {
+      catalog_fingerprint: catalog.fingerprint,
+      valid_cards: scopedCards.filter((card) => card.live_validation_state === "validated").length,
+      invalid_cards: scopedCards.filter((card) => card.live_validation_state !== "validated").length,
+      max_level: scopedCards.reduce((max, card) => Math.max(max, Number(card.level ?? 0)), 0),
+      pending_fold_work: pendingFoldRuns.some((candidate) => candidate.run_id === run.run_id)
+    },
+    safety: {
+      raw_message_content_included: false,
+      prompts_included: false,
+      chain_of_thought_included: false
+    }
+  };
+}
 function intersectBudget(base, requested) { const min = (key, fallback) => { const a=base[key], b=requested[key]; if (typeof a === "number" && typeof b === "number") return Math.min(a,b); if (typeof a === "number") return a; if (typeof b === "number") return b; return fallback; }; return { max_goal_continuation_turns: min("max_goal_continuation_turns",20), no_progress_threshold: min("no_progress_threshold",2), wall_clock_seconds: min("wall_clock_seconds",120), max_actions: min("max_actions",16), max_tokens: min("max_tokens",null), max_cost: min("max_cost",null) }; }
 class RateLimiter { constructor(limit){this.limit=limit;this.map=new Map();} take(principal){const minute=Math.floor(Date.now()/60000);const key=`${principal}:${minute}`;const count=(this.map.get(key)??0)+1;this.map.set(key,count);if(count>this.limit)throw new GatewayError("RATE_LIMITED","Request rate limit exceeded",429);if(this.map.size>1000)for(const k of this.map.keys())if(!k.endsWith(`:${minute}`))this.map.delete(k);} }

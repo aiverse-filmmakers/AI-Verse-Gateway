@@ -24,8 +24,9 @@ export async function governInvocationContext({
       diagnostic: diagnostic("unconfigured", policy, {
         pressure_before: null,
         pressure_after: null,
-        estimated_tokens_before: null,
-        estimated_tokens_after: null,
+        estimated_tokens_before: estimateTokens(input, policy),
+        estimated_tokens_after: estimateTokens(input, policy),
+        tokens_by_layer: rawLayerTokens(input, policy),
         raw_tail_messages: input.length,
         prefix_messages: 0,
         fold_scheduled: false,
@@ -44,6 +45,7 @@ export async function governInvocationContext({
         pressure_after: beforePressure,
         estimated_tokens_before: beforeTokens,
         estimated_tokens_after: beforeTokens,
+        tokens_by_layer: rawLayerTokens(input, policy, beforeTokens),
         raw_tail_messages: input.length,
         prefix_messages: 0,
         fold_scheduled: false,
@@ -61,6 +63,7 @@ export async function governInvocationContext({
         pressure_after: beforePressure,
         estimated_tokens_before: beforeTokens,
         estimated_tokens_after: beforeTokens,
+        tokens_by_layer: rawLayerTokens(input, policy, beforeTokens),
         raw_tail_messages: input.length,
         prefix_messages: 0,
         fold_scheduled: !skipped,
@@ -191,6 +194,14 @@ export async function governInvocationContext({
       pressure_after: afterPressure,
       estimated_tokens_before: beforeTokens,
       estimated_tokens_after: afterTokens,
+      tokens_by_layer: {
+        system: layerEstimate(protectedSystem, policy),
+        older_raw_before: layerEstimate(prefix, policy),
+        recent_raw: layerEstimate(tail, policy),
+        compacted_summary: layerEstimate([compactMessage], policy),
+        total_before: beforeTokens,
+        total_after: afterTokens
+      },
       raw_tail_messages: tailCount,
       prefix_messages: prefix.length,
       fold_scheduled: true,
@@ -233,6 +244,25 @@ function normalizeConfig(config) {
 function estimateTokens(messages, policy) {
   const bytes = Buffer.byteLength(stableStringify(messages ?? []), "utf8");
   return Math.ceil(bytes / policy.chars_per_token_estimate);
+}
+
+function rawLayerTokens(messages, policy, total = null) {
+  const system = (messages ?? []).filter((message) => message?.role === "system");
+  const conversation = (messages ?? []).filter((message) => message?.role !== "system");
+  const computedTotal = total ?? estimateTokens(messages ?? [], policy);
+  return {
+    system: layerEstimate(system, policy),
+    older_raw_before: 0,
+    recent_raw: layerEstimate(conversation, policy),
+    compacted_summary: 0,
+    total_before: computedTotal,
+    total_after: computedTotal
+  };
+}
+
+function layerEstimate(messages, policy) {
+  if (!Array.isArray(messages) || messages.length === 0) return 0;
+  return estimateTokens(messages, policy);
 }
 
 function diagnostic(status, policy, detail) {

@@ -2,7 +2,7 @@ import path from "node:path";
 import { EventEmitter } from "node:events";
 import { readFile, readdir } from "node:fs/promises";
 import { GatewayError } from "./errors.mjs";
-import { atomicJson, appendNdjson, ensureDir, id, nowIso, readJson, sha256, stableStringify } from "./util.mjs";
+import { atomicJson, appendNdjson, ensureDir, id, mutateJson, nowIso, readJson, sha256, stableStringify } from "./util.mjs";
 import { paths } from "./paths.mjs";
 import { RUN_RECOVERABLE } from "./constants.mjs";
 import {
@@ -25,6 +25,7 @@ export class GatewayStore {
     await Promise.all([this.p.sessions, this.p.runs, this.p.events, this.p.foldCards].map(ensureDir));
     const idem = await readJson(this.p.idempotency, null);
     if (!idem) await atomicJson(this.p.idempotency, { schema_version: "1.0", records: {} });
+    await rebuildFoldCatalog(this, { live_validation: true });
   }
   sessionFile(sessionId) { assertStorageId(sessionId, "session_id"); return path.join(this.p.sessions, `${sessionId}.json`); }
   runFile(runId) { assertStorageId(runId, "run_id"); return path.join(this.p.runs, `${runId}.json`); }
@@ -78,7 +79,34 @@ export class GatewayStore {
     return run;
   }
   async getRun(runId) { return await readJson(this.runFile(runId), null); }
-  async saveRun(run) { run.updated_at = nowIso(); await atomicJson(this.runFile(run.run_id), run); this.bus.emit(`run:${run.run_id}`, { kind: "state", run }); return run; }
+  async saveRun(run) {
+    const candidate = JSON.parse(JSON.stringify(run));
+    candidate.updated_at = nowIso();
+    const saved = await mutateJson(this.runFile(run.run_id), (current) => {
+      const next = { ...candidate };
+      if (newerExtension(current?.archive_diagnostics, next.archive_diagnostics)) {
+        next.archive_diagnostics = current.archive_diagnostics;
+      }
+      return next;
+    }, candidate);
+    Object.assign(run, saved);
+    this.bus.emit(`run:${run.run_id}`, { kind: "state", run: saved });
+    return run;
+  }
+  async mutateRun(runId, updater) {
+    assertStorageId(runId, "run_id");
+    if (typeof updater !== "function") throw new GatewayError("RUN_MUTATION_INVALID", "Run mutation updater is required", 500);
+    const saved = await mutateJson(this.runFile(runId), async (current) => {
+      if (!current) throw new GatewayError("RUN_NOT_FOUND", "Run not found", 404);
+      const draft = JSON.parse(JSON.stringify(current));
+      const updated = await updater(draft);
+      const next = updated ?? draft;
+      next.updated_at = nowIso();
+      return next;
+    });
+    this.bus.emit(`run:${runId}`, { kind: "state", run: saved });
+    return saved;
+  }
   async event(runId, type, data = {}) {
     const event = { event_id: id("evt"), run_id: runId, type, at: nowIso(), data };
     await appendNdjson(this.eventFile(runId), event);
@@ -153,6 +181,18 @@ export class GatewayStore {
     pending.sort((a, b) => String(a.completed_at ?? "").localeCompare(String(b.completed_at ?? "")));
     return pending;
   }
+  async pendingFoldWorkRuns() {
+    let names = [];
+    try { names = await readdir(this.p.runs); } catch { return []; }
+    const pending = [];
+    for (const name of names) {
+      if (!name.endsWith(".json")) continue;
+      const run = await readJson(path.join(this.p.runs, name), null);
+      if (run?.context_governor?.fold_work?.state === "scheduled_for_safe_boundary") pending.push(run);
+    }
+    pending.sort((a, b) => String(a.updated_at ?? a.created_at ?? "").localeCompare(String(b.updated_at ?? b.created_at ?? "")));
+    return pending;
+  }
   async recoverInterrupted() {
     let names = [];
     try { names = await readdir(this.p.runs); } catch { return []; }
@@ -169,6 +209,15 @@ export class GatewayStore {
     }
     return changed;
   }
+}
+
+function newerExtension(current, incoming) {
+  if (!current) return false;
+  if (!incoming) return true;
+  const currentAt = Date.parse(current.updated_at ?? "");
+  const incomingAt = Date.parse(incoming.updated_at ?? "");
+  if (Number.isFinite(currentAt) && Number.isFinite(incomingAt)) return currentAt > incomingAt;
+  return false;
 }
 
 function assertStorageId(value, label) {

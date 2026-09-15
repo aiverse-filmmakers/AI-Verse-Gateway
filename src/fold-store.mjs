@@ -45,6 +45,7 @@ export async function createFoldCard(store, input = {}) {
       resolved.push(item);
     }
     sourceRefs = resolved.map((item) => item.ref);
+    await assertSourceOrder(store, sourceRefs);
     coveredBytes = resolved.reduce((sum, item) => sum + item.bytes, 0);
     const messageCount = resolved.reduce((sum, item) => sum + item.ref.message_count, 0);
     coverage = {
@@ -75,6 +76,7 @@ export async function createFoldCard(store, input = {}) {
       if (!self.valid) throw new GatewayError("INVALID_FOLD_CHILD", `Child fold card ${cardId} failed self-validation`, 409);
       children.push(child);
     }
+    await assertChildOrder(store, children);
     childRefs = children.map((child) => ({ card_id: child.card_id, fingerprint: child.fingerprint }));
     coveredBytes = children.reduce((sum, child) => sum + Number(child.size_estimate?.covered_bytes ?? 0), 0);
     coverage = {
@@ -138,6 +140,10 @@ export async function createFoldCard(store, input = {}) {
     fingerprint,
     created_at: nowIso()
   };
+  const prePersistValidation = selfValidateCard(card);
+  if (!prePersistValidation.valid) {
+    throw new GatewayError("FOLD_CARD_BUILD_INVALID", `Constructed fold card failed validation: ${prePersistValidation.errors.join("; ")}`, 409);
+  }
   await atomicJson(file, card);
   const persisted = await readJson(file);
   const persistedValidation = selfValidateCard(persisted);
@@ -155,6 +161,10 @@ export async function getFoldCard(store, cardId) {
   const self = selfValidateCard(card);
   if (!self.valid) {
     throw new GatewayError("INVALID_FOLD_CARD", `Fold card ${cardId} failed self-validation: ${self.errors.join("; ")}`, 409);
+  }
+  const live = await validateFoldCard(store, cardId);
+  if (!live.valid) {
+    throw new GatewayError("INVALID_FOLD_CARD", `Fold card ${cardId} failed live validation: ${live.errors.join("; ")}`, 409);
   }
   return card;
 }
@@ -193,18 +203,37 @@ async function validateRecursive(store, cardId, errors, visited) {
   }
 
   if (card.level === 1) {
+    let actualCoveredBytes = 0;
+    let priorOrder = null;
     for (const ref of card.source_refs) {
       try {
-        await readFoldSource(store, ref, card.scope);
+        const resolved = await readFoldSource(store, ref, card.scope);
+        actualCoveredBytes += Buffer.byteLength(stableStringify(resolved.messages), "utf8");
+        const run = await store.getRun(ref.run_id);
+        if (!run) {
+          errors.push(`${cardId}:source_missing_run:${ref.run_id}`);
+          continue;
+        }
+        const currentOrder = runOrderKey(run, ref.start_index);
+        if (priorOrder && compareOrderKey(priorOrder, currentOrder) >= 0) errors.push(`${cardId}:source_order`);
+        priorOrder = runOrderKey(run, ref.end_index);
       } catch (error) {
         errors.push(`${cardId}:source:${error?.code ?? error?.message ?? "invalid"}`);
       }
     }
+    if (actualCoveredBytes > 0 && card.size_estimate.covered_bytes !== actualCoveredBytes) errors.push(`${cardId}:covered_bytes_mismatch`);
   } else {
+    const children = [];
+    let priorBoundary = null;
     for (const ref of card.child_refs) {
       const child = await readJson(store.foldCardFile(ref.card_id), null);
       if (!child) {
         errors.push(`${cardId}:child_missing:${ref.card_id}`);
+        continue;
+      }
+      const childSelf = selfValidateCard(child);
+      if (!childSelf.valid) {
+        for (const error of childSelf.errors) errors.push(`${cardId}:child_invalid:${ref.card_id}:${error}`);
         continue;
       }
       if (child.fingerprint !== ref.fingerprint) {
@@ -213,10 +242,96 @@ async function validateRecursive(store, cardId, errors, visited) {
       }
       if (child.level !== card.level - 1) errors.push(`${cardId}:child_level_mismatch:${ref.card_id}`);
       if (stableStringify(child.scope) !== stableStringify(card.scope)) errors.push(`${cardId}:child_scope_mismatch:${ref.card_id}`);
+
+      const boundary = await cardBoundaryOrder(store, child);
+      if (!boundary) {
+        errors.push(`${cardId}:child_boundary_invalid:${ref.card_id}`);
+      } else {
+        if (priorBoundary && compareOrderKey(priorBoundary, boundary.first) >= 0) errors.push(`${cardId}:child_order`);
+        priorBoundary = boundary.last;
+      }
+
+      children.push(child);
       await validateRecursive(store, ref.card_id, errors, visited);
+    }
+
+    if (children.length === card.child_refs.length && children.length > 0) {
+      const expectedCoveredBytes = children.reduce((sum, child) => sum + child.size_estimate.covered_bytes, 0);
+      const expectedSources = children.reduce((sum, child) => sum + child.coverage.descendant_source_count, 0);
+      const expectedMessages = children.reduce((sum, child) => sum + child.coverage.descendant_message_count, 0);
+      if (card.size_estimate.covered_bytes !== expectedCoveredBytes) errors.push(`${cardId}:covered_bytes_mismatch`);
+      if (
+        card.coverage.descendant_source_count !== expectedSources ||
+        card.coverage.descendant_message_count !== expectedMessages ||
+        card.coverage.first_source_ref !== children[0].coverage.first_source_ref ||
+        card.coverage.last_source_ref !== children[children.length - 1].coverage.last_source_ref
+      ) errors.push(`${cardId}:coverage_mismatch`);
     }
   }
   visited.delete(cardId);
+}
+
+async function assertSourceOrder(store, refs) {
+  let prior = null;
+  for (const ref of refs) {
+    const run = await store.getRun(ref.run_id);
+    if (!run) throw new GatewayError("FOLD_SOURCE_NOT_FOUND", "Fold source run was not found", 404);
+    const current = runOrderKey(run, ref.start_index);
+    if (prior && compareOrderKey(prior, current) >= 0) {
+      throw new GatewayError("INVALID_FOLD_ORDER", "Fold source_refs must follow canonical chronological/message order", 409);
+    }
+    prior = runOrderKey(run, ref.end_index);
+  }
+}
+
+async function assertChildOrder(store, children) {
+  let prior = null;
+  for (const child of children) {
+    const boundary = await cardBoundaryOrder(store, child);
+    if (!boundary) throw new GatewayError("INVALID_FOLD_ORDER", "Fold child coverage boundary is invalid", 409);
+    if (prior && compareOrderKey(prior, boundary.first) >= 0) {
+      throw new GatewayError("INVALID_FOLD_ORDER", "Fold child_refs must follow canonical chronological order", 409);
+    }
+    prior = boundary.last;
+  }
+}
+
+async function cardBoundaryOrder(store, card) {
+  const first = parseSourcePointer(card.coverage?.first_source_ref);
+  const last = parseSourcePointer(card.coverage?.last_source_ref);
+  if (!first || !last) return null;
+  const [firstRun, lastRun] = await Promise.all([store.getRun(first.run_id), store.getRun(last.run_id)]);
+  if (!firstRun || !lastRun) return null;
+  return {
+    first: runOrderKey(firstRun, first.start_index),
+    last: runOrderKey(lastRun, last.end_index)
+  };
+}
+
+function parseSourcePointer(value) {
+  if (typeof value !== "string") return null;
+  const match = value.match(/^gateway:run:(.+):messages:(\d+)-(\d+)$/);
+  if (!match) return null;
+  return {
+    run_id: match[1],
+    start_index: Number(match[2]),
+    end_index: Number(match[3])
+  };
+}
+
+function runOrderKey(run, messageIndex) {
+  return {
+    at: String(run.completed_at ?? run.created_at ?? ""),
+    run_id: String(run.run_id ?? ""),
+    message_index: Number(messageIndex)
+  };
+}
+
+function compareOrderKey(a, b) {
+  if (a.run_id === b.run_id) return a.message_index - b.message_index;
+  const byTime = a.at.localeCompare(b.at);
+  if (byTime !== 0) return byTime;
+  return a.run_id.localeCompare(b.run_id);
 }
 
 export async function readFoldSource(store, ref, expectedScope = null) {
@@ -387,24 +502,174 @@ function cardFingerprint(cardLike) {
 
 function selfValidateCard(card) {
   const errors = [];
-  if (!card || typeof card !== "object") return { valid: false, errors: ["not_object"] };
+  if (!card || typeof card !== "object" || Array.isArray(card)) return { valid: false, errors: ["not_object"] };
   if (card.schema_version !== CARD_SCHEMA) errors.push("schema_version");
   if (card.kind !== CARD_KIND) errors.push("kind");
   if (!Number.isInteger(card.level) || card.level < 1 || card.level > MAX_LEVEL) errors.push("level");
   try { normalizeScope(card.scope); } catch { errors.push("scope"); }
-  if (!Array.isArray(card.child_refs) || !Array.isArray(card.source_refs)) errors.push("refs");
-  if (typeof card.summary !== "string" || card.summary.length === 0) errors.push("summary");
-  if (typeof card.created_at !== "string" || card.created_at.length === 0) errors.push("created_at");
+
+  const childRefs = Array.isArray(card.child_refs) ? card.child_refs : null;
+  const sourceRefs = Array.isArray(card.source_refs) ? card.source_refs : null;
+  if (!childRefs || !sourceRefs) errors.push("refs");
+  if (typeof card.summary !== "string" || card.summary.length === 0 || card.summary.length > MAX_SUMMARY_CHARS) errors.push("summary");
+  if (typeof card.created_at !== "string" || !Number.isFinite(Date.parse(card.created_at))) errors.push("created_at");
   if (typeof card.card_id !== "string" || !/^fold_[a-f0-9]{40}$/.test(card.card_id)) errors.push("card_id");
   if (typeof card.fingerprint !== "string" || !/^sha256:[a-f0-9]{64}$/.test(card.fingerprint)) errors.push("fingerprint");
-  if (card.validation_state?.state !== "validated") errors.push("validation_state");
+
+  validateGeneratorShape(card.generator, errors);
+  validateValidationState(card.validation_state, card.level, errors);
+
+  if (childRefs && sourceRefs && Number.isInteger(card.level)) {
+    if (card.level === 1) {
+      if (sourceRefs.length === 0 || childRefs.length !== 0) errors.push("ref_mode");
+      const seen = new Set();
+      let priorSameRun = null;
+      for (const ref of sourceRefs) {
+        if (!validSourceRefShape(ref)) {
+          errors.push("source_ref_shape");
+          continue;
+        }
+        const key = sourceRefKey(ref);
+        if (seen.has(key)) errors.push("source_ref_duplicate");
+        seen.add(key);
+        if (priorSameRun && priorSameRun.run_id === ref.run_id && ref.start_index <= priorSameRun.end_index) errors.push("source_ref_order");
+        priorSameRun = ref;
+      }
+    } else if (card.level > 1) {
+      if (childRefs.length === 0 || sourceRefs.length !== 0) errors.push("ref_mode");
+      const seen = new Set();
+      for (const ref of childRefs) {
+        if (!validChildRefShape(ref)) {
+          errors.push("child_ref_shape");
+          continue;
+        }
+        if (seen.has(ref.card_id)) errors.push("child_ref_duplicate");
+        seen.add(ref.card_id);
+      }
+    }
+  }
+
+  validateCoverageShape(card, errors);
+  validateSizeShape(card, errors);
+
   if (errors.length === 0) {
     const expectedFingerprint = cardFingerprint(card);
     if (expectedFingerprint !== card.fingerprint) errors.push("fingerprint_mismatch");
     const expectedId = `fold_${expectedFingerprint.slice("sha256:".length, "sha256:".length + 40)}`;
     if (expectedId !== card.card_id) errors.push("identity_mismatch");
   }
-  return { valid: errors.length === 0, errors };
+  return { valid: errors.length === 0, errors: [...new Set(errors)] };
+}
+
+function validateGeneratorShape(generator, errors) {
+  if (!generator || typeof generator !== "object" || Array.isArray(generator)) {
+    errors.push("generator");
+    return;
+  }
+  for (const key of ["kind", "version"]) {
+    if (typeof generator[key] !== "string" || generator[key].trim().length === 0 || generator[key].length > 512) errors.push("generator");
+  }
+  for (const key of ["provider", "model", "prompt_fingerprint"]) {
+    if (generator[key] !== undefined && generator[key] !== null && (typeof generator[key] !== "string" || generator[key].trim().length === 0 || generator[key].length > 512)) errors.push("generator");
+  }
+}
+
+function validateValidationState(state, level, errors) {
+  if (!state || typeof state !== "object" || state.state !== "validated" || !Array.isArray(state.checks)) {
+    errors.push("validation_state");
+    return;
+  }
+  const required = ["structure", "scope", "ordered_refs", level === 1 ? "source_fingerprints" : "child_fingerprints", "content_fingerprint"];
+  if (state.checks.some((item) => typeof item !== "string") || required.some((item) => !state.checks.includes(item))) errors.push("validation_state");
+}
+
+function validSourceRefShape(ref) {
+  return Boolean(
+    ref &&
+    typeof ref === "object" &&
+    ref.kind === "run_messages" &&
+    safeStoredId(ref.run_id) &&
+    safeStoredId(ref.session_id) &&
+    Number.isInteger(ref.start_index) &&
+    Number.isInteger(ref.end_index) &&
+    ref.start_index >= 0 &&
+    ref.end_index >= ref.start_index &&
+    Number.isInteger(ref.message_count) &&
+    ref.message_count === ref.end_index - ref.start_index + 1 &&
+    typeof ref.fingerprint === "string" &&
+    /^sha256:[a-f0-9]{64}$/.test(ref.fingerprint)
+  );
+}
+
+function validChildRefShape(ref) {
+  return Boolean(
+    ref &&
+    typeof ref === "object" &&
+    typeof ref.card_id === "string" &&
+    /^fold_[a-f0-9]{40}$/.test(ref.card_id) &&
+    typeof ref.fingerprint === "string" &&
+    /^sha256:[a-f0-9]{64}$/.test(ref.fingerprint)
+  );
+}
+
+function validateCoverageShape(card, errors) {
+  const coverage = card.coverage;
+  if (!coverage || typeof coverage !== "object" || Array.isArray(coverage)) {
+    errors.push("coverage");
+    return;
+  }
+  const keys = ["direct_source_count", "direct_message_count", "child_count", "descendant_source_count", "descendant_message_count"];
+  if (keys.some((key) => !Number.isInteger(coverage[key]) || coverage[key] < 0)) {
+    errors.push("coverage");
+    return;
+  }
+  const first = coverage.first_source_ref;
+  const last = coverage.last_source_ref;
+  if (typeof first !== "string" || typeof last !== "string" || !first.startsWith("gateway:run:") || !last.startsWith("gateway:run:")) errors.push("coverage");
+
+  if (card.level === 1 && Array.isArray(card.source_refs)) {
+    if (card.source_refs.length === 0 || !card.source_refs.every(validSourceRefShape)) {
+      errors.push("coverage");
+      return;
+    }
+    const messageCount = card.source_refs.reduce((sum, ref) => sum + ref.message_count, 0);
+    if (
+      coverage.direct_source_count !== card.source_refs.length ||
+      coverage.direct_message_count !== messageCount ||
+      coverage.child_count !== 0 ||
+      coverage.descendant_source_count !== card.source_refs.length ||
+      coverage.descendant_message_count !== messageCount ||
+      coverage.first_source_ref !== sourcePointer(card.source_refs[0]) ||
+      coverage.last_source_ref !== sourcePointer(card.source_refs[card.source_refs.length - 1])
+    ) errors.push("coverage");
+  } else if (card.level > 1 && Array.isArray(card.child_refs)) {
+    if (
+      coverage.direct_source_count !== 0 ||
+      coverage.direct_message_count !== 0 ||
+      coverage.child_count !== card.child_refs.length ||
+      coverage.descendant_source_count < card.child_refs.length ||
+      coverage.descendant_message_count < coverage.descendant_source_count
+    ) errors.push("coverage");
+  }
+}
+
+function validateSizeShape(card, errors) {
+  const size = card.size_estimate;
+  if (!size || typeof size !== "object" || Array.isArray(size)) {
+    errors.push("size_estimate");
+    return;
+  }
+  const summaryBytes = typeof card.summary === "string" ? Buffer.byteLength(card.summary, "utf8") : -1;
+  if (
+    !Number.isInteger(size.covered_bytes) || size.covered_bytes <= 0 ||
+    !Number.isInteger(size.summary_bytes) || size.summary_bytes !== summaryBytes ||
+    !Number.isInteger(size.estimated_covered_tokens) || size.estimated_covered_tokens !== estimateTokens(size.covered_bytes) ||
+    !Number.isInteger(size.estimated_summary_tokens) || size.estimated_summary_tokens !== estimateTokens(size.summary_bytes)
+  ) errors.push("size_estimate");
+}
+
+function safeStoredId(value) {
+  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value);
 }
 
 function normalizeScope(scope) {
