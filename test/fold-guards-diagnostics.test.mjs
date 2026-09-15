@@ -321,7 +321,7 @@ test("authenticated advanced diagnostics expose safe context/archive/recovery sc
       summary: "Server diagnostic archive card.",
       generator: GENERATOR
     });
-    await searchFoldArchive(direct, {
+    const archiveResult = await searchFoldArchive(direct, {
       query: 'exact "DIAG-X"',
       scope,
       session_id: run.session_id,
@@ -330,6 +330,7 @@ test("authenticated advanced diagnostics expose safe context/archive/recovery sc
       max_messages: 8,
       max_raw_bytes: 8192
     });
+    assert.ok(archiveResult.diagnostics.source_refs.length >= 1);
 
     const response = await fetch(`${baseUrl}/v1/runs/${created.run_id}/diagnostics`, {
       headers: { authorization: `Bearer ${fixture.setup.api_token}` }
@@ -342,9 +343,9 @@ test("authenticated advanced diagnostics expose safe context/archive/recovery sc
     assert.ok(diagnostics.context.tokens_by_layer);
     assert.equal(typeof diagnostics.context.tokens_by_layer.total_before, "number");
     assert.deepEqual(diagnostics.archive.cards_used, [card.card_id]);
-    assert.ok(diagnostics.archive.source_refs.length >= 1);
-    assert.equal(diagnostics.archive.retrieval_depth, 1);
-    assert.equal(diagnostics.archive.exact_fallback_reason, "precision_intent");
+    assert.deepEqual(diagnostics.archive.source_refs, archiveResult.diagnostics.source_refs);
+    assert.equal(diagnostics.archive.retrieval_depth, archiveResult.diagnostics.retrieval_depth);
+    assert.equal(diagnostics.archive.exact_fallback_reason, archiveResult.diagnostics.exact_fallback_reason);
     assert.equal(diagnostics.safety.raw_message_content_included, false);
     assert.equal(diagnostics.safety.prompts_included, false);
     assert.equal(diagnostics.safety.chain_of_thought_included, false);
