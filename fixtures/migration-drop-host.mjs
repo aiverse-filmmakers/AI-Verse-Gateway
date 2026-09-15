@@ -50,10 +50,12 @@ switch (input.operation) {
       request_fingerprint: req.request_fingerprint
     });
     saveState(state);
-    result = req.operation === "migration.import" &&
-      req.action_class === "write_local_reversible" &&
+    const allowedMigration =
+      ((req.operation === "migration.import" && req.action_class === "write_local_reversible") ||
+       (req.operation === "migration.pending" && req.action_class === "read_local")) &&
       req.scope === "operator" &&
-      /^[a-f0-9]{64}$/.test(String(req.request_fingerprint ?? ""))
+      /^[a-f0-9]{64}$/.test(String(req.request_fingerprint ?? ""));
+    result = allowedMigration
       ? { decision: "allow", allowed: true }
       : { decision: "deny", allowed: false, reason: "unexpected migration request" };
     break;
@@ -61,9 +63,48 @@ switch (input.operation) {
   case "request_action": {
     const req = p.request ?? {};
     const params = req.parameters ?? {};
+    const state = readState();
+
+    if (req.operation === "migration.pending") {
+      state.actions.push({
+        operation: req.operation,
+        scope: req.scope,
+        action_class: req.action_class,
+        parameters: params
+      });
+      saveState(state);
+      const validPending =
+        req.scope === "operator" &&
+        req.action_class === "read_local" &&
+        (params.limit === undefined || params.limit === 64);
+      result = validPending ? {
+        status: "succeeded",
+        effect_occurred: false,
+        result: {
+          migration_pending: {
+            state: "needs-clarification",
+            count: 1,
+            items: [{
+              source_import_key: "a".repeat(64),
+              clarification_id: "clarify-" + "b".repeat(24),
+              topic: "TUI",
+              kind: "relationship",
+              question: "Is TUI a current client, a past client, or a one-off project?",
+              choices: ["current client", "past client", "one-off project", "something else"],
+              evidence_spans: ["TUI"]
+            }]
+          }
+        }
+      } : {
+        status: "blocked",
+        effect_occurred: false,
+        result: { reason: "pending migration read was not operator-scoped" }
+      };
+      break;
+    }
+
     const source = params.source ?? {};
     const plan = params.plan ?? {};
-    const state = readState();
     state.actions.push({
       operation: req.operation,
       scope: req.scope,
@@ -88,12 +129,16 @@ switch (input.operation) {
       effect_occurred: true,
       result: {
         migration_import: {
-          schema_version: "1.0",
+          schema_version: "1.1",
+          state: Array.isArray(plan.clarifications) && plan.clarifications.length ? "needs-clarification" : "complete",
           source_sha256: "f".repeat(64),
           counts: {
+            profile_items: plan.profile ? 1 : 0,
             workspace_items: Array.isArray(plan.workspaces) ? plan.workspaces.length : 0,
             memory_items: Array.isArray(plan.memories) ? plan.memories.length : 0,
             data_items: Array.isArray(plan.data) ? plan.data.length : 0,
+            pending_clarifications: Array.isArray(plan.clarifications) ? plan.clarifications.length : 0,
+            resolved_clarifications: Array.isArray(plan.resolutions) ? plan.resolutions.length : 0,
             effects: 2
           },
           replayed: false,
