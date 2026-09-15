@@ -299,7 +299,7 @@ test("scope boundaries fail closed and referenced-card tampering is detected ins
   const parentValidation = await store.validateFoldCard(parent.card_id);
   assert.equal(parentValidation.valid, false);
   assert.equal(
-    parentValidation.errors.some((item) => item.includes(alpha.card_id) && item.includes("fingerprint_mismatch")),
+    parentValidation.errors.some((item) => item.includes(alpha.card_id) && item.includes("child_invalid")),
     true
   );
   await assert.rejects(
