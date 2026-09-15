@@ -343,6 +343,21 @@ async function advancedRunDiagnostics(store, run) {
       emergency_tail_shrink: governor.emergency_tail_shrink === true,
       fold_work: governor.fold_work ?? null
     } : null,
+    retrieval: run.context_retrieval ? {
+      api_version: run.context_retrieval.api_version ?? null,
+      query_fingerprint: run.context_retrieval.query_fingerprint ?? null,
+      requested_depth: run.context_retrieval.requested_depth ?? null,
+      realized_depths: Array.isArray(run.context_retrieval.realized_depths) ? run.context_retrieval.realized_depths : [],
+      progressive_available: run.context_retrieval.progressive_available === true,
+      intent_class: run.context_retrieval.intent_class ?? null,
+      exact_sensitive: run.context_retrieval.exact_sensitive === true,
+      source_reads: Number(run.context_retrieval.source_reads ?? 0),
+      gateway_source_range_reads: Number(run.context_retrieval.gateway_source_range_reads ?? 0),
+      legacy_reads: Number(run.context_retrieval.legacy_reads ?? 0),
+      fallback_reason: run.context_retrieval.fallback_reason ?? null,
+      bytes_by_depth: run.context_retrieval.bytes_by_depth ?? {},
+      item_counts: run.context_retrieval.item_counts ?? {}
+    } : null,
     archive: {
       cards_used: Array.isArray(archive.cards_used) ? archive.cards_used : [],
       source_refs: Array.isArray(archive.source_refs) ? archive.source_refs : [],
