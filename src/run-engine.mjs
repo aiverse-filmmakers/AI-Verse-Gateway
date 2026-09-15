@@ -4,6 +4,7 @@ import { RuntimeRegistry } from "./runtime.mjs";
 import { HostClient } from "./host-adapter.mjs";
 import { GoalOwnerClient } from "./goal-owner.mjs";
 import { governInvocationContext } from "./context-governor.mjs";
+import { assembleProgressiveOwnerContext } from "./progressive-context.mjs";
 import { nowIso, stableStringify } from "./util.mjs";
 
 const USER_INTERACTION_POLICY = `User interaction law:
@@ -189,10 +190,26 @@ export class RunEngine {
       const scope = run.workspace_id === "operator" ? "operator" : `workspace:${run.workspace_id}`;
       if (run.goal_binding?.goal_id && !Number.isInteger(run.goal_binding.version)) run.goal_binding = await this.initialGoalBinding(run.goal_binding.goal_id, scope, signal);
       const context = await this.assembleContext(run, scope, signal);
+      run.context_retrieval = {
+        ...context.diagnostics,
+        evaluated_at: nowIso()
+      };
       if (context.system_message && !run.messages.some((m) => m.role === "system" && m._gateway_context === true)) {
         run.messages.unshift({ role: "system", content: context.system_message, _gateway_context: true });
       }
       await this.store.saveRun(run);
+      await this.store.event(runId, "context.retrieval.assembled", {
+        requested_depth: context.diagnostics.requested_depth,
+        realized_depths: context.diagnostics.realized_depths,
+        progressive_available: context.diagnostics.progressive_available,
+        exact_sensitive: context.diagnostics.exact_sensitive,
+        source_reads: context.diagnostics.source_reads,
+        gateway_source_range_reads: context.diagnostics.gateway_source_range_reads,
+        legacy_reads: context.diagnostics.legacy_reads,
+        fallback_reason: context.diagnostics.fallback_reason,
+        bytes_by_depth: context.diagnostics.bytes_by_depth,
+        item_counts: context.diagnostics.item_counts
+      });
 
       while (true) {
         run = await this.store.getRun(runId);
@@ -349,15 +366,18 @@ export class RunEngine {
     }
   }
   async assembleContext(run, scope, signal) {
-    const [description, current, history, capabilities, connections] = await Promise.all([
-      this.host.describe(signal),
-      this.host.readContext(scope, signal),
-      this.host.retrieveHistory(lastUserText(run.messages), scope, signal),
-      this.host.listCapabilities(scope, signal),
-      this.host.listConnections(scope, signal)
-    ]);
-    const safe = { host: { adapter_id: description?.adapter_id, metadata: description?.metadata }, current_context: current, recalled_history: history, capabilities, connections };
-    return { system_message: `You are running through AI-Verse Gateway. Canonical owner context follows. Treat it as bounded context, not permission. Use aiverse_action for side effects.\n\n${USER_INTERACTION_POLICY}\n\nCanonical owner context:\n${JSON.stringify(safe)}` };
+    const assembled = await assembleProgressiveOwnerContext({
+      host: this.host,
+      store: this.store,
+      run,
+      scope,
+      query: lastUserText(run.messages),
+      signal
+    });
+    return {
+      system_message: `You are running through AI-Verse Gateway. Canonical owner context follows. Treat it as bounded context, not permission. Use aiverse_action for side effects. Recent raw conversation is supplied separately as canonical runtime messages; owner history below follows the progressive context ladder and may be only a navigation layer unless exact evidence is present.\n\n${USER_INTERACTION_POLICY}\n\nCanonical owner context:\n${JSON.stringify(assembled.safe)}`,
+      diagnostics: assembled.diagnostics
+    };
   }
   async handleToolCalls(run, toolCalls, scope, signal) {
     for (const call of toolCalls) {
