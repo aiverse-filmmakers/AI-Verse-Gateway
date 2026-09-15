@@ -4,6 +4,12 @@ import { sha256, stableStringify } from "./util.mjs";
 export const PROGRESSIVE_CONTEXT_VERSION = "gateway.progressive-context.g1.v1";
 export const PROGRESSIVE_HISTORY_VERSION = "memory.progressive-recall.v1";
 export const PROGRESSIVE_HISTORY_OPERATION = "retrieve_history_progressive";
+export const RUNTIME_DEEP_RETRIEVAL_VERSION = "gateway.deep-retrieval.g2.v1";
+export const RUNTIME_DEEP_LIMITS = Object.freeze({
+  summary: Object.freeze({ max_limit: 6, max_bytes: 8192 }),
+  detail: Object.freeze({ max_limit: 4, max_bytes: 12288 }),
+  source: Object.freeze({ max_limit: 1, max_bytes: 16384 })
+});
 
 const DEPTHS = ["catalog", "summary", "detail", "source"];
 const BUDGETS = {
@@ -178,6 +184,144 @@ export async function assembleProgressiveOwnerContext({
   return { safe, diagnostics };
 }
 
+export async function retrieveRuntimeDeepContext({
+  host,
+  store,
+  run,
+  scope,
+  depth,
+  query,
+  limit,
+  max_bytes,
+  evidence_ref = null,
+  signal
+}) {
+  const normalizedDepth = String(depth ?? "").trim();
+  const bounds = RUNTIME_DEEP_LIMITS[normalizedDepth];
+  if (!bounds) {
+    throw new GatewayError("CONTEXT_RETRIEVAL_DEPTH_INVALID", "Runtime deep retrieval depth must be summary, detail, or source", 400);
+  }
+  const normalizedQuery = String(query ?? "").trim().replace(/\s+/g, " ");
+  if (!normalizedQuery || normalizedQuery.length > 4096) {
+    throw new GatewayError("CONTEXT_RETRIEVAL_QUERY_INVALID", "Runtime deep retrieval query must be 1..4096 characters", 400);
+  }
+
+  const requestedLimit = limit == null ? bounds.max_limit : Number(limit);
+  if (!Number.isInteger(requestedLimit) || requestedLimit < 1 || requestedLimit > bounds.max_limit) {
+    throw new GatewayError(
+      "CONTEXT_RETRIEVAL_BUDGET_EXCEEDED",
+      `Runtime ${normalizedDepth} retrieval limit must be between 1 and ${bounds.max_limit}`,
+      409
+    );
+  }
+  const requestedBytes = max_bytes == null ? bounds.max_bytes : Number(max_bytes);
+  if (!Number.isInteger(requestedBytes) || requestedBytes < 4096 || requestedBytes > bounds.max_bytes) {
+    throw new GatewayError(
+      "CONTEXT_RETRIEVAL_BUDGET_EXCEEDED",
+      `Runtime ${normalizedDepth} retrieval max_bytes must be between 4096 and ${bounds.max_bytes}`,
+      409
+    );
+  }
+
+  if (normalizedDepth === "source") {
+    if (!evidence_ref || typeof evidence_ref !== "object" || Array.isArray(evidence_ref)) {
+      throw new GatewayError("CONTEXT_RETRIEVAL_EVIDENCE_REQUIRED", "Source retrieval requires a prior detail evidence_ref", 400);
+    }
+    assertEvidenceScope(evidence_ref, scope);
+    if (serializedBytes(evidence_ref) > 32768) {
+      throw new GatewayError("CONTEXT_RETRIEVAL_EVIDENCE_TOO_LARGE", "Source evidence_ref exceeds the Gateway safety bound", 409);
+    }
+  } else if (evidence_ref != null) {
+    throw new GatewayError("CONTEXT_RETRIEVAL_EVIDENCE_INVALID", "evidence_ref is only allowed for source retrieval", 400);
+  }
+
+  const description = await host.describe(signal);
+  const operations = Array.isArray(description?.operations) ? description.operations : [];
+  if (!operations.includes(PROGRESSIVE_HISTORY_OPERATION)) {
+    throw new GatewayError("CONTEXT_RETRIEVAL_UNAVAILABLE", "OS host does not expose progressive Memory retrieval", 409);
+  }
+
+  const ownerResult = await progressiveRead(host, {
+    depth: normalizedDepth,
+    scope,
+    query: normalizedQuery,
+    limit: requestedLimit,
+    max_bytes: requestedBytes,
+    ...(normalizedDepth === "source" ? { evidence_ref } : {})
+  }, signal);
+  if (serializedBytes(ownerResult) > requestedBytes) {
+    throw new GatewayError("CONTEXT_RETRIEVAL_RESULT_TOO_LARGE", "Owner progressive retrieval exceeded the Gateway-requested byte budget", 502);
+  }
+
+  let gatewayExactSource = null;
+  if (normalizedDepth === "source" && ownerResult?.status === "external_source_required") {
+    gatewayExactSource = await resolveGatewayExternalSource({
+      store,
+      requestRun: run,
+      scope,
+      query: normalizedQuery,
+      sourceResponse: ownerResult,
+      maxBytes: Math.max(1024, requestedBytes - 2048),
+      maxMessages: GATEWAY_SOURCE_MAX_MESSAGES
+    });
+  }
+
+  const result = {
+    schema_version: "1.0",
+    api_version: RUNTIME_DEEP_RETRIEVAL_VERSION,
+    depth: normalizedDepth,
+    scope,
+    owner_result: ownerResult,
+    gateway_exact_source: gatewayExactSource
+  };
+  enforceRuntimeResultBudget(result, requestedBytes);
+
+  return {
+    result,
+    diagnostics: {
+      schema_version: "1.0",
+      api_version: RUNTIME_DEEP_RETRIEVAL_VERSION,
+      depth: normalizedDepth,
+      query_fingerprint: `sha256:${sha256(normalizedQuery)}`,
+      limit: requestedLimit,
+      max_bytes: requestedBytes,
+      owner: "ai-verse-memory",
+      source_read: normalizedDepth === "source",
+      gateway_source_range_reads: Number(gatewayExactSource?.source_range_reads ?? 0),
+      result_bytes: serializedBytes(result),
+      result_status: gatewayExactSource?.status ?? ownerResult?.status ?? "ok"
+    }
+  };
+}
+
+function assertEvidenceScope(evidenceRef, boundScope) {
+  const evidenceScope = String(evidenceRef?.scope ?? "");
+  const allowed = boundScope === "operator"
+    ? ["operator"]
+    : [boundScope, "operator"];
+  if (!allowed.includes(evidenceScope)) {
+    throw new GatewayError("CONTEXT_RETRIEVAL_SCOPE_ESCAPE", "Runtime evidence_ref is outside the run's bound visibility", 403);
+  }
+}
+
+function enforceRuntimeResultBudget(result, maxBytes) {
+  if (serializedBytes(result) <= maxBytes) return;
+  const exact = result.gateway_exact_source;
+  if (exact && Array.isArray(exact.messages)) {
+    while (exact.messages.length > 0 && serializedBytes(result) > maxBytes) {
+      exact.messages.pop();
+      exact.truncated = true;
+    }
+    exact.raw_bytes_returned = exact.messages.reduce(
+      (sum, item) => sum + Buffer.byteLength(String(item?.content ?? ""), "utf8"),
+      0
+    );
+  }
+  if (serializedBytes(result) > maxBytes) {
+    throw new GatewayError("CONTEXT_RETRIEVAL_RESULT_TOO_LARGE", "Combined deep retrieval result cannot fit the requested byte budget", 502);
+  }
+}
+
 async function progressiveRead(host, payload, signal) {
   return await host.retrieveHistoryProgressive({
     version: PROGRESSIVE_HISTORY_VERSION,
@@ -211,7 +355,15 @@ function selectEvidenceRef(detail) {
   ) ?? null;
 }
 
-async function resolveGatewayExternalSource({ store, requestRun, scope, query, sourceResponse }) {
+async function resolveGatewayExternalSource({
+  store,
+  requestRun,
+  scope,
+  query,
+  sourceResponse,
+  maxBytes = GATEWAY_SOURCE_MAX_BYTES,
+  maxMessages = GATEWAY_SOURCE_MAX_MESSAGES
+}) {
   if (!store || !requestRun) {
     return externalFailure("gateway_store_unavailable");
   }
@@ -264,7 +416,7 @@ async function resolveGatewayExternalSource({ store, requestRun, scope, query, s
     }
   }
 
-  const chosen = chooseBoundedMessages(candidates, GATEWAY_SOURCE_MAX_MESSAGES, GATEWAY_SOURCE_MAX_BYTES);
+  const chosen = chooseBoundedMessages(candidates, maxMessages, maxBytes);
   return {
     schema_version: "1.0",
     kind: "gateway_exact_source",

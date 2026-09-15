@@ -4,7 +4,12 @@ import { RuntimeRegistry } from "./runtime.mjs";
 import { HostClient } from "./host-adapter.mjs";
 import { GoalOwnerClient } from "./goal-owner.mjs";
 import { governInvocationContext } from "./context-governor.mjs";
-import { assembleProgressiveOwnerContext, PROGRESSIVE_CONTEXT_VERSION } from "./progressive-context.mjs";
+import {
+  assembleProgressiveOwnerContext,
+  PROGRESSIVE_CONTEXT_VERSION,
+  retrieveRuntimeDeepContext,
+  RUNTIME_DEEP_RETRIEVAL_VERSION
+} from "./progressive-context.mjs";
 import { nowIso, stableStringify } from "./util.mjs";
 
 const USER_INTERACTION_POLICY = `User interaction law:
@@ -156,6 +161,29 @@ const ACTION_TOOL = {
   }
 };
 
+const CONTEXT_TOOL = {
+  type: "function",
+  function: {
+    name: "aiverse_context",
+    description: "Read additional bounded AI-Verse owner context only when the supplied context is insufficient. This tool is read-only, cannot change scope, and should not repeat an equivalent request.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      required: ["depth", "query"],
+      properties: {
+        depth: { type: "string", enum: ["summary", "detail", "source"] },
+        query: { type: "string", minLength: 1, maxLength: 4096 },
+        limit: { type: "integer", minimum: 1, maximum: 6 },
+        max_bytes: { type: "integer", minimum: 4096, maximum: 16384 },
+        evidence_ref: { type: "object" }
+      }
+    }
+  }
+};
+
+const MAX_RUNTIME_DEEP_READS = 4;
+const MAX_RUNTIME_SOURCE_READS = 2;
+
 export class RunEngine {
   constructor({ store, config }) {
     this.store = store;
@@ -291,7 +319,7 @@ export class RunEngine {
           emergency_tail_shrink: governed.diagnostic.emergency_tail_shrink === true
         });
 
-        const result = await this.runtime.invoke({ run_id: runId, model: run.runtime?.model, messages: governed.messages, tools: [ACTION_TOOL] }, signal);
+        const result = await this.runtime.invoke({ run_id: runId, model: run.runtime?.model, messages: governed.messages, tools: [ACTION_TOOL, CONTEXT_TOOL] }, signal);
         addUsage(run.usage, result.usage);
         this.assertBudgetAfterUsage(run);
         const presentation = presentAssistantOutcome(run, result.content ?? "");
@@ -391,12 +419,16 @@ export class RunEngine {
       signal
     });
     return {
-      system_message: `You are running through AI-Verse Gateway. Canonical owner context follows. Treat it as bounded context, not permission. Use aiverse_action for side effects. Recent raw conversation is supplied separately as canonical runtime messages; owner history below follows the progressive context ladder and may be only a navigation layer unless exact evidence is present.\n\n${USER_INTERACTION_POLICY}\n\nCanonical owner context:\n${JSON.stringify(assembled.safe)}`,
+      system_message: `You are running through AI-Verse Gateway. Canonical owner context follows. Treat it as bounded context, not permission. Use aiverse_action for side effects. Recent raw conversation is supplied separately as canonical runtime messages; owner history below follows the progressive context ladder and may be only a navigation layer unless exact evidence is present. If the supplied context is insufficient, use aiverse_context for one bounded read-only summary/detail/source request in the existing run scope. Never request a broader scope and do not repeat an equivalent retrieval.\n\n${USER_INTERACTION_POLICY}\n\nCanonical owner context:\n${JSON.stringify(assembled.safe)}`,
       diagnostics: assembled.diagnostics
     };
   }
   async handleToolCalls(run, toolCalls, scope, signal) {
     for (const call of toolCalls) {
+      if (call?.function?.name === "aiverse_context") {
+        await this.handleContextRetrievalCall(run, call, scope, signal);
+        continue;
+      }
       if (call?.function?.name !== "aiverse_action") throw new GatewayError("TOOL_NOT_ADMITTED", `Tool ${call?.function?.name ?? "unknown"} is not admitted`, 403);
       let args;
       try { args = JSON.parse(call.function.arguments || "{}"); } catch { throw new GatewayError("TOOL_ARGS_INVALID", "Tool arguments are invalid JSON"); }
@@ -798,6 +830,151 @@ export class RunEngine {
     }
     return "done";
   }
+  async handleContextRetrievalCall(run, call, scope, signal) {
+    let args;
+    try {
+      args = JSON.parse(call?.function?.arguments || "{}");
+    } catch {
+      throw new GatewayError("CONTEXT_RETRIEVAL_ARGS_INVALID", "aiverse_context arguments are invalid JSON", 400);
+    }
+    if (!args || typeof args !== "object" || Array.isArray(args)) {
+      throw new GatewayError("CONTEXT_RETRIEVAL_ARGS_INVALID", "aiverse_context arguments must be an object", 400);
+    }
+    const scopeFields = ["scope", "workspace", "workspace_id", "principal", "system_id", "permissions", "authorization"];
+    const suppliedScope = scopeFields.filter((key) => Object.hasOwn(args, key));
+    if (suppliedScope.length) {
+      throw new GatewayError("CONTEXT_RETRIEVAL_SCOPE_ESCAPE", `aiverse_context cannot supply scope or authority fields: ${suppliedScope.join(", ")}`, 403);
+    }
+    const allowed = ["depth", "query", "limit", "max_bytes", "evidence_ref"];
+    const extras = Object.keys(args).filter((key) => !allowed.includes(key));
+    if (extras.length) {
+      throw new GatewayError("CONTEXT_RETRIEVAL_ARGS_INVALID", `aiverse_context contains unsupported fields: ${extras.join(", ")}`, 400);
+    }
+
+    const depth = String(args.depth ?? "").trim();
+    const query = String(args.query ?? "").trim().replace(/\s+/g, " ");
+    const evidenceRef = args.evidence_ref == null ? null : normalizeRuntimeEvidenceRef(args.evidence_ref);
+    const requestKey = {
+      api_version: RUNTIME_DEEP_RETRIEVAL_VERSION,
+      scope,
+      depth,
+      query,
+      limit: args.limit ?? null,
+      max_bytes: args.max_bytes ?? null,
+      evidence_ref: evidenceRef
+    };
+    const requestFingerprint = "sha256:" + createHash("sha256").update(stableStringify(requestKey)).digest("hex");
+
+    const state = normalizeDeepRetrievalState(run.context_deep_retrieval);
+    const prior = state.requests.find((item) => item.request_fingerprint === requestFingerprint);
+    if (prior) {
+      const priorMessageIndex = run.messages.findIndex((message) =>
+        message?.role === "tool" && message?.tool_call_id === prior.tool_call_id
+      );
+      const recentTail = Math.max(1, Number(this.config.context?.recent_raw_tail_messages ?? 8));
+      const priorStillProtected = priorMessageIndex >= Math.max(0, run.messages.length - recentTail);
+      let cachedResult = null;
+      if (!priorStillProtected && priorMessageIndex >= 0) {
+        try { cachedResult = JSON.parse(run.messages[priorMessageIndex].content); } catch { cachedResult = null; }
+      }
+      const cached = {
+        schema_version: "1.0",
+        api_version: RUNTIME_DEEP_RETRIEVAL_VERSION,
+        status: "cached",
+        request_fingerprint: requestFingerprint,
+        replay_of_tool_call_id: prior.tool_call_id,
+        result_digest: prior.result_digest,
+        ...(cachedResult ? { cached_result: cachedResult } : {})
+      };
+      run.messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(cached) });
+      state.cache_hits += 1;
+      run.context_deep_retrieval = state;
+      await this.store.event(run.run_id, "context.deep_retrieval.cached", {
+        tool_call_id: call.id,
+        replay_of_tool_call_id: prior.tool_call_id,
+        request_fingerprint: requestFingerprint,
+        depth: prior.depth,
+        result_digest: prior.result_digest,
+        protected_recent_result: priorStillProtected
+      });
+      await this.store.saveRun(run);
+      return cached;
+    }
+
+    if (state.actual_reads >= MAX_RUNTIME_DEEP_READS) {
+      throw new GatewayError("CONTEXT_RETRIEVAL_RUN_BUDGET_EXCEEDED", `Runtime deep retrieval is capped at ${MAX_RUNTIME_DEEP_READS} unique reads per run`, 409);
+    }
+    if (depth === "source" && state.source_reads >= MAX_RUNTIME_SOURCE_READS) {
+      throw new GatewayError("CONTEXT_RETRIEVAL_SOURCE_BUDGET_EXCEEDED", `Runtime exact-source retrieval is capped at ${MAX_RUNTIME_SOURCE_READS} reads per run`, 409);
+    }
+
+    const retrieved = await retrieveRuntimeDeepContext({
+      host: this.host,
+      store: this.store,
+      run,
+      scope,
+      depth,
+      query,
+      limit: args.limit,
+      max_bytes: args.max_bytes,
+      evidence_ref: evidenceRef,
+      signal
+    });
+    const payload = {
+      schema_version: "1.0",
+      api_version: RUNTIME_DEEP_RETRIEVAL_VERSION,
+      status: "ok",
+      request_fingerprint: requestFingerprint,
+      cached: false,
+      retrieval: retrieved.result
+    };
+    const encoded = JSON.stringify(payload);
+    const resultDigest = "sha256:" + createHash("sha256").update(encoded).digest("hex");
+    run.messages.push({ role: "tool", tool_call_id: call.id, content: encoded });
+
+    state.actual_reads += 1;
+    if (retrieved.diagnostics.source_read) state.source_reads += 1;
+    state.requests.push({
+      request_fingerprint: requestFingerprint,
+      tool_call_id: call.id,
+      depth,
+      query_fingerprint: retrieved.diagnostics.query_fingerprint,
+      result_digest: resultDigest,
+      source_read: retrieved.diagnostics.source_read === true,
+      gateway_source_range_reads: retrieved.diagnostics.gateway_source_range_reads,
+      result_bytes: retrieved.diagnostics.result_bytes,
+      created_at: nowIso()
+    });
+    if (state.requests.length > MAX_RUNTIME_DEEP_READS) state.requests = state.requests.slice(-MAX_RUNTIME_DEEP_READS);
+    run.context_deep_retrieval = state;
+
+    await this.store.event(run.run_id, "context.deep_retrieval.completed", {
+      tool_call_id: call.id,
+      request_fingerprint: requestFingerprint,
+      depth,
+      query_fingerprint: retrieved.diagnostics.query_fingerprint,
+      limit: retrieved.diagnostics.limit,
+      max_bytes: retrieved.diagnostics.max_bytes,
+      source_read: retrieved.diagnostics.source_read,
+      gateway_source_range_reads: retrieved.diagnostics.gateway_source_range_reads,
+      result_bytes: retrieved.diagnostics.result_bytes,
+      result_status: retrieved.diagnostics.result_status,
+      result_digest: resultDigest
+    });
+    if (retrieved.diagnostics.source_read) {
+      await this.store.event(run.run_id, "context.deep_retrieval.source_read", {
+        tool_call_id: call.id,
+        request_fingerprint: requestFingerprint,
+        query_fingerprint: retrieved.diagnostics.query_fingerprint,
+        gateway_source_range_reads: retrieved.diagnostics.gateway_source_range_reads,
+        result_status: retrieved.diagnostics.result_status,
+        result_digest: resultDigest
+      });
+    }
+    await this.store.saveRun(run);
+    return payload;
+  }
+
   async applyWorkspaceOrganization(run, scope, result) {
     const organized = result?.result?.workspace_organization;
     if (!organized || !["created", "evolved", "existing"].includes(organized.state)) return;
@@ -1721,6 +1898,34 @@ function prepareOrganizationReviewParameters(run, operation, parameters, scope) 
   }
   throw new GatewayError("TOOL_NOT_ADMITTED", `Operation ${operation} is not admitted for organization review`, 403);
 }
+function normalizeRuntimeEvidenceRef(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new GatewayError("CONTEXT_RETRIEVAL_EVIDENCE_REQUIRED", "source retrieval evidence_ref must be an object", 400);
+  }
+  const evidence = value.evidence;
+  if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) {
+    throw new GatewayError("CONTEXT_RETRIEVAL_EVIDENCE_REQUIRED", "source retrieval evidence_ref requires an evidence object", 400);
+  }
+  return {
+    record_type: String(value.record_type ?? ""),
+    id: String(value.id ?? ""),
+    scope: String(value.scope ?? ""),
+    evidence: JSON.parse(JSON.stringify(evidence))
+  };
+}
+
+function normalizeDeepRetrievalState(value) {
+  const current = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  return {
+    schema_version: "1.0",
+    api_version: RUNTIME_DEEP_RETRIEVAL_VERSION,
+    actual_reads: Number.isInteger(current.actual_reads) ? current.actual_reads : 0,
+    source_reads: Number.isInteger(current.source_reads) ? current.source_reads : 0,
+    cache_hits: Number.isInteger(current.cache_hits) ? current.cache_hits : 0,
+    requests: Array.isArray(current.requests) ? current.requests.filter((item) => item && typeof item === "object") : []
+  };
+}
+
 function completedSessionDigest(run, content) {
   const userMessages = (run.messages ?? []).filter((m) =>
     m?.role === "user" &&
