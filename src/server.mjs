@@ -358,6 +358,25 @@ async function advancedRunDiagnostics(store, run) {
       bytes_by_depth: run.context_retrieval.bytes_by_depth ?? {},
       item_counts: run.context_retrieval.item_counts ?? {}
     } : null,
+    deep_retrieval: run.context_deep_retrieval ? {
+      api_version: run.context_deep_retrieval.api_version ?? null,
+      actual_reads: Number(run.context_deep_retrieval.actual_reads ?? 0),
+      source_reads: Number(run.context_deep_retrieval.source_reads ?? 0),
+      cache_hits: Number(run.context_deep_retrieval.cache_hits ?? 0),
+      requests: Array.isArray(run.context_deep_retrieval.requests)
+        ? run.context_deep_retrieval.requests.map((item) => ({
+            request_fingerprint: item.request_fingerprint ?? null,
+            tool_call_id: item.tool_call_id ?? null,
+            depth: item.depth ?? null,
+            query_fingerprint: item.query_fingerprint ?? null,
+            result_digest: item.result_digest ?? null,
+            source_read: item.source_read === true,
+            gateway_source_range_reads: Number(item.gateway_source_range_reads ?? 0),
+            result_bytes: Number(item.result_bytes ?? 0),
+            created_at: item.created_at ?? null
+          }))
+        : []
+    } : null,
     archive: {
       cards_used: Array.isArray(archive.cards_used) ? archive.cards_used : [],
       source_refs: Array.isArray(archive.source_refs) ? archive.source_refs : [],
