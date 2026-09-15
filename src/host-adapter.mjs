@@ -16,6 +16,7 @@ export class HostClient {
   describe(signal) { return this.call("describe", {}, signal); }
   readContext(scope, signal) { return this.call("read_context", { scope }, signal); }
   retrieveHistory(query, scope, signal) { return this.call("retrieve_history", { query, scope }, signal); }
+  retrieveHistoryProgressive(payload, signal) { return this.call("retrieve_history_progressive", payload, signal); }
   listCapabilities(scope, signal) { return this.call("list_capabilities", { scope }, signal); }
   listConnections(scope, signal) { return this.call("list_connections", { scope }, signal); }
   authorizeAction(request, signal) { return this.call("authorize_action", { request }, signal); }

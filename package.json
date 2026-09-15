@@ -19,9 +19,9 @@
     "component.json"
   ],
   "scripts": {
-    "test": "node --test --test-concurrency=1 --test-reporter=spec test/clean-install.test.mjs test/loop-contracts.test.mjs test/security-and-recovery.test.mjs test/fold-storage.test.mjs test/fold-engine.test.mjs test/fold-archive.test.mjs test/context-governor.test.mjs test/fold-guards-diagnostics.test.mjs test/f1-branch-catalog-evaluation.test.mjs",
+    "test": "node --test --test-concurrency=1 --test-reporter=spec test/clean-install.test.mjs test/loop-contracts.test.mjs test/security-and-recovery.test.mjs test/fold-storage.test.mjs test/fold-engine.test.mjs test/fold-archive.test.mjs test/context-governor.test.mjs test/fold-guards-diagnostics.test.mjs test/f1-branch-catalog-evaluation.test.mjs test/progressive-context.test.mjs",
     "test:acceptance": "node --test test/clean-install.test.mjs",
-    "check": "node --check bin/aiverse-gateway.mjs && node --check src/server.mjs && node --check src/run-engine.mjs && node --check src/fold-store.mjs && node --check src/fold-engine.mjs && node --check src/fold-archive.mjs && node --check src/context-governor.mjs && npm test"
+    "check": "node --check bin/aiverse-gateway.mjs && node --check src/server.mjs && node --check src/run-engine.mjs && node --check src/fold-store.mjs && node --check src/fold-engine.mjs && node --check src/fold-archive.mjs && node --check src/context-governor.mjs && node --check src/progressive-context.mjs && npm test"
   },
   "license": "MIT",
   "keywords": [

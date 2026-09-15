@@ -4,6 +4,7 @@ import { RuntimeRegistry } from "./runtime.mjs";
 import { HostClient } from "./host-adapter.mjs";
 import { GoalOwnerClient } from "./goal-owner.mjs";
 import { governInvocationContext } from "./context-governor.mjs";
+import { assembleProgressiveOwnerContext, PROGRESSIVE_CONTEXT_VERSION } from "./progressive-context.mjs";
 import { nowIso, stableStringify } from "./util.mjs";
 
 const USER_INTERACTION_POLICY = `User interaction law:
@@ -189,10 +190,42 @@ export class RunEngine {
       const scope = run.workspace_id === "operator" ? "operator" : `workspace:${run.workspace_id}`;
       if (run.goal_binding?.goal_id && !Number.isInteger(run.goal_binding.version)) run.goal_binding = await this.initialGoalBinding(run.goal_binding.goal_id, scope, signal);
       const context = await this.assembleContext(run, scope, signal);
+      const retrievalDiagnostics = context.diagnostics ?? {
+        schema_version: "1.0",
+        api_version: PROGRESSIVE_CONTEXT_VERSION,
+        query_fingerprint: null,
+        requested_depth: null,
+        realized_depths: [],
+        progressive_available: false,
+        intent_class: "unavailable",
+        exact_sensitive: false,
+        source_reads: 0,
+        gateway_source_range_reads: 0,
+        legacy_reads: 0,
+        fallback_reason: "context_diagnostics_unavailable",
+        bytes_by_depth: {},
+        item_counts: {}
+      };
+      run.context_retrieval = {
+        ...retrievalDiagnostics,
+        evaluated_at: nowIso()
+      };
       if (context.system_message && !run.messages.some((m) => m.role === "system" && m._gateway_context === true)) {
         run.messages.unshift({ role: "system", content: context.system_message, _gateway_context: true });
       }
       await this.store.saveRun(run);
+      await this.store.event(runId, "context.retrieval.assembled", {
+        requested_depth: retrievalDiagnostics.requested_depth,
+        realized_depths: retrievalDiagnostics.realized_depths,
+        progressive_available: retrievalDiagnostics.progressive_available,
+        exact_sensitive: retrievalDiagnostics.exact_sensitive,
+        source_reads: retrievalDiagnostics.source_reads,
+        gateway_source_range_reads: retrievalDiagnostics.gateway_source_range_reads,
+        legacy_reads: retrievalDiagnostics.legacy_reads,
+        fallback_reason: retrievalDiagnostics.fallback_reason,
+        bytes_by_depth: retrievalDiagnostics.bytes_by_depth,
+        item_counts: retrievalDiagnostics.item_counts
+      });
 
       while (true) {
         run = await this.store.getRun(runId);
@@ -349,15 +382,18 @@ export class RunEngine {
     }
   }
   async assembleContext(run, scope, signal) {
-    const [description, current, history, capabilities, connections] = await Promise.all([
-      this.host.describe(signal),
-      this.host.readContext(scope, signal),
-      this.host.retrieveHistory(lastUserText(run.messages), scope, signal),
-      this.host.listCapabilities(scope, signal),
-      this.host.listConnections(scope, signal)
-    ]);
-    const safe = { host: { adapter_id: description?.adapter_id, metadata: description?.metadata }, current_context: current, recalled_history: history, capabilities, connections };
-    return { system_message: `You are running through AI-Verse Gateway. Canonical owner context follows. Treat it as bounded context, not permission. Use aiverse_action for side effects.\n\n${USER_INTERACTION_POLICY}\n\nCanonical owner context:\n${JSON.stringify(safe)}` };
+    const assembled = await assembleProgressiveOwnerContext({
+      host: this.host,
+      store: this.store,
+      run,
+      scope,
+      query: lastUserText(run.messages),
+      signal
+    });
+    return {
+      system_message: `You are running through AI-Verse Gateway. Canonical owner context follows. Treat it as bounded context, not permission. Use aiverse_action for side effects. Recent raw conversation is supplied separately as canonical runtime messages; owner history below follows the progressive context ladder and may be only a navigation layer unless exact evidence is present.\n\n${USER_INTERACTION_POLICY}\n\nCanonical owner context:\n${JSON.stringify(assembled.safe)}`,
+      diagnostics: assembled.diagnostics
+    };
   }
   async handleToolCalls(run, toolCalls, scope, signal) {
     for (const call of toolCalls) {
