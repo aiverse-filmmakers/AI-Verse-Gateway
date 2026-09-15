@@ -267,8 +267,11 @@ test("RunEngine sends compacted derived context to runtime while persisted run.m
   assert.equal(saved.usage.input_tokens, 21);
   assert.equal(saved.usage.output_tokens, 5);
 
-  assert.equal(invocations.length, 2, "one compaction call plus one normal runtime invocation expected");
-  const runtimeCall = invocations[1];
+  const compactionCalls = invocations.filter((item) => String(item.run_id).includes(":context-fold:"));
+  const runtimeCalls = invocations.filter((item) => item.run_id === run.run_id);
+  assert.equal(compactionCalls.length, 1, "one E4 compaction call expected");
+  assert.equal(runtimeCalls.length, 1, "one foreground runtime invocation expected");
+  const runtimeCall = runtimeCalls[0];
   assert.deepEqual(runtimeCall.messages.slice(-2), canonical.slice(-2));
   assert.ok(runtimeCall.messages.length < canonical.length);
   assert.ok(runtimeCall.messages.some((item) => item.role === "system" && item.content.includes("AI-Verse compacted earlier conversation context")));
