@@ -34,10 +34,30 @@ export async function setupComponent(opts = {}) {
   if (goalOwnerConfig) { if (!(await existsFile(goalOwnerConfig))) throw new GatewayError("GOAL_OWNER_CONFIG_MISSING", "Goal owner config does not exist"); await copyFile(goalOwnerConfig, p.goalOwner); }
   const token = opts.token || randomToken();
   const runtime = runtimeConfig(opts);
-  const config = defaultConfig({ system_root: systemRoot, system_id: opts.system_id || "local", workspace: opts.workspace || "operator", listen_host: opts.listen_host, port: opts.port ? Number(opts.port) : undefined, allow_remote: opts.allow_remote, behind_tls_proxy: opts.behind_tls_proxy, allowed_origins: opts.allowed_origins, auth_keys: [hashToken(token, opts.principal || "operator")], host_adapter_config: p.host, goal_owner_config: goalOwnerConfig ? p.goalOwner : null, runtime });
+  const config = defaultConfig({
+    system_root: systemRoot,
+    system_id: opts.system_id || "local",
+    workspace: opts.workspace || "operator",
+    listen_host: opts.listen_host,
+    port: opts.port ? Number(opts.port) : undefined,
+    allow_remote: opts.allow_remote,
+    behind_tls_proxy: opts.behind_tls_proxy,
+    allowed_origins: opts.allowed_origins,
+    auth_keys: [hashToken(token, opts.principal || "operator")],
+    host_adapter_config: p.host,
+    goal_owner_config: goalOwnerConfig ? p.goalOwner : null,
+    runtime,
+    context_window_tokens: opts.context_window_tokens == null ? null : Number(opts.context_window_tokens),
+    context_soft_pressure_ratio: opts.context_soft_pressure_ratio == null ? undefined : Number(opts.context_soft_pressure_ratio),
+    context_hard_pressure_ratio: opts.context_hard_pressure_ratio == null ? undefined : Number(opts.context_hard_pressure_ratio),
+    context_recent_raw_tail_messages: opts.context_recent_raw_tail_messages == null ? undefined : Number(opts.context_recent_raw_tail_messages),
+    context_chars_per_token_estimate: opts.context_chars_per_token_estimate == null ? undefined : Number(opts.context_chars_per_token_estimate),
+    context_summary_wrapper_token_reserve: opts.context_summary_wrapper_token_reserve == null ? undefined : Number(opts.context_summary_wrapper_token_reserve),
+    context_cache_sensitive_skip: opts.context_cache_sensitive_skip == null ? true : String(opts.context_cache_sensitive_skip).toLowerCase() !== "false"
+  });
   await atomicJson(p.config, config);
   const host = new HostClient(p.host); const described = await host.describe();
-  return { ok: true, command: "setup", state: "ready", home, system_id: config.system.id, workspace: config.system.default_workspace, host: { adapter_id: described?.adapter_id, protocol_version: described?.protocol_version, canonical_state_owned: described?.metadata?.canonical_state_owned }, runtime: runtime.kind, api_token: token, api_token_note: "Shown once. Only a scrypt hash is stored.", goal_owner: goalOwnerConfig ? "configured" : "not-configured-current-brain-goal-api-unavailable", authority_transfer: "none", external_credentials_stored: false };
+  return { ok: true, command: "setup", state: "ready", home, system_id: config.system.id, workspace: config.system.default_workspace, host: { adapter_id: described?.adapter_id, protocol_version: described?.protocol_version, canonical_state_owned: described?.metadata?.canonical_state_owned }, runtime: runtime.kind, context_governor: { configured: Number.isInteger(config.context?.window_tokens), window_tokens: config.context?.window_tokens ?? null }, api_token: token, api_token_note: "Shown once. Only a scrypt hash is stored.", goal_owner: goalOwnerConfig ? "configured" : "not-configured-current-brain-goal-api-unavailable", authority_transfer: "none", external_credentials_stored: false };
 }
 
 function runtimeConfig(opts) {
