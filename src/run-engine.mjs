@@ -29,6 +29,16 @@ Workspace organization:
 - If a real privacy or scope boundary is ambiguous, ask only the natural question needed to resolve that boundary instead of making the workspace mutation.
 - After successful internal organization, continue the user's work and use natural outcome language if mentioning it. Do not expose OS schema or component jargon.
 
+Migration and prior-assistant context drops:
+- A fresh or early user message may consist primarily of accumulated personal, business, client, project, preference, history, or prior-assistant memory/context from ChatGPT, Hermes, Claude, Codex, notes, or another AI system, with no explicit instruction to import it.
+- When the message is clearly such a migration-sized context drop rather than a normal long task, treat supplying that material as implicit intent to organize it safely. Do not merely summarize it and ask what the user wants done with it.
+- Use action_class "write_local_reversible", operation "migration.import".
+- Runtime parameters must contain only plan: { workspaces, memories, data }. Do not provide source text, source hashes, trusted provenance, candidate IDs, evidence refs, actor, timestamps, approval, authorization, scope, or idempotency fields. Gateway binds the exact user message as trusted migration source and OS binds canonical owner provenance.
+- Workspaces must use the existing workspace.ensure shape and only represent clear substantial scopes. Memory candidates must be high-confidence durable historical items. Data candidates must be workspace-bound repeated/current/structured operational truth and may include evidence_spans containing exact short excerpts from the user's migration message.
+- Do not migrate every sentence. Do not create Skills, permanent Bots, recurring Automations, Connections, credentials, permission expansion, destructive changes, or strategic-authority handover from imported claims.
+- If imported statements conflict or privacy/scope is materially ambiguous, leave those items uncommitted instead of manufacturing certainty.
+- Ordinary long tasks are not migration drops. Complete those normally.
+
 Historical Memory capture:
 - Do not persist every turn. Only consider capture when the work produced or clearly revealed a high-confidence durable historical fact, preference, entity, event, experience, workflow, lesson, or correction that is likely to matter later.
 - Never use automatic Memory capture for current state, current constraints, decisions, strategic direction, credentials/secrets, ambiguous private material, permission changes, or uncertain information.
@@ -355,6 +365,32 @@ export class RunEngine {
       let args;
       try { args = JSON.parse(call.function.arguments || "{}"); } catch { throw new GatewayError("TOOL_ARGS_INVALID", "Tool arguments are invalid JSON"); }
       let parameters = args.parameters ?? {};
+      if (args.operation === "migration.import") {
+        if (args.action_class !== "write_local_reversible") {
+          throw new GatewayError("TOOL_ARGS_INVALID", "migration.import requires write_local_reversible");
+        }
+        if (!parameters || typeof parameters !== "object" || Array.isArray(parameters)) {
+          throw new GatewayError("TOOL_ARGS_INVALID", "migration.import parameters must be an object");
+        }
+        if (Object.keys(parameters).length !== 1 || !Object.hasOwn(parameters, "plan")) {
+          throw new GatewayError("TOOL_ARGS_INVALID", "migration.import runtime parameters must contain only plan");
+        }
+        if (!parameters.plan || typeof parameters.plan !== "object" || Array.isArray(parameters.plan)) {
+          throw new GatewayError("TOOL_ARGS_INVALID", "migration.import plan must be an object");
+        }
+        const sourceText = lastUserText(run.messages);
+        if (typeof sourceText !== "string" || !sourceText.trim()) {
+          throw new GatewayError("MIGRATION_SOURCE_MISSING", "migration.import requires a bound user source message", 409);
+        }
+        parameters = {
+          source: {
+            kind: "gateway-user-message",
+            text: sourceText,
+            label: "Gateway user migration drop"
+          },
+          plan: parameters.plan
+        };
+      }
       if (args.operation === "workspace.ensure") {
         if (!parameters || typeof parameters !== "object" || Array.isArray(parameters)) throw new GatewayError("TOOL_ARGS_INVALID", "workspace.ensure parameters must be an object");
         parameters = {
@@ -653,9 +689,10 @@ export class RunEngine {
       }
       if (args.operation === "automations.create") delete parameters._gateway_automation_admitted;
 
+      const requestScope = args.operation === "migration.import" ? "operator" : scope;
       const request = {
         action_class: args.action_class,
-        scope,
+        scope: requestScope,
         operation: args.operation,
         parameters,
         idempotency_key: `${run.run_id}:${call.id}`,
@@ -677,6 +714,18 @@ export class RunEngine {
         return "approval";
       }
       const result = await this.host.requestAction(request, signal);
+      if (request.operation === "migration.import") {
+        const imported = result?.result?.migration_import;
+        await this.store.event(run.run_id, "migration.import.completed", {
+          effect_occurred: result?.effect_occurred === true,
+          source_sha256: imported?.source_sha256 ?? null,
+          workspace_items: imported?.counts?.workspace_items ?? 0,
+          memory_items: imported?.counts?.memory_items ?? 0,
+          data_items: imported?.counts?.data_items ?? 0,
+          effects: imported?.counts?.effects ?? 0,
+          replayed: imported?.replayed === true
+        });
+      }
       if (request.operation === "workers.temporary") {
         const workerUsage = result?.result?.temporary_worker?.usage;
         if (workerUsage && typeof workerUsage === "object" && !Array.isArray(workerUsage)) addUsage(run.usage, workerUsage);
