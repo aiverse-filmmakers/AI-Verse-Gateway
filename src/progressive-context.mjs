@@ -368,9 +368,13 @@ async function resolveGatewayExternalSource({
     return externalFailure("gateway_store_unavailable");
   }
   const evidence = sourceResponse?.evidence;
-  const refs = Array.isArray(evidence?.external_source_refs) && evidence.external_source_refs.length
+  const coverageRefs = Array.isArray(evidence?.source_coverage)
+    ? evidence.source_coverage
+    : [];
+  const externalRefs = Array.isArray(evidence?.external_source_refs)
     ? evidence.external_source_refs
-    : Array.isArray(evidence?.source_coverage) ? evidence.source_coverage : [];
+    : [];
+  const refs = coverageRefs.length > 0 ? coverageRefs : externalRefs;
   if (refs.length === 0) return externalFailure("external_source_refs_missing");
 
   const parsed = refs.slice(0, 8).map(parseGatewaySourceRef);
