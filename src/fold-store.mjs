@@ -45,6 +45,7 @@ export async function createFoldCard(store, input = {}) {
       resolved.push(item);
     }
     sourceRefs = resolved.map((item) => item.ref);
+    await assertSourceOrder(store, sourceRefs);
     coveredBytes = resolved.reduce((sum, item) => sum + item.bytes, 0);
     const messageCount = resolved.reduce((sum, item) => sum + item.ref.message_count, 0);
     coverage = {
@@ -75,6 +76,7 @@ export async function createFoldCard(store, input = {}) {
       if (!self.valid) throw new GatewayError("INVALID_FOLD_CHILD", `Child fold card ${cardId} failed self-validation`, 409);
       children.push(child);
     }
+    await assertChildOrder(store, children);
     childRefs = children.map((child) => ({ card_id: child.card_id, fingerprint: child.fingerprint }));
     coveredBytes = children.reduce((sum, child) => sum + Number(child.size_estimate?.covered_bytes ?? 0), 0);
     coverage = {
@@ -138,6 +140,10 @@ export async function createFoldCard(store, input = {}) {
     fingerprint,
     created_at: nowIso()
   };
+  const prePersistValidation = selfValidateCard(card);
+  if (!prePersistValidation.valid) {
+    throw new GatewayError("FOLD_CARD_BUILD_INVALID", `Constructed fold card failed validation: ${prePersistValidation.errors.join("; ")}`, 409);
+  }
   await atomicJson(file, card);
   const persisted = await readJson(file);
   const persistedValidation = selfValidateCard(persisted);
@@ -263,6 +269,31 @@ async function validateRecursive(store, cardId, errors, visited) {
     }
   }
   visited.delete(cardId);
+}
+
+async function assertSourceOrder(store, refs) {
+  let prior = null;
+  for (const ref of refs) {
+    const run = await store.getRun(ref.run_id);
+    if (!run) throw new GatewayError("FOLD_SOURCE_NOT_FOUND", "Fold source run was not found", 404);
+    const current = runOrderKey(run, ref.start_index);
+    if (prior && compareOrderKey(prior, current) >= 0) {
+      throw new GatewayError("INVALID_FOLD_ORDER", "Fold source_refs must follow canonical chronological/message order", 409);
+    }
+    prior = runOrderKey(run, ref.end_index);
+  }
+}
+
+async function assertChildOrder(store, children) {
+  let prior = null;
+  for (const child of children) {
+    const boundary = await cardBoundaryOrder(store, child);
+    if (!boundary) throw new GatewayError("INVALID_FOLD_ORDER", "Fold child coverage boundary is invalid", 409);
+    if (prior && compareOrderKey(prior, boundary.first) >= 0) {
+      throw new GatewayError("INVALID_FOLD_ORDER", "Fold child_refs must follow canonical chronological order", 409);
+    }
+    prior = boundary.last;
+  }
 }
 
 async function cardBoundaryOrder(store, card) {
