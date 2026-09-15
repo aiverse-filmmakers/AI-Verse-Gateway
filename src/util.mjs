@@ -31,6 +31,30 @@ export async function readJson(file, fallback = undefined) {
   catch (error) { if (error?.code === "ENOENT" && fallback !== undefined) return fallback; throw error; }
 }
 export async function atomicJson(file, value) {
+  return await withSerializedFileWrite(file, async () => {
+    await writeJsonReplacement(file, value);
+    return value;
+  });
+}
+
+export async function mutateJson(file, updater, fallback = undefined) {
+  if (typeof updater !== "function") throw new TypeError("mutateJson updater must be a function");
+  return await withSerializedFileWrite(file, async () => {
+    let current;
+    try {
+      current = JSON.parse(await readFile(file, "utf8"));
+    } catch (error) {
+      if (error?.code === "ENOENT" && fallback !== undefined) current = fallback;
+      else throw error;
+    }
+    const next = await updater(current);
+    if (next === undefined) throw new TypeError("mutateJson updater must return a value");
+    await writeJsonReplacement(file, next);
+    return next;
+  });
+}
+
+async function withSerializedFileWrite(file, operation) {
   const key = path.resolve(file);
   const prior = fileWriteTails.get(key) ?? Promise.resolve();
   let release;
@@ -39,18 +63,22 @@ export async function atomicJson(file, value) {
   fileWriteTails.set(key, tail);
   await prior.catch(() => {});
   try {
-    await ensureDir(path.dirname(file));
-    const tmp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
-    try {
-      await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-      await renameWithTransientRetry(tmp, file);
-    } catch (error) {
-      await rm(tmp, { force: true }).catch(() => {});
-      throw error;
-    }
+    return await operation();
   } finally {
     release();
     if (fileWriteTails.get(key) === tail) fileWriteTails.delete(key);
+  }
+}
+
+async function writeJsonReplacement(file, value) {
+  await ensureDir(path.dirname(file));
+  const tmp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+  try {
+    await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    await renameWithTransientRetry(tmp, file);
+  } catch (error) {
+    await rm(tmp, { force: true }).catch(() => {});
+    throw error;
   }
 }
 
