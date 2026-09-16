@@ -7,6 +7,7 @@ export function gatewayHome(explicit) {
 export function paths(home) {
   return {
     home,
+    owner: path.join(home, "ownership.json"),
     install: path.join(home, "install.json"),
     config: path.join(home, "config.json"),
     host: path.join(home, "host.json"),
