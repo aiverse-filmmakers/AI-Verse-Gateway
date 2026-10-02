@@ -62,6 +62,8 @@ export async function startServer(config, home, options = {}) {
     engine,
     host,
     port: typeof address === "object" && address ? address.port : port,
+    // Graceful close is the durable restart boundary: no old execution or
+    // post-completion recovery may continue mutating Gateway state afterward.
     close: async () => {
       await new Promise((resolve, reject) => server.close((e) => e ? reject(e) : resolve()));
       await engine.drain();
