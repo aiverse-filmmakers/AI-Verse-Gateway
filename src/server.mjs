@@ -29,12 +29,11 @@ export async function startServer(config, home, options = {}) {
   await store.init();
   await store.recoverInterrupted();
   const engine = new RunEngine({ store, config });
-  // Completed runs are already canonical before optional Memory digest handoff.
-  // Retry any durable pending/retryable handoff without reopening the run.
-  void engine.recoverPendingSessionDigests();
-  // Invisible organization review is post-completion work. Resume durable pending
-  // proposals without reopening the foreground run or conversation.
-  void engine.recoverPendingOrganizationReviews();
+  // Completed runs are already canonical before optional post-completion work.
+  // Recovery stays background/non-blocking, but the two passes are serialized so
+  // independent durable extensions cannot race one another on the same run revision.
+  void engine.recoverPendingSessionDigests()
+    .then(() => engine.recoverPendingOrganizationReviews());
   const limiter = new RateLimiter(config.server.requests_per_minute);
   const ctx = {
     config,
