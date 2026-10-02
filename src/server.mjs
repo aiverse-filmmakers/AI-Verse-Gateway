@@ -5,10 +5,21 @@ import { GatewayStore } from "./store.mjs";
 import { RunEngine } from "./run-engine.mjs";
 import { id, nowIso, sleep, stableStringify } from "./util.mjs";
 import { VERSION } from "./constants.mjs";
+import { assertLifecycleReady, readLifecycleState } from "./lifecycle-state.mjs";
 
 export async function startServer(config, home, options = {}) {
-  if (config.enabled !== true) throw new GatewayError("GATEWAY_DISABLED", "Gateway is disabled", 503);
-  const store = new GatewayStore(home); await store.init(); await store.recoverInterrupted();
+  const initialLifecycle = await readLifecycleState(home);
+  const authoritativeConfig = assertLifecycleReady(initialLifecycle);
+  const requestedGeneration = config?.service_generation ?? null;
+  const authoritativeGeneration = authoritativeConfig.service_generation ?? null;
+  if (requestedGeneration !== authoritativeGeneration) {
+    throw new GatewayError("GATEWAY_RESTART_REQUIRED", "Gateway configuration changed before server start; reload configuration and restart", 503);
+  }
+
+  config = authoritativeConfig;
+  const store = new GatewayStore(home);
+  await store.init();
+  await store.recoverInterrupted();
   const engine = new RunEngine({ store, config });
   // Completed runs are already canonical before optional Memory digest handoff.
   // Retry any durable pending/retryable handoff without reopening the run.
@@ -17,25 +28,71 @@ export async function startServer(config, home, options = {}) {
   // proposals without reopening the foreground run or conversation.
   void engine.recoverPendingOrganizationReviews();
   const limiter = new RateLimiter(config.server.requests_per_minute);
-  const server = createServer((req, res) => void handle(req, res, { config, store, engine, limiter }));
+  const ctx = {
+    config,
+    home,
+    serviceGeneration: authoritativeGeneration,
+    store,
+    engine,
+    limiter
+  };
+  const server = createServer((req, res) => void handle(req, res, ctx));
   const host = options.host ?? config.server.host;
   const port = options.port ?? config.server.port;
   const loopback = host === "127.0.0.1" || host === "localhost" || host === "::1";
-  if (!loopback && (!config.server.allow_remote || !config.server.behind_tls_proxy)) throw new GatewayError("REMOTE_BIND_UNSAFE", "Non-loopback serving requires configured remote access behind a trusted TLS proxy", 403);
-  await new Promise((resolve, reject) => { server.once("error", reject); server.listen(port, host, resolve); });
+  if (!loopback && (!config.server.allow_remote || !config.server.behind_tls_proxy)) {
+    throw new GatewayError("REMOTE_BIND_UNSAFE", "Non-loopback serving requires configured remote access behind a trusted TLS proxy", 403);
+  }
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, host, resolve);
+  });
   const address = server.address();
-  return { server, store, engine, host, port: typeof address === "object" && address ? address.port : port, close: () => new Promise((resolve, reject) => server.close((e) => e ? reject(e) : resolve())) };
+  return {
+    server,
+    store,
+    engine,
+    host,
+    port: typeof address === "object" && address ? address.port : port,
+    close: () => new Promise((resolve, reject) => server.close((e) => e ? reject(e) : resolve()))
+  };
 }
 
 async function handle(req, res, ctx) {
   try {
     const url = new URL(req.url ?? "/", `http://${req.headers.host || "127.0.0.1"}`);
-    if (req.method === "GET" && url.pathname === "/health") return json(res, 200, { ok: true, component: "ai-verse-gateway", version: VERSION });
+    const lifecycle = await readLifecycleState(ctx.home, {
+      expected_service_generation: ctx.serviceGeneration
+    });
+
+    if (req.method === "GET" && url.pathname === "/health") {
+      const ready = lifecycle.state === "ready";
+      return json(res, ready ? 200 : 503, {
+        ok: ready,
+        component: "ai-verse-gateway",
+        version: VERSION,
+        state: lifecycle.state
+      });
+    }
+
     const origin = checkOrigin(req, ctx.config);
-    if (req.method === "OPTIONS") return preflight(res, origin);
+    if (req.method === "OPTIONS") {
+      assertLifecycleReady(lifecycle);
+      return preflight(res, origin);
+    }
+
     const identity = bearer(req, ctx.config.auth.keys);
     ctx.limiter.take(identity.principal);
-    if (req.method === "GET" && url.pathname === "/status") return json(res, 200, publicStatus(ctx.config));
+
+    if (req.method === "GET" && url.pathname === "/status") {
+      return json(res, 200, publicStatus(ctx.config, lifecycle));
+    }
+
+    // The on-disk lifecycle state is the live operational authority. A process
+    // may remain bound for diagnostics after disable/uninstall, but it may not
+    // continue serving models, runs, chat, automation or control traffic.
+    assertLifecycleReady(lifecycle);
+
     if (req.method === "GET" && url.pathname === "/v1/models") return json(res, 200, { object: "list", data: [{ id: "aiverse", object: "model", created: 0, owned_by: "ai-verse", gateway_runtime: ctx.config.runtime.kind }] });
     if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
       const body = await readJsonBody(req, ctx.config.server.max_body_bytes);
@@ -295,7 +352,7 @@ function checkOrigin(req, config) { const origin=req.headers.origin; if (!origin
 function corsHeaders(origin, extra={}) { return { ...(origin ? { "access-control-allow-origin": origin, vary: "Origin" } : {}), ...extra }; }
 function preflight(res, origin) { res.writeHead(204, corsHeaders(origin, { "access-control-allow-methods": "GET,POST,OPTIONS", "access-control-allow-headers": "authorization,content-type,idempotency-key,x-aiverse-session-id,x-aiverse-workspace", "access-control-max-age": "600" })); res.end(); }
 function json(res, status, body) { if (res.writableEnded) return; res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify(body)); }
-function publicStatus(config) { return { component: "ai-verse-gateway", version: VERSION, state: config.enabled ? "ready" : "disabled", system_id: config.system.id, runtime: config.runtime.kind, binding: config.server.host, remote: config.server.allow_remote === true, goal_owner_configured: Boolean(config.goal_owner_config), at: nowIso() }; }
+function publicStatus(config, lifecycle) { return { component: "ai-verse-gateway", version: VERSION, state: lifecycle?.state ?? "unhealthy", system_id: config.system.id, runtime: config.runtime.kind, binding: config.server.host, remote: config.server.allow_remote === true, goal_owner_configured: Boolean(config.goal_owner_config), at: nowIso() }; }
 function sanitizeRun(run) { if (!run) return run; const { messages, ...publicRun } = run; return publicRun; }
 
 async function advancedRunDiagnostics(store, run) {
