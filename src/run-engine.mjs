@@ -809,7 +809,7 @@ export class RunEngine {
         await this.store.event(run.run_id, "approval.required", { tool_call_id: call.id, operation: request.operation, action_class: request.action_class });
         return "approval";
       }
-      run = await this.assertExecutionAuthority(run, signal);
+      run = await this.assertExecutionAuthority(run, signal, ["queued", "running", "resuming"]);
       const result = await this.host.requestAction(request, signal);
       if (request.operation === "migration.import") {
         const imported = result?.result?.migration_import;
