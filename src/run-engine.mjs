@@ -10,6 +10,7 @@ import {
   retrieveRuntimeDeepContext,
   RUNTIME_DEEP_RETRIEVAL_VERSION
 } from "./progressive-context.mjs";
+import { RUN_TERMINAL } from "./constants.mjs";
 import { nowIso, stableStringify } from "./util.mjs";
 
 const USER_INTERACTION_POLICY = `User interaction law:
@@ -201,6 +202,25 @@ export class RunEngine {
     this.runtime = new RuntimeRegistry(config.runtime);
     this.controllers = new Map();
     this.sessionActive = new Map();
+    this.activeExecutions = new Set();
+  }
+  async assertExecutionAuthority(run, signal = null, allowedStatuses = ["running", "resuming"]) {
+    if (signal?.aborted) throw signal.reason ?? new GatewayError("RUN_CANCELED", "Run canceled", 409);
+    const current = await this.store.getRun(run.run_id);
+    if (!current) throw new GatewayError("RUN_NOT_FOUND", "Run not found", 404);
+    const expectedRevision = Number.isInteger(run.revision) ? run.revision : 0;
+    const currentRevision = Number.isInteger(current.revision) ? current.revision : 0;
+    if (currentRevision !== expectedRevision || !allowedStatuses.includes(current.status)) {
+      if (current.status === "canceled" || current.status === "paused") {
+        throw new GatewayError("RUN_CANCELED", `Run is ${current.status}; stale execution authority was revoked`, 409);
+      }
+      throw new GatewayError(
+        "RUN_REVISION_CONFLICT",
+        `Run changed while execution was in progress (expected revision ${expectedRevision}, current ${currentRevision}, status ${current.status})`,
+        409
+      );
+    }
+    return current;
   }
   async start(runId) {
     const run = await this.store.getRun(runId);
@@ -210,10 +230,18 @@ export class RunEngine {
     const controller = new AbortController();
     this.controllers.set(runId, controller);
     this.sessionActive.set(run.session_id, runId);
-    void this.execute(runId, controller.signal).finally(() => {
+    const execution = this.execute(runId, controller.signal);
+    this.activeExecutions.add(execution);
+    void execution.finally(() => {
       this.controllers.delete(runId);
       if (this.sessionActive.get(run.session_id) === runId) this.sessionActive.delete(run.session_id);
-    });
+      this.activeExecutions.delete(execution);
+    }).catch(() => {});
+  }
+  async drain() {
+    while (this.activeExecutions.size) {
+      await Promise.allSettled([...this.activeExecutions]);
+    }
   }
   async execute(runId, signal) {
     let run = await this.store.getRun(runId);
@@ -328,6 +356,7 @@ export class RunEngine {
         });
 
         const result = await this.runtime.invoke({ run_id: runId, model: run.runtime?.model, messages: governed.messages, tools: [ACTION_TOOL, CONTEXT_TOOL] }, signal);
+        run = await this.assertExecutionAuthority(run, signal);
         addUsage(run.usage, result.usage);
         this.assertBudgetAfterUsage(run);
         const presentation = presentAssistantOutcome(run, result.content ?? "");
@@ -340,7 +369,7 @@ export class RunEngine {
             technical_receipts_preserved: true
           });
         }
-        if (assistant.content) await this.emitText(runId, assistant.content);
+        if (assistant.content) await this.emitText(run, assistant.content, signal);
         await this.store.saveRun(run);
 
         if (assistant.tool_calls?.length) {
@@ -789,6 +818,7 @@ export class RunEngine {
         await this.store.event(run.run_id, "approval.required", { tool_call_id: call.id, operation: request.operation, action_class: request.action_class });
         return "approval";
       }
+      run = await this.assertExecutionAuthority(run, signal, ["queued", "running", "resuming"]);
       const result = await this.host.requestAction(request, signal);
       if (request.operation === "migration.import") {
         const imported = result?.result?.migration_import;
@@ -1029,6 +1059,7 @@ export class RunEngine {
     const authorization = await this.host.authorizeAction({ ...pending.request, approval: { principal, operation_id: operationId } });
     if (isDenied(authorization)) throw new GatewayError("ACTION_DENIED", "OS host denied action during approval recheck", 403);
     if (needsApproval(authorization)) throw new GatewayError("APPROVAL_NOT_ACCEPTED", "OS host still requires approval after the explicit grant; action was not executed", 409);
+    await this.assertExecutionAuthority(run, null, ["awaiting_approval"]);
     const result = await this.host.requestAction({ ...pending.request, approval: { principal, operation_id: operationId } });
     run.usage.actions += 1;
     run.messages.push({ role: "tool", tool_call_id: pending.tool_call_id, content: JSON.stringify(result) });
@@ -1036,16 +1067,66 @@ export class RunEngine {
     await this.store.saveRun(run); await this.store.event(runId, "approval.applied", { tool_call_id: pending.tool_call_id }); await this.store.commitIdempotency(idem.mapKey, { status: run.status });
     await this.start(runId); return run;
   }
-  async pause(runId, principal, reason = "operator_pause") { const run = await this.ownedRun(runId, principal); run.status = "paused"; run.checkpoint = { phase: "paused", reason, at: nowIso() }; await this.store.saveRun(run); await this.store.event(runId, "run.paused", { reason }); this.controllers.get(runId)?.abort(new GatewayError("RUN_CANCELED", reason, 409)); return run; }
-  async resume(runId, principal) { const run = await this.ownedRun(runId, principal); if (!["paused", "paused_recovery_required", "paused_no_progress", "parked"].includes(run.status)) throw new GatewayError("RUN_NOT_RESUMABLE", `Run status ${run.status} is not resumable`, 409); run.status = "resuming"; await this.store.saveRun(run); await this.store.event(runId, "run.resumed", {}); await this.start(runId); return run; }
-  async cancel(runId, reason = "operator_cancel", principal = null) { const run = await this.store.getRun(runId); if (!run) throw new GatewayError("RUN_NOT_FOUND", "Run not found", 404); if (principal && run.principal !== principal) throw new GatewayError("FORBIDDEN", "Principal does not own this run", 403); if (run.status === "canceled" || run.status === "completed") return run; run.status = "canceled"; run.error = { code: "RUN_CANCELED", message: reason }; run.completed_at = nowIso(); await this.store.saveRun(run); await this.store.event(runId, "run.canceled", { reason }); this.controllers.get(runId)?.abort(new GatewayError("RUN_CANCELED", reason, 409)); return run; }
+  async pause(runId, principal, reason = "operator_pause") {
+    let changed = false;
+    const run = await this.store.mutateRun(runId, (current) => {
+      if (current.principal !== principal) throw new GatewayError("FORBIDDEN", "Principal does not own this run", 403);
+      if (RUN_TERMINAL.has(current.status) || current.status === "paused") return current;
+      current.status = "paused";
+      current.checkpoint = { phase: "paused", reason, at: nowIso() };
+      changed = true;
+      return current;
+    });
+    if (changed) {
+      await this.store.event(runId, "run.paused", { reason });
+      this.controllers.get(runId)?.abort(new GatewayError("RUN_CANCELED", reason, 409));
+    }
+    return run;
+  }
+  async resume(runId, principal) {
+    const run = await this.store.mutateRun(runId, (current) => {
+      if (current.principal !== principal) throw new GatewayError("FORBIDDEN", "Principal does not own this run", 403);
+      if (!["paused", "paused_recovery_required", "paused_no_progress", "parked"].includes(current.status)) {
+        throw new GatewayError("RUN_NOT_RESUMABLE", `Run status ${current.status} is not resumable`, 409);
+      }
+      current.status = "resuming";
+      current.checkpoint = { phase: "resuming", at: nowIso() };
+      return current;
+    });
+    await this.store.event(runId, "run.resumed", {});
+    await this.start(runId);
+    return run;
+  }
+  async cancel(runId, reason = "operator_cancel", principal = null) {
+    let changed = false;
+    const run = await this.store.mutateRun(runId, (current) => {
+      if (principal && current.principal !== principal) throw new GatewayError("FORBIDDEN", "Principal does not own this run", 403);
+      if (current.status === "canceled" || current.status === "completed") return current;
+      current.status = "canceled";
+      current.error = { code: "RUN_CANCELED", message: reason };
+      current.completed_at = nowIso();
+      current.checkpoint = { phase: "canceled", reason, at: current.completed_at };
+      changed = true;
+      return current;
+    });
+    if (changed) {
+      await this.store.event(runId, "run.canceled", { reason });
+      this.controllers.get(runId)?.abort(new GatewayError("RUN_CANCELED", reason, 409));
+    }
+    return run;
+  }
   async ownedRun(runId, principal) { const run = await this.store.getRun(runId); if (!run) throw new GatewayError("RUN_NOT_FOUND", "Run not found", 404); if (run.principal !== principal) throw new GatewayError("FORBIDDEN", "Principal does not own this run", 403); return run; }
   async initialGoalBinding(goalId, scope, signal) { const owner = await this.goalOwner.get(goalId, scope, signal); const goal = owner?.goal ?? owner; if (!goal || goal.goal_id !== goalId || goal.status !== "active") throw new GatewayError("GOAL_NOT_ACTIVE", "Brain Goal is missing or not active", 409); return { goal_id: goalId, version: goal.version, activation_epoch: goal.activation_epoch ?? 1 }; }
   async revalidateGoal(run, scope, signal) { const prior = run.goal_binding; const current = await this.initialGoalBinding(prior.goal_id, scope, signal); if (current.goal_id !== prior.goal_id || current.version !== prior.version || current.activation_epoch !== prior.activation_epoch) throw new GatewayError("GOAL_LEASE_REVOKED", "Brain Goal binding changed; autonomous continuation lease is revoked", 409); }
   assertDeadline(run) { if (run.deadline_at && Date.now() >= Date.parse(run.deadline_at)) throw new GatewayError("DEADLINE_EXCEEDED", "Run deadline exceeded", 409); }
   assertBudgetBeforeTurn(run) { if (run.continuation.turn >= run.continuation.max_turns) throw new GatewayError("TURN_BUDGET_EXCEEDED", "Run turn budget exhausted", 409); }
   assertBudgetAfterUsage(run) { const b = run.budget ?? {}; const tokens = Number(run.usage.input_tokens ?? 0) + Number(run.usage.output_tokens ?? 0); if (Number.isFinite(b.max_tokens) && b.max_tokens !== null && tokens > b.max_tokens) throw new GatewayError("TOKEN_BUDGET_EXCEEDED", "Token budget exceeded", 409); if (Number.isFinite(b.max_cost) && b.max_cost !== null && run.usage.cost > b.max_cost) throw new GatewayError("COST_BUDGET_EXCEEDED", "Cost budget exceeded", 409); if (Number.isFinite(b.max_actions) && run.usage.actions > b.max_actions) throw new GatewayError("ACTION_BUDGET_EXCEEDED", "Action budget exceeded", 409); }
-  async emitText(runId, text) { for (let i = 0; i < text.length; i += 256) await this.store.event(runId, "assistant.delta", { text: text.slice(i, i + 256) }); }
+  async emitText(run, text, signal = null) {
+    for (let i = 0; i < text.length; i += 256) {
+      await this.assertExecutionAuthority(run, signal);
+      await this.store.event(run.run_id, "assistant.delta", { text: text.slice(i, i + 256) });
+    }
+  }
   async complete(run, content) {
     run.status = "completed";
     run.output = { content };

@@ -29,12 +29,12 @@ export async function startServer(config, home, options = {}) {
   await store.init();
   await store.recoverInterrupted();
   const engine = new RunEngine({ store, config });
-  // Completed runs are already canonical before optional Memory digest handoff.
-  // Retry any durable pending/retryable handoff without reopening the run.
-  void engine.recoverPendingSessionDigests();
-  // Invisible organization review is post-completion work. Resume durable pending
-  // proposals without reopening the foreground run or conversation.
-  void engine.recoverPendingOrganizationReviews();
+  // Completed runs are already canonical before optional post-completion work.
+  // Recovery stays background/non-blocking, but the two passes are serialized so
+  // independent durable extensions cannot race one another on the same run revision.
+  const recovery = engine.recoverPendingSessionDigests()
+    .then(() => engine.recoverPendingOrganizationReviews());
+  void recovery.catch(() => {});
   const limiter = new RateLimiter(config.server.requests_per_minute);
   const ctx = {
     config,
@@ -62,7 +62,13 @@ export async function startServer(config, home, options = {}) {
     engine,
     host,
     port: typeof address === "object" && address ? address.port : port,
-    close: () => new Promise((resolve, reject) => server.close((e) => e ? reject(e) : resolve()))
+    // Graceful close is the durable restart boundary: no old execution or
+    // post-completion recovery may continue mutating Gateway state afterward.
+    close: async () => {
+      await new Promise((resolve, reject) => server.close((e) => e ? reject(e) : resolve()));
+      await engine.drain();
+      await recovery;
+    }
   };
 }
 
