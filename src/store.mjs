@@ -33,15 +33,28 @@ export class GatewayStore {
   foldCardFile(cardId) { assertStorageId(cardId, "fold_card_id"); return path.join(this.p.foldCards, `${cardId}.json`); }
   async createSession({ system_id, workspace_id, principal, title = null, session_id = null }) {
     const sessionId = session_id ?? id("sess");
-    const existing = await readJson(this.sessionFile(sessionId), null);
-    if (existing) {
-      if (existing.system_id !== system_id || existing.workspace_id !== workspace_id || existing.principal !== principal) throw new GatewayError("SESSION_BINDING_MISMATCH", "Existing session binding does not match the authenticated request", 409);
-      return existing;
-    }
+    const file = this.sessionFile(sessionId);
     const now = nowIso();
-    const session = { schema_version: "1.0", session_id: sessionId, system_id, workspace_id, principal, title: title ?? sessionId, status: "active", created_at: now, updated_at: now, active_run_id: null };
-    await atomicJson(this.sessionFile(sessionId), session);
-    return session;
+    return await mutateJson(file, (current) => {
+      if (current) {
+        if (current.system_id !== system_id || current.workspace_id !== workspace_id || current.principal !== principal) {
+          throw new GatewayError("SESSION_BINDING_MISMATCH", "Existing session binding does not match the authenticated request", 409);
+        }
+        return current;
+      }
+      return {
+        schema_version: "1.0",
+        session_id: sessionId,
+        system_id,
+        workspace_id,
+        principal,
+        title: title ?? sessionId,
+        status: "active",
+        created_at: now,
+        updated_at: now,
+        active_run_id: null
+      };
+    }, null);
   }
   async getSession(sessionId) { return await readJson(this.sessionFile(sessionId), null); }
   async saveSession(session) { session.updated_at = nowIso(); await atomicJson(this.sessionFile(session.session_id), session); return session; }
@@ -72,7 +85,8 @@ export class GatewayStore {
       pending_approval: null,
       created_at: now,
       updated_at: now,
-      completed_at: null
+      completed_at: null,
+      revision: 0
     };
     await atomicJson(this.runFile(runId), run);
     await this.event(runId, "run.created", { status: run.status });
@@ -81,14 +95,24 @@ export class GatewayStore {
   async getRun(runId) { return await readJson(this.runFile(runId), null); }
   async saveRun(run) {
     const candidate = JSON.parse(JSON.stringify(run));
+    const expectedRevision = Number.isInteger(candidate.revision) ? candidate.revision : 0;
     candidate.updated_at = nowIso();
     const saved = await mutateJson(this.runFile(run.run_id), (current) => {
-      const next = { ...candidate };
+      if (!current) throw new GatewayError("RUN_NOT_FOUND", "Run not found", 404);
+      const currentRevision = Number.isInteger(current.revision) ? current.revision : 0;
+      if (currentRevision !== expectedRevision) {
+        throw new GatewayError(
+          "RUN_REVISION_CONFLICT",
+          `Run revision changed from ${expectedRevision} to ${currentRevision}; stale state was not persisted`,
+          409
+        );
+      }
+      const next = { ...candidate, revision: currentRevision + 1 };
       if (newerExtension(current?.archive_diagnostics, next.archive_diagnostics)) {
         next.archive_diagnostics = current.archive_diagnostics;
       }
       return next;
-    }, candidate);
+    });
     Object.assign(run, saved);
     this.bus.emit(`run:${run.run_id}`, { kind: "state", run: saved });
     return run;
@@ -98,9 +122,12 @@ export class GatewayStore {
     if (typeof updater !== "function") throw new GatewayError("RUN_MUTATION_INVALID", "Run mutation updater is required", 500);
     const saved = await mutateJson(this.runFile(runId), async (current) => {
       if (!current) throw new GatewayError("RUN_NOT_FOUND", "Run not found", 404);
+      const currentRevision = Number.isInteger(current.revision) ? current.revision : 0;
       const draft = JSON.parse(JSON.stringify(current));
+      draft.revision = currentRevision;
       const updated = await updater(draft);
       const next = updated ?? draft;
+      next.revision = currentRevision + 1;
       next.updated_at = nowIso();
       return next;
     });
@@ -129,22 +156,38 @@ export class GatewayStore {
   async resolveFoldCardSources(cardId) { return await resolveFoldCardSources(this, cardId); }
   async claimIdempotency(namespace, key, payload, result = undefined) {
     if (!key) return { state: "new" };
-    const db = await readJson(this.p.idempotency, { schema_version: "1.0", records: {} });
     const mapKey = `${namespace}:${key}`;
     const digest = sha256(stableStringify(payload));
-    const prior = db.records[mapKey];
-    if (prior) {
-      if (prior.digest !== digest) throw new GatewayError("IDEMPOTENCY_CONFLICT", "Idempotency key was already used with a different payload", 409);
-      return { state: "replay", record: prior };
-    }
-    db.records[mapKey] = { digest, result: result ?? null, created_at: nowIso() };
-    await atomicJson(this.p.idempotency, db);
-    return { state: "new", mapKey, db };
+    let outcome = null;
+    await mutateJson(this.p.idempotency, (db) => {
+      const current = db ?? { schema_version: "1.0", records: {} };
+      const prior = current.records[mapKey];
+      if (prior) {
+        if (prior.digest !== digest) {
+          throw new GatewayError("IDEMPOTENCY_CONFLICT", "Idempotency key was already used with a different payload", 409);
+        }
+        if (prior.result == null) {
+          throw new GatewayError("IDEMPOTENCY_IN_PROGRESS", "Idempotency key is already reserved by an in-progress operation", 409);
+        }
+        outcome = { state: "replay", record: prior };
+        return current;
+      }
+      current.records[mapKey] = { digest, result: result ?? null, created_at: nowIso() };
+      outcome = { state: "new", mapKey };
+      return current;
+    }, { schema_version: "1.0", records: {} });
+    return outcome;
   }
   async commitIdempotency(mapKey, result) {
     if (!mapKey) return;
-    const db = await readJson(this.p.idempotency, { schema_version: "1.0", records: {} });
-    if (db.records[mapKey]) { db.records[mapKey].result = result; db.records[mapKey].completed_at = nowIso(); await atomicJson(this.p.idempotency, db); }
+    await mutateJson(this.p.idempotency, (db) => {
+      const current = db ?? { schema_version: "1.0", records: {} };
+      if (current.records[mapKey]) {
+        current.records[mapKey].result = result;
+        current.records[mapKey].completed_at = nowIso();
+      }
+      return current;
+    }, { schema_version: "1.0", records: {} });
   }
   async audit({ principal, action, run_id = null, request, outcome }) {
     const receipt = { receipt_id: id("audit"), at: nowIso(), principal, action, run_id, request_digest: sha256(stableStringify(request ?? {})), outcome };
