@@ -32,8 +32,9 @@ export async function startServer(config, home, options = {}) {
   // Completed runs are already canonical before optional post-completion work.
   // Recovery stays background/non-blocking, but the two passes are serialized so
   // independent durable extensions cannot race one another on the same run revision.
-  void engine.recoverPendingSessionDigests()
+  const recovery = engine.recoverPendingSessionDigests()
     .then(() => engine.recoverPendingOrganizationReviews());
+  void recovery.catch(() => {});
   const limiter = new RateLimiter(config.server.requests_per_minute);
   const ctx = {
     config,
@@ -61,7 +62,11 @@ export async function startServer(config, home, options = {}) {
     engine,
     host,
     port: typeof address === "object" && address ? address.port : port,
-    close: () => new Promise((resolve, reject) => server.close((e) => e ? reject(e) : resolve()))
+    close: async () => {
+      await new Promise((resolve, reject) => server.close((e) => e ? reject(e) : resolve()));
+      await engine.drain();
+      await recovery;
+    }
   };
 }
 
