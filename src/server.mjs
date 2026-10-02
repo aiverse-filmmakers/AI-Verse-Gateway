@@ -8,6 +8,14 @@ import { VERSION } from "./constants.mjs";
 import { assertLifecycleReady, readLifecycleState } from "./lifecycle-state.mjs";
 
 export async function startServer(config, home, options = {}) {
+  // Reject an unsafe serve-time network override before any lifecycle work.
+  // The same policy is checked again below against authoritative disk config.
+  const requestedHost = options.host ?? config?.server?.host ?? "127.0.0.1";
+  const requestedLoopback = requestedHost === "127.0.0.1" || requestedHost === "localhost" || requestedHost === "::1";
+  if (!requestedLoopback && (!config?.server?.allow_remote || !config?.server?.behind_tls_proxy)) {
+    throw new GatewayError("REMOTE_BIND_UNSAFE", "Non-loopback serving requires configured remote access behind a trusted TLS proxy", 403);
+  }
+
   const initialLifecycle = await readLifecycleState(home);
   const authoritativeConfig = assertLifecycleReady(initialLifecycle);
   const requestedGeneration = config?.service_generation ?? null;
