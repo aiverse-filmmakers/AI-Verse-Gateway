@@ -202,6 +202,7 @@ export class RunEngine {
     this.runtime = new RuntimeRegistry(config.runtime);
     this.controllers = new Map();
     this.sessionActive = new Map();
+    this.activeExecutions = new Set();
   }
   async assertExecutionAuthority(run, signal = null, allowedStatuses = ["running", "resuming"]) {
     if (signal?.aborted) throw signal.reason ?? new GatewayError("RUN_CANCELED", "Run canceled", 409);
@@ -229,10 +230,18 @@ export class RunEngine {
     const controller = new AbortController();
     this.controllers.set(runId, controller);
     this.sessionActive.set(run.session_id, runId);
-    void this.execute(runId, controller.signal).finally(() => {
+    const execution = this.execute(runId, controller.signal);
+    this.activeExecutions.add(execution);
+    void execution.finally(() => {
       this.controllers.delete(runId);
       if (this.sessionActive.get(run.session_id) === runId) this.sessionActive.delete(run.session_id);
-    });
+      this.activeExecutions.delete(execution);
+    }).catch(() => {});
+  }
+  async drain() {
+    while (this.activeExecutions.size) {
+      await Promise.allSettled([...this.activeExecutions]);
+    }
   }
   async execute(runId, signal) {
     let run = await this.store.getRun(runId);
