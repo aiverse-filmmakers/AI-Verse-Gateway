@@ -55,6 +55,7 @@ export function validateConfig(config) {
   const loopback = s.host === "127.0.0.1" || s.host === "localhost" || s.host === "::1";
   if (!loopback && (!s.allow_remote || !s.behind_tls_proxy)) throw new GatewayError("REMOTE_BIND_UNSAFE", "Non-loopback binding requires allow_remote=true and behind_tls_proxy=true");
   if (config.auth?.required !== true || !Array.isArray(config.auth?.keys) || config.auth.keys.length < 1) throw new GatewayError("AUTH_INVALID", "Gateway requires at least one hashed bearer credential");
+  if (config.service_generation !== undefined && config.service_generation !== null && !/^[A-Za-z0-9._:-]{8,128}$/.test(String(config.service_generation))) throw new GatewayError("CONFIG_INVALID", "service_generation must be an opaque 8-128 character identifier");
   if (!config.system?.root || !config.host_adapter_config) throw new GatewayError("CONFIG_INVALID", "system.root and host_adapter_config are required");
   if (!config.runtime?.kind) throw new GatewayError("CONFIG_INVALID", "runtime.kind is required");
   const context = config.context ?? {};

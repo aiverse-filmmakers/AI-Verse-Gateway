@@ -1,12 +1,14 @@
 import os from "node:os";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { access, copyFile, lstat, readdir, realpath, rm, rmdir } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { hashToken } from "./auth.mjs";
-import { defaultConfig, loadConfig } from "./config.mjs";
+import { defaultConfig, loadConfig, validateConfig } from "./config.mjs";
 import { GatewayError } from "./errors.mjs";
 import { HostClient } from "./host-adapter.mjs";
 import { gatewayHome, paths } from "./paths.mjs";
+import { readLifecycleState } from "./lifecycle-state.mjs";
 import { atomicJson, ensureDir, existsFile, nowIso, randomToken, readJson } from "./util.mjs";
 import { VERSION } from "./constants.mjs";
 
@@ -131,20 +133,50 @@ export async function installComponent(opts = {}) {
 }
 
 export async function setupComponent(opts = {}) {
-  const home = gatewayHome(opts.home); const p = paths(home);
+  const home = gatewayHome(opts.home);
+  const p = paths(home);
   if (!(await existsFile(p.install))) throw new GatewayError("NOT_INSTALLED", "Run `aiverse-gateway install` first", 409);
+
   const systemRoot = path.resolve(opts.system_root || "");
-  if (!systemRoot || !(await existsFile(path.join(systemRoot, "AI-VERSE.yaml")))) throw new GatewayError("SYSTEM_ROOT_INVALID", "setup requires an AI-Verse OS root containing AI-VERSE.yaml");
-  let hostConfig = opts.host_config ? path.resolve(opts.host_config) : p.host;
-  if (opts.host_config) await copyFile(hostConfig, p.host), hostConfig = p.host;
-  else {
+  if (!systemRoot || !(await existsFile(path.join(systemRoot, "AI-VERSE.yaml")))) {
+    throw new GatewayError("SYSTEM_ROOT_INVALID", "setup requires an AI-Verse OS root containing AI-VERSE.yaml");
+  }
+
+  let candidateHostConfig;
+  let verificationHostPath;
+  let temporaryHostPath = null;
+
+  if (opts.host_config) {
+    verificationHostPath = path.resolve(opts.host_config);
+    if (!(await existsFile(verificationHostPath))) {
+      throw new GatewayError("HOST_CONFIG_MISSING", "Host adapter config does not exist");
+    }
+    candidateHostConfig = await readJson(verificationHostPath);
+  } else {
     const adapter = path.join(systemRoot, "scripts", "ai_verse_host_adapter.py");
     if (!(await existsFile(adapter))) throw new GatewayError("HOST_ADAPTER_MISSING", "AI-Verse OS host adapter is missing");
     const python = opts.python || process.env.PYTHON || (process.platform === "win32" ? "python" : "python3");
-    await atomicJson(p.host, { schema_version: "1.0", name: "ai-verse-os-host", transport: "json-subprocess", command: [python, adapter, "--root", systemRoot], timeout_seconds: 60, max_input_bytes: 2097152, max_output_bytes: 2097152, max_stderr_bytes: 65536, env_names: [], cwd: systemRoot });
+    candidateHostConfig = {
+      schema_version: "1.0",
+      name: "ai-verse-os-host",
+      transport: "json-subprocess",
+      command: [python, adapter, "--root", systemRoot],
+      timeout_seconds: 60,
+      max_input_bytes: 2097152,
+      max_output_bytes: 2097152,
+      max_stderr_bytes: 65536,
+      env_names: [],
+      cwd: systemRoot
+    };
   }
+
   const goalOwnerConfig = opts.goal_owner_config ? path.resolve(opts.goal_owner_config) : null;
-  if (goalOwnerConfig) { if (!(await existsFile(goalOwnerConfig))) throw new GatewayError("GOAL_OWNER_CONFIG_MISSING", "Goal owner config does not exist"); await copyFile(goalOwnerConfig, p.goalOwner); }
+  let candidateGoalOwnerConfig = null;
+  if (goalOwnerConfig) {
+    if (!(await existsFile(goalOwnerConfig))) throw new GatewayError("GOAL_OWNER_CONFIG_MISSING", "Goal owner config does not exist");
+    candidateGoalOwnerConfig = await readJson(goalOwnerConfig);
+  }
+
   const token = opts.token || randomToken();
   const runtime = runtimeConfig(opts);
   const config = defaultConfig({
@@ -168,9 +200,75 @@ export async function setupComponent(opts = {}) {
     context_summary_wrapper_token_reserve: opts.context_summary_wrapper_token_reserve == null ? undefined : Number(opts.context_summary_wrapper_token_reserve),
     context_cache_sensitive_skip: opts.context_cache_sensitive_skip == null ? true : String(opts.context_cache_sensitive_skip).toLowerCase() !== "false"
   });
-  await atomicJson(p.config, config);
-  const host = new HostClient(p.host); const described = await host.describe();
-  return { ok: true, command: "setup", state: "ready", home, system_id: config.system.id, workspace: config.system.default_workspace, host: { adapter_id: described?.adapter_id, protocol_version: described?.protocol_version, canonical_state_owned: described?.metadata?.canonical_state_owned }, runtime: runtime.kind, context_governor: { configured: Number.isInteger(config.context?.window_tokens), window_tokens: config.context?.window_tokens ?? null }, api_token: token, api_token_note: "Shown once. Only a scrypt hash is stored.", goal_owner: goalOwnerConfig ? "configured" : "not-configured-current-brain-goal-api-unavailable", authority_transfer: "none", external_credentials_stored: false };
+  config.service_generation = randomUUID();
+
+  // Configuration safety is proven before any ready configuration is published.
+  validateConfig(config);
+
+  let described;
+  try {
+    if (!verificationHostPath) {
+      temporaryHostPath = path.join(home, `.host.setup-${process.pid}-${randomUUID()}.json`);
+      await atomicJson(temporaryHostPath, candidateHostConfig);
+      verificationHostPath = temporaryHostPath;
+    }
+    described = await new HostClient(verificationHostPath).describe();
+    if (!described || typeof described !== "object" || described?.metadata?.canonical_state_owned !== false) {
+      throw new GatewayError("HOST_INCOMPATIBLE", "OS host adapter did not prove the required non-canonical Gateway ownership contract", 409);
+    }
+  } finally {
+    if (temporaryHostPath) await rm(temporaryHostPath, { force: true });
+  }
+
+  // Host/goal adapter files are published only after validation/compatibility
+  // succeeds. config.json is the final publication edge for ready setup state.
+  const priorHost = (await existsFile(p.host)) ? await readJson(p.host) : null;
+  const priorGoalOwner = (await existsFile(p.goalOwner)) ? await readJson(p.goalOwner) : null;
+  let hostPublished = false;
+  let goalPublished = false;
+  try {
+    await atomicJson(p.host, candidateHostConfig);
+    hostPublished = true;
+    if (candidateGoalOwnerConfig) {
+      await atomicJson(p.goalOwner, candidateGoalOwnerConfig);
+      goalPublished = true;
+    }
+    await atomicJson(p.config, config);
+  } catch (error) {
+    if (hostPublished) {
+      if (priorHost) await atomicJson(p.host, priorHost);
+      else await rm(p.host, { force: true });
+    }
+    if (goalPublished) {
+      if (priorGoalOwner) await atomicJson(p.goalOwner, priorGoalOwner);
+      else await rm(p.goalOwner, { force: true });
+    }
+    throw error;
+  }
+
+  return {
+    ok: true,
+    command: "setup",
+    state: "ready",
+    home,
+    system_id: config.system.id,
+    workspace: config.system.default_workspace,
+    host: {
+      adapter_id: described?.adapter_id,
+      protocol_version: described?.protocol_version,
+      canonical_state_owned: described?.metadata?.canonical_state_owned
+    },
+    runtime: runtime.kind,
+    context_governor: {
+      configured: Number.isInteger(config.context?.window_tokens),
+      window_tokens: config.context?.window_tokens ?? null
+    },
+    api_token: token,
+    api_token_note: "Shown once. Only a scrypt hash is stored.",
+    goal_owner: goalOwnerConfig ? "configured" : "not-configured-current-brain-goal-api-unavailable",
+    authority_transfer: "none",
+    external_credentials_stored: false
+  };
 }
 
 function runtimeConfig(opts) {
@@ -189,33 +287,85 @@ function runtimeConfig(opts) {
 }
 
 export async function statusComponent(opts = {}) {
-  const home = gatewayHome(opts.home); const p = paths(home);
-  if (!(await existsFile(p.install))) return { ok: true, command: "status", state: "absent", home };
-  if (!(await existsFile(p.config))) return { ok: true, command: "status", state: "setup-required", home, version: VERSION };
-  try { const config = await loadConfig(home); return { ok: true, command: "status", state: config.enabled ? "ready" : "disabled", home, version: VERSION, system_id: config.system.id, runtime: config.runtime.kind, binding: config.server.host, goal_owner_configured: Boolean(config.goal_owner_config) }; }
-  catch (error) { return { ok: false, command: "status", state: "unhealthy", home, error: String(error.message ?? error) }; }
+  const home = gatewayHome(opts.home);
+  const snapshot = await readLifecycleState(home);
+  if (snapshot.state === "absent") return { ok: true, command: "status", state: "absent", home };
+  if (snapshot.state === "setup-required") return { ok: true, command: "status", state: "setup-required", home, version: VERSION };
+  if (snapshot.state === "unhealthy") {
+    return { ok: false, command: "status", state: "unhealthy", home, error: snapshot.error };
+  }
+
+  const config = snapshot.config;
+  return {
+    ok: true,
+    command: "status",
+    state: snapshot.state,
+    home,
+    version: VERSION,
+    system_id: config.system.id,
+    runtime: config.runtime.kind,
+    binding: config.server.host,
+    goal_owner_configured: Boolean(config.goal_owner_config)
+  };
 }
 
 export async function doctorComponent(opts = {}) {
-  const home = gatewayHome(opts.home); const p = paths(home); const checks = [];
-  const installed = await existsFile(p.install); checks.push(check("structural", "installation-marker", installed, installed ? "installed" : "missing"));
-  if (!installed) return doctorResult(home, checks);
-  const hasConfig = await existsFile(p.config); checks.push(check("structural", "config", hasConfig, hasConfig ? "present" : "setup required"));
-  if (!hasConfig) return doctorResult(home, checks);
-  let config;
-  try { config = await loadConfig(home); checks.push(check("structural", "config-schema", true, "valid")); } catch (e) { checks.push(check("structural", "config-schema", false, e.message)); return doctorResult(home, checks); }
+  const home = gatewayHome(opts.home);
+  const p = paths(home);
+  const checks = [];
+  const snapshot = await readLifecycleState(home);
+
+  const installed = snapshot.state !== "absent";
+  checks.push(check("structural", "installation-marker", installed, installed ? "installed" : "missing"));
+  if (snapshot.state === "absent") return doctorResult(home, checks, "absent");
+
+  const hasConfig = snapshot.state !== "setup-required";
+  checks.push(check("structural", "config", hasConfig, hasConfig ? "present" : "setup required"));
+  if (snapshot.state === "setup-required") return doctorResult(home, checks, "setup-required");
+
+  if (snapshot.state === "unhealthy") {
+    checks.push(check("structural", "config-schema", false, snapshot.error || "invalid"));
+    return doctorResult(home, checks, "unhealthy");
+  }
+
+  const config = snapshot.config;
+  checks.push(check("structural", "config-schema", true, "valid"));
+
+  if (snapshot.state === "disabled") {
+    checks.push(check("lifecycle", "enabled", false, "disabled by operator"));
+    return doctorResult(home, checks, "disabled");
+  }
+
+  checks.push(check("lifecycle", "enabled", true, "enabled"));
   checks.push(check("dependency", "node-version", Number(process.versions.node.split(".")[0]) >= 20, process.version));
   checks.push(check("attachment/discovery", "system-root", await existsFile(path.join(config.system.root, "AI-VERSE.yaml")), config.system.root));
-  try { const desc = await new HostClient(config.host_adapter_config).describe(); checks.push(check("runtime", "os-host", desc?.metadata?.canonical_state_owned === false, `${desc?.adapter_id ?? "unknown"} protocol ${desc?.protocol_version ?? "unknown"}`)); }
-  catch (e) { checks.push(check("runtime", "os-host", false, e.message)); }
-  if (config.runtime.kind === "openai-compatible" && config.runtime.api_key_env) checks.push(check("operational", "runtime-credential", Boolean(process.env[config.runtime.api_key_env]), process.env[config.runtime.api_key_env] ? "environment credential present" : `missing ${config.runtime.api_key_env}`));
-  else checks.push(check("operational", "runtime-config", true, config.runtime.kind));
+  try {
+    const desc = await new HostClient(config.host_adapter_config).describe();
+    checks.push(check("runtime", "os-host", desc?.metadata?.canonical_state_owned === false, `${desc?.adapter_id ?? "unknown"} protocol ${desc?.protocol_version ?? "unknown"}`));
+  } catch (e) {
+    checks.push(check("runtime", "os-host", false, e.message));
+  }
+  if (config.runtime.kind === "openai-compatible" && config.runtime.api_key_env) {
+    checks.push(check("operational", "runtime-credential", Boolean(process.env[config.runtime.api_key_env]), process.env[config.runtime.api_key_env] ? "environment credential present" : `missing ${config.runtime.api_key_env}`));
+  } else {
+    checks.push(check("operational", "runtime-config", true, config.runtime.kind));
+  }
   checks.push(check("system/composed", "brain-goal-owner", true, config.goal_owner_config ? "configured" : "optional unavailable: current Brain main has no goal owner adapter"));
   checks.push(check("system/composed", "remote-security", config.server.host === "127.0.0.1" || (config.server.allow_remote && config.server.behind_tls_proxy), config.server.host === "127.0.0.1" ? "loopback default" : "explicit remote behind TLS proxy"));
   return doctorResult(home, checks);
 }
 function check(depth, name, ok, detail) { return { depth, name, ok, detail }; }
-function doctorResult(home, checks) { const ok = checks.every((x) => x.ok); return { ok, command: "doctor", state: ok ? "ready" : "unhealthy", home, depths_checked: [...new Set(checks.map((x)=>x.depth))], checks }; }
+function doctorResult(home, checks, stateOverride = null) {
+  const ok = checks.every((x) => x.ok);
+  return {
+    ok,
+    command: "doctor",
+    state: stateOverride ?? (ok ? "ready" : "unhealthy"),
+    home,
+    depths_checked: [...new Set(checks.map((x) => x.depth))],
+    checks
+  };
+}
 
 export async function setEnabled(opts, enabled) { const home=gatewayHome(opts.home); const p=paths(home); const config=await loadConfig(home); config.enabled=enabled; await atomicJson(p.config,config); return { ok:true, command:enabled?"enable":"disable", state:enabled?"ready":"disabled", canonical_state_preserved:true }; }
 export async function updateComponent(opts={}) { if (!opts.apply) return { ok:true, command:"update", dry_run:true, source:opts.source??null, note:"Software update is separate from canonical Gateway session/run state. Use --apply --source <npm-or-git-spec> to update the installed package." }; if (!opts.source) throw new GatewayError("UPDATE_SOURCE_REQUIRED","--source is required with --apply"); const npm=process.platform==="win32"?"npm.cmd":"npm"; const code=await spawnExit(npm,["install","-g",opts.source]); if(code!==0)throw new GatewayError("UPDATE_FAILED",`npm install exited ${code}`,500); return {ok:true,command:"update",source:opts.source,canonical_state_preserved:true}; }
