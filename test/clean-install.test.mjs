@@ -4,6 +4,7 @@ import { mkdtemp, writeFile, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { sha256 } from "../src/util.mjs";
 import { installComponent, setupComponent, doctorComponent, setEnabled, uninstallComponent, statusComponent, updateComponent } from "../src/lifecycle.mjs";
 import { loadConfig } from "../src/config.mjs";
 import { startServer } from "../src/server.mjs";
@@ -50,5 +51,7 @@ test("clean install -> setup -> doctor -> OpenAI chat -> disable/enable -> unins
   assert.equal((await setEnabled({home:f.home},false)).state,"disabled"); assert.equal((await statusComponent({home:f.home})).state,"disabled");
   assert.equal((await setEnabled({home:f.home},true)).state,"ready");
   assert.equal((await updateComponent({home:f.home})).dry_run,true);
-  const un=await uninstallComponent({home:f.home}); assert.equal(un.canonical_state_preserved,true); assert.match(await readFile(path.join(f.home,"state","idempotency.json"),"utf8"),/clean-1/);
+  const un=await uninstallComponent({home:f.home}); assert.equal(un.canonical_state_preserved,true); const idemKey = "run:clean-1";
+  const idemRecord = path.join(f.home, "state", "idempotency", "records", sha256(idemKey).slice(0, 2), `${sha256(idemKey)}.json`);
+  assert.match(await readFile(idemRecord, "utf8"), /clean-1/);
 });
