@@ -1,8 +1,8 @@
 import { randomBytes, scrypt, scryptSync, timingSafeEqual } from "node:crypto";
 import { promisify } from "node:util";
+import { GatewayError } from "./errors.mjs";
 
 const scryptAsync = promisify(scrypt);
-import { GatewayError } from "./errors.mjs";
 
 export function hashToken(token, principal = "operator") {
   const salt = randomBytes(16).toString("base64url");
