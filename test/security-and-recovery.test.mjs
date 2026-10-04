@@ -4,12 +4,51 @@ import { mkdtemp, readdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { GatewayStore } from "../src/store.mjs";
-import { hashToken, verifyToken } from "../src/auth.mjs";
+import { hashToken, verifyToken, verifyTokenAsync } from "../src/auth.mjs";
+import { PreAuthAdmission, RateLimiter, requestPeerKey } from "../src/server.mjs";
 import { GatewayError } from "../src/errors.mjs";
 import { atomicJson, readJson } from "../src/util.mjs";
 import { RunEngine } from "../src/run-engine.mjs";
 
 test("auth stores a one-way scrypt verifier", () => { const token="secret-fixture";const record=hashToken(token,"operator");assert.equal(record.hash.includes(token),false);assert.equal(verifyToken(token,record),true);assert.equal(verifyToken("wrong",record),false); });
+
+test("request-time bearer verification uses asynchronous scrypt without blocking the event loop", async () => {
+  const record = hashToken("async-fixture-token", "operator");
+  const attempts = Array.from({ length: 12 }, () => verifyTokenAsync("invalid-fixture-token", record));
+  let settled = 0;
+  for (const attempt of attempts) attempt.then(() => { settled += 1; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, 0, "scrypt work should remain pending while the event loop gets a turn");
+  assert.deepEqual(await Promise.all(attempts), Array(12).fill(false));
+});
+
+test("pre-auth admission bounds concurrent KDF work and releases capacity after completion", async () => {
+  const admission = new PreAuthAdmission(10, { maxInFlight: 1, maxInFlightPerPeer: 1 });
+  const req = { socket: { remoteAddress: "192.0.2.20" }, headers: {} };
+  let release;
+  const pending = admission.run(req, () => new Promise((resolve) => { release = resolve; }));
+  await assert.rejects(
+    () => admission.run(req, async () => true),
+    (error) => error instanceof GatewayError && error.code === "RATE_LIMITED"
+  );
+  release("verified");
+  assert.equal(await pending, "verified");
+  assert.equal(admission.inFlight, 0);
+  assert.equal(admission.peerInFlight.size, 0);
+});
+
+test("pre-auth limiter bounds transport-peer buckets and ignores forwarded address headers", () => {
+  const limiter = new RateLimiter(2, 2);
+  const first = { socket: { remoteAddress: "192.0.2.10" }, headers: { "x-forwarded-for": "198.51.100.1" } };
+  const second = { socket: { remoteAddress: "192.0.2.10" }, headers: { "x-forwarded-for": "198.51.100.2" } };
+  assert.equal(requestPeerKey(first), requestPeerKey(second));
+  limiter.take(requestPeerKey(first));
+  limiter.take(requestPeerKey(second));
+  assert.throws(() => limiter.take(requestPeerKey(first)), (error) => error instanceof GatewayError && error.code === "RATE_LIMITED");
+  limiter.take("192.0.2.11");
+  assert.equal(limiter.map.size, 2);
+  assert.throws(() => limiter.take("192.0.2.12"), (error) => error instanceof GatewayError && error.code === "RATE_LIMITED");
+});
 
 
 test("atomic JSON replacement serializes same-file writers and leaves one valid record", async () => {
