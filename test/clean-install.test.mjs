@@ -30,6 +30,7 @@ test("clean install -> setup -> doctor -> OpenAI chat -> disable/enable -> unins
   try {
     let eventLoopTicks = 0;
     const probe = setInterval(() => { eventLoopTicks += 1; }, 5);
+    probe.unref();
     const invalidFlood = Array.from({ length: 24 }, (_, index) =>
       fetch(`http://127.0.0.1:${live.port}/status`, { headers: { authorization: `Bearer invalid-${index}` } })
     );
