@@ -36,13 +36,15 @@ export async function startServer(config, home, options = {}) {
     .then(() => engine.recoverPendingOrganizationReviews());
   void recovery.catch(() => {});
   const limiter = new RateLimiter(config.server.requests_per_minute);
+  const preAuthLimiter = new RateLimiter(Math.min(120, Number(config.server.requests_per_minute) || 120));
   const ctx = {
     config,
     home,
     serviceGeneration: authoritativeGeneration,
     store,
     engine,
-    limiter
+    limiter,
+    preAuthLimiter
   };
   const server = createServer((req, res) => void handle(req, res, ctx));
   const host = options.host ?? config.server.host;
@@ -95,7 +97,10 @@ async function handle(req, res, ctx) {
       return preflight(res, origin);
     }
 
-    const identity = bearer(req, ctx.config.auth.keys);
+    // Key pre-auth admission by the transport peer. Forwarded client-address
+    // headers are ignored; behind a TLS proxy, the proxy is the peer bucket.
+    ctx.preAuthLimiter.take(requestPeerKey(req));
+    const identity = await bearer(req, ctx.config.auth.keys);
     ctx.limiter.take(identity.principal);
 
     if (req.method === "GET" && url.pathname === "/status") {
@@ -471,4 +476,28 @@ async function advancedRunDiagnostics(store, run) {
   };
 }
 function intersectBudget(base, requested) { const min = (key, fallback) => { const a=base[key], b=requested[key]; if (typeof a === "number" && typeof b === "number") return Math.min(a,b); if (typeof a === "number") return a; if (typeof b === "number") return b; return fallback; }; return { max_goal_continuation_turns: min("max_goal_continuation_turns",20), no_progress_threshold: min("no_progress_threshold",2), wall_clock_seconds: min("wall_clock_seconds",120), max_actions: min("max_actions",16), max_tokens: min("max_tokens",null), max_cost: min("max_cost",null) }; }
-class RateLimiter { constructor(limit){this.limit=limit;this.map=new Map();} take(principal){const minute=Math.floor(Date.now()/60000);const key=`${principal}:${minute}`;const count=(this.map.get(key)??0)+1;this.map.set(key,count);if(count>this.limit)throw new GatewayError("RATE_LIMITED","Request rate limit exceeded",429);if(this.map.size>1000)for(const k of this.map.keys())if(!k.endsWith(`:${minute}`))this.map.delete(k);} }
+export function requestPeerKey(req) {
+  const peer = req?.socket?.remoteAddress;
+  return typeof peer === "string" && peer.length > 0 ? peer.toLowerCase() : "unknown";
+}
+
+export class RateLimiter {
+  constructor(limit, maxEntries = 4096) {
+    this.limit = Math.max(1, Math.floor(Number(limit) || 1));
+    this.maxEntries = Math.max(1, Math.floor(Number(maxEntries) || 1));
+    this.map = new Map();
+  }
+  take(identity) {
+    const minute = Math.floor(Date.now() / 60000);
+    for (const [key, entry] of this.map) if (entry.minute !== minute) this.map.delete(key);
+    const key = String(identity ?? "unknown");
+    const entry = this.map.get(key);
+    if (!entry && this.map.size >= this.maxEntries) {
+      throw new GatewayError("RATE_LIMITED", "Request rate limit capacity exceeded", 429);
+    }
+    if (entry && entry.count >= this.limit) {
+      throw new GatewayError("RATE_LIMITED", "Request rate limit exceeded", 429);
+    }
+    this.map.set(key, { minute, count: (entry?.count ?? 0) + 1 });
+  }
+}
