@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { GatewayError } from "../src/errors.mjs";
 import { RunEngine } from "../src/run-engine.mjs";
@@ -219,4 +220,93 @@ test("cancel during a runtime result race prevents stale streaming and owner han
 
 test("pause during a runtime result race prevents stale streaming and completion", async () => {
   await controlDuringIgnoredRuntime("pause");
+});
+
+
+test("idempotency claims serialize across independent store instances and preserve replay/conflict semantics", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "avg-idem-independent-"));
+  const first = new GatewayStore(home);
+  const second = new GatewayStore(home);
+  await Promise.all([first.init(), second.init()]);
+  const results = await Promise.allSettled([
+    first.claimIdempotency("automation_wake", "invocation-one", { invocation_id: "invocation-one", objective: "ship" }),
+    second.claimIdempotency("automation_wake", "invocation-one", { invocation_id: "invocation-one", objective: "ship" })
+  ]);
+  assert.equal(results.filter((item) => item.status === "fulfilled").length, 1);
+  assert.equal(results.filter((item) => item.status === "rejected").length, 1);
+  const admitted = results.find((item) => item.status === "fulfilled").value;
+  const rejected = results.find((item) => item.status === "rejected").reason;
+  assert.equal(admitted.state, "new");
+  assert.equal(rejected.code, "IDEMPOTENCY_IN_PROGRESS");
+  await second.commitIdempotency(admitted.mapKey, { run_id: "run-one" });
+  assert.equal((await first.claimIdempotency("automation_wake", "invocation-one", { invocation_id: "invocation-one", objective: "ship" })).record.result.run_id, "run-one");
+  await assert.rejects(
+    () => first.claimIdempotency("automation_wake", "invocation-one", { invocation_id: "invocation-one", objective: "changed" }),
+    (error) => error instanceof GatewayError && error.code === "IDEMPOTENCY_CONFLICT"
+  );
+});
+
+test("legacy idempotency migration retains results and is restart-safe", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "avg-idem-migration-"));
+  const legacyPath = path.join(home, "state", "idempotency.json");
+  const { mkdir, writeFile, readFile } = await import("node:fs/promises");
+  const { sha256, stableStringify } = await import("../src/util.mjs");
+  const payload = { objective: "ship" };
+  await mkdir(path.dirname(legacyPath), { recursive: true });
+  await writeFile(legacyPath, JSON.stringify({ schema_version: "1.0", records: {
+    "automation_wake:legacy-key": { digest: sha256(stableStringify(payload)), result: { run_id: "run-legacy" }, created_at: "2026-01-01T00:00:00.000Z", completed_at: "2026-01-01T00:00:01.000Z" }
+  } }));
+  const store = new GatewayStore(home);
+  await store.init();
+  await store.init();
+  const replay = await store.claimIdempotency("automation_wake", "legacy-key", payload);
+  assert.equal(replay.state, "replay");
+  assert.equal(replay.record.result.run_id, "run-legacy");
+  await assert.rejects(() => readFile(legacyPath), (error) => error.code === "ENOENT");
+});
+
+
+test("crashed idempotency result writer lock is recovered after the holder is dead", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "avg-idem-stale-lock-"));
+  const store = new GatewayStore(home);
+  await store.init();
+  const claim = await store.claimIdempotency("run", "stale-lock", { a: 1 });
+  const file = store.idempotency.recordFile(claim.mapKey);
+  const lock = `${file}.lock`;
+  const { writeFile, utimes } = await import("node:fs/promises");
+  await writeFile(lock, JSON.stringify({ pid: 2147483647, token: "dead-holder", created_at: Date.now() - 60000 }));
+  const stale = new Date(Date.now() - 60000);
+  await utimes(lock, stale, stale);
+  await store.commitIdempotency(claim.mapKey, { run_id: "recovered" });
+  const replay = await store.claimIdempotency("run", "stale-lock", { a: 1 });
+  assert.equal(replay.record.result.run_id, "recovered");
+});
+
+
+test("separate Gateway processes cannot both reserve one idempotency key", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "avg-idem-processes-"));
+  const { spawn } = await import("node:child_process");
+  const { pathToFileURL } = await import("node:url");
+  const moduleUrl = pathToFileURL(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../src/idempotency-store.mjs")).href;
+  const childSource = `import { IdempotencyStore } from ${JSON.stringify(moduleUrl)};
+const store = new IdempotencyStore(process.argv[1]);
+await store.init(process.argv[2]);
+try {
+  const result = await store.claim("automation_wake", "same-process-key", { invocation_id: "same-process-key" });
+  process.stdout.write(JSON.stringify({ state: result.state }));
+} catch (error) {
+  process.stdout.write(JSON.stringify({ code: error.code }));
+}`;
+  const run = () => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ["--input-type=module", "-e", childSource, path.join(home, "state"), path.join(home, "state", "idempotency.json")]);
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+    child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+    child.once("error", reject);
+    child.once("close", (code) => code === 0 ? resolve(JSON.parse(stdout)) : reject(new Error(stderr || `child exited ${code}`)));
+  });
+  const results = await Promise.all([run(), run()]);
+  assert.equal(results.filter((result) => result.state === "new").length, 1);
+  assert.equal(results.filter((result) => result.code === "IDEMPOTENCY_IN_PROGRESS").length, 1);
 });
