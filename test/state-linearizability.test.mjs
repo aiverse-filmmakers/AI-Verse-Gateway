@@ -220,3 +220,44 @@ test("cancel during a runtime result race prevents stale streaming and owner han
 test("pause during a runtime result race prevents stale streaming and completion", async () => {
   await controlDuringIgnoredRuntime("pause");
 });
+
+
+test("idempotency claims serialize across independent store instances and preserve replay/conflict semantics", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "avg-idem-independent-"));
+  const first = new GatewayStore(home);
+  const second = new GatewayStore(home);
+  await Promise.all([first.init(), second.init()]);
+  const results = await Promise.allSettled([
+    first.claimIdempotency("automation_wake", "invocation-one", { invocation_id: "invocation-one", objective: "ship" }),
+    second.claimIdempotency("automation_wake", "invocation-one", { invocation_id: "invocation-one", objective: "ship" })
+  ]);
+  assert.equal(results.filter((item) => item.status === "fulfilled").length, 1);
+  assert.equal(results.filter((item) => item.status === "rejected").length, 1);
+  const admitted = results.find((item) => item.status === "fulfilled").value;
+  const rejected = results.find((item) => item.status === "rejected").reason;
+  assert.equal(admitted.state, "new");
+  assert.equal(rejected.code, "IDEMPOTENCY_IN_PROGRESS");
+  await second.commitIdempotency(admitted.mapKey, { run_id: "run-one" });
+  assert.equal((await first.claimIdempotency("automation_wake", "invocation-one", { invocation_id: "invocation-one", objective: "ship" })).record.result.run_id, "run-one");
+  await assert.rejects(
+    () => first.claimIdempotency("automation_wake", "invocation-one", { invocation_id: "invocation-one", objective: "changed" }),
+    (error) => error instanceof GatewayError && error.code === "IDEMPOTENCY_CONFLICT"
+  );
+});
+
+test("legacy idempotency migration retains results and is restart-safe", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "avg-idem-migration-"));
+  const legacyPath = path.join(home, "state", "idempotency.json");
+  const { mkdir, writeFile, readFile } = await import("node:fs/promises");
+  await mkdir(path.dirname(legacyPath), { recursive: true });
+  await writeFile(legacyPath, JSON.stringify({ schema_version: "1.0", records: {
+    "run:legacy-key": { digest: "abc123", result: { run_id: "run-legacy" }, created_at: "2026-01-01T00:00:00.000Z", completed_at: "2026-01-01T00:00:01.000Z" }
+  } }));
+  const store = new GatewayStore(home);
+  await store.init();
+  await store.init();
+  assert.deepEqual(await store.claimIdempotency("run", "legacy-key", { ignored: true }), { state: "replay", record: {
+    digest: "abc123", result: { run_id: "run-legacy" }, created_at: "2026-01-01T00:00:00.000Z", completed_at: "2026-01-01T00:00:01.000Z"
+  } });
+  await assert.rejects(() => readFile(legacyPath), (error) => error.code === "ENOENT");
+});
