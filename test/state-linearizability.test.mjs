@@ -280,3 +280,32 @@ test("crashed idempotency result writer lock is recovered after the holder is de
   const replay = await store.claimIdempotency("run", "stale-lock", { a: 1 });
   assert.equal(replay.record.result.run_id, "recovered");
 });
+
+
+test("separate Gateway processes cannot both reserve one idempotency key", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "avg-idem-processes-"));
+  const { spawn } = await import("node:child_process");
+  const { pathToFileURL } = await import("node:url");
+  const moduleUrl = pathToFileURL(path.resolve(path.dirname(new URL(import.meta.url).pathname), "../src/idempotency-store.mjs")).href;
+  const childSource = `import { IdempotencyStore } from ${JSON.stringify(moduleUrl)};
+const store = new IdempotencyStore(process.argv[1]);
+await store.init(process.argv[2]);
+try {
+  const result = await store.claim("automation_wake", "same-process-key", { invocation_id: "same-process-key" });
+  process.stdout.write(JSON.stringify({ state: result.state }));
+} catch (error) {
+  process.stdout.write(JSON.stringify({ code: error.code }));
+}`;
+  const run = () => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ["--input-type=module", "-e", childSource, path.join(home, "state"), path.join(home, "state", "idempotency.json")]);
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+    child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+    child.once("error", reject);
+    child.once("close", (code) => code === 0 ? resolve(JSON.parse(stdout)) : reject(new Error(stderr || `child exited ${code}`)));
+  });
+  const results = await Promise.all([run(), run()]);
+  assert.equal(results.filter((result) => result.state === "new").length, 1);
+  assert.equal(results.filter((result) => result.code === "IDEMPOTENCY_IN_PROGRESS").length, 1);
+});
