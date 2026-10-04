@@ -109,7 +109,7 @@ POST /v1/runs/:run_id/approval
 
 `/v1/chat/completions` supports normal JSON responses and OpenAI-style SSE chunks with `stream: true`. `/v1/runs/:id/events` exposes the richer Gateway run event stream.
 
-An optional `Idempotency-Key` on run creation durably binds retries to the original payload. Reusing the same key with a different payload is rejected.
+An optional `Idempotency-Key` on run creation durably binds retries to the original payload. Reusing the same key with a different payload is rejected. Idempotency records are stored as direct hashed-key files under Gateway state, so claim and replay lookup do not read or rewrite prior history. Records do not expire because expiration would weaken the existing retry and changed-payload rejection guarantees. On first startup after upgrade, the legacy JSON map is copied and verified before the migration-complete marker is published; the old file is removed only after that marker is durable.
 
 Client-supplied actor/user IDs are never authentication. The effective principal comes from the verified Gateway bearer credential.
 
