@@ -272,9 +272,8 @@ test("crashed idempotency result writer lock is recovered after the holder is de
   const claim = await store.claimIdempotency("run", "stale-lock", { a: 1 });
   const file = store.idempotency.recordFile(claim.mapKey);
   const lock = `${file}.lock`;
-  const { mkdir, writeFile, utimes } = await import("node:fs/promises");
-  await mkdir(lock);
-  await writeFile(path.join(lock, "owner.json"), JSON.stringify({ pid: 2147483647, token: "dead-holder", created_at: Date.now() - 60000 }));
+  const { writeFile, utimes } = await import("node:fs/promises");
+  await writeFile(lock, JSON.stringify({ pid: 2147483647, token: "dead-holder", created_at: Date.now() - 60000 }));
   const stale = new Date(Date.now() - 60000);
   await utimes(lock, stale, stale);
   await store.commitIdempotency(claim.mapKey, { run_id: "recovered" });
