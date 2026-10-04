@@ -908,7 +908,11 @@ export class RunEngine {
     const requestFingerprint = "sha256:" + createHash("sha256").update(stableStringify(requestKey)).digest("hex");
 
     const state = normalizeDeepRetrievalState(run.context_deep_retrieval);
-    const prior = state.requests.find((item) => item.request_fingerprint === requestFingerprint);
+    // Exact-source results are freshness-sensitive. Always consult the owner again
+    // before returning them; request identity alone cannot prove the source is unchanged.
+    const prior = depth === "source"
+      ? null
+      : state.requests.find((item) => item.request_fingerprint === requestFingerprint);
     if (prior) {
       const priorMessageIndex = run.messages.findIndex((message) =>
         message?.role === "tool" && message?.tool_call_id === prior.tool_call_id
