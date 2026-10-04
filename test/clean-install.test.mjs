@@ -28,6 +28,17 @@ test("clean install -> setup -> doctor -> OpenAI chat -> disable/enable -> unins
   const doctor=await doctorComponent({home:f.home}); assert.equal(doctor.ok,true);
   const config=await loadConfig(f.home); const live=await startServer(config,f.home,{port:0});
   try {
+    let eventLoopTicks = 0;
+    const probe = setInterval(() => { eventLoopTicks += 1; }, 5);
+    const invalidFlood = Array.from({ length: 24 }, (_, index) =>
+      fetch(`http://127.0.0.1:${live.port}/status`, { headers: { authorization: `Bearer invalid-${index}` } })
+    );
+    const authenticatedDuringFlood = fetch(`http://127.0.0.1:${live.port}/status`, { headers: { authorization: `Bearer ${setup.api_token}` } });
+    const [invalidResponses, validResponse] = await Promise.all([Promise.all(invalidFlood), authenticatedDuringFlood]);
+    clearInterval(probe);
+    assert.equal(invalidResponses.every((response) => response.status === 401), true);
+    assert.equal(validResponse.status, 200, "authenticated traffic remains serviceable during invalid-bearer load");
+    assert.ok(eventLoopTicks > 0, "event loop continues to make progress during scrypt verification");
     const response=await fetch(`http://127.0.0.1:${live.port}/v1/chat/completions`,{method:"POST",headers:{authorization:`Bearer ${setup.api_token}`,"content-type":"application/json","idempotency-key":"clean-1"},body:JSON.stringify({model:"aiverse",messages:[{role:"user",content:"hello"}]})});
     assert.equal(response.status,200); const body=await response.json(); assert.match(body.choices[0].message.content,/hello/);
     const replay=await fetch(`http://127.0.0.1:${live.port}/v1/chat/completions`,{method:"POST",headers:{authorization:`Bearer ${setup.api_token}`,"content-type":"application/json","idempotency-key":"clean-1"},body:JSON.stringify({model:"aiverse",messages:[{role:"user",content:"hello"}]})});
