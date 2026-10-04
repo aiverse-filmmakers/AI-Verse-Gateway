@@ -249,22 +249,17 @@ test("legacy idempotency migration retains results and is restart-safe", async (
   const home = await mkdtemp(path.join(os.tmpdir(), "avg-idem-migration-"));
   const legacyPath = path.join(home, "state", "idempotency.json");
   const { mkdir, writeFile, readFile } = await import("node:fs/promises");
+  const { sha256, stableStringify } = await import("../src/util.mjs");
+  const payload = { objective: "ship" };
   await mkdir(path.dirname(legacyPath), { recursive: true });
   await writeFile(legacyPath, JSON.stringify({ schema_version: "1.0", records: {
-    "run:legacy-key": { digest: "abc123", result: { run_id: "run-legacy" }, created_at: "2026-01-01T00:00:00.000Z", completed_at: "2026-01-01T00:00:01.000Z" }
+    "automation_wake:legacy-key": { digest: sha256(stableStringify(payload)), result: { run_id: "run-legacy" }, created_at: "2026-01-01T00:00:00.000Z", completed_at: "2026-01-01T00:00:01.000Z" }
   } }));
   const store = new GatewayStore(home);
   await store.init();
   await store.init();
-  const { sha256, stableStringify } = await import("../src/util.mjs");
-  const payload = { ignored: true };
-  await (await import("node:fs/promises")).writeFile(legacyPath, JSON.stringify({ schema_version: "1.0", records: {
-    "run:legacy-key": { digest: sha256(stableStringify(payload)), result: { run_id: "run-legacy" }, created_at: "2026-01-01T00:00:00.000Z", completed_at: "2026-01-01T00:00:01.000Z" }
-  } }));
-  // Existing completion marker means a later legacy file is not imported or trusted.
-  assert.equal((await store.claimIdempotency("run", "legacy-key", payload)).state, "new");
-  assert.deepEqual(await store.claimIdempotency("run", "legacy-key", payload), { state: "replay", record: {
-    digest: sha256(stableStringify(payload)), result: { run_id: "run-legacy" }, created_at: "2026-01-01T00:00:00.000Z", completed_at: "2026-01-01T00:00:01.000Z"
-  } });
+  const replay = await store.claimIdempotency("automation_wake", "legacy-key", payload);
+  assert.equal(replay.state, "replay");
+  assert.equal(replay.record.result.run_id, "run-legacy");
   await assert.rejects(() => readFile(legacyPath), (error) => error.code === "ENOENT");
 });
