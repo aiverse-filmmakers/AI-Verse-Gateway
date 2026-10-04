@@ -19,7 +19,9 @@ export function paths(home) {
     folds: path.join(home, "state", "folds"),
     foldCards: path.join(home, "state", "folds", "cards"),
     foldCatalog: path.join(home, "state", "folds", "catalog.json"),
-    idempotency: path.join(home, "state", "idempotency.json"),
+    idempotencyRecords: path.join(home, "state", "idempotency"),
+    idempotencyMigration: path.join(home, "state", "idempotency", "migration.json"),
+    legacyIdempotency: path.join(home, "state", "idempotency.json"),
     audit: path.join(home, "state", "audit.ndjson")
   };
 }
