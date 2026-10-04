@@ -263,3 +263,21 @@ test("legacy idempotency migration retains results and is restart-safe", async (
   assert.equal(replay.record.result.run_id, "run-legacy");
   await assert.rejects(() => readFile(legacyPath), (error) => error.code === "ENOENT");
 });
+
+
+test("crashed idempotency result writer lock is recovered after the holder is dead", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "avg-idem-stale-lock-"));
+  const store = new GatewayStore(home);
+  await store.init();
+  const claim = await store.claimIdempotency("run", "stale-lock", { a: 1 });
+  const file = store.idempotency.recordFile(claim.mapKey);
+  const lock = `${file}.lock`;
+  const { mkdir, writeFile, utimes } = await import("node:fs/promises");
+  await mkdir(lock);
+  await writeFile(path.join(lock, "owner.json"), JSON.stringify({ pid: 2147483647, token: "dead-holder", created_at: Date.now() - 60000 }));
+  const stale = new Date(Date.now() - 60000);
+  await utimes(lock, stale, stale);
+  await store.commitIdempotency(claim.mapKey, { run_id: "recovered" });
+  const replay = await store.claimIdempotency("run", "stale-lock", { a: 1 });
+  assert.equal(replay.record.result.run_id, "recovered");
+});
