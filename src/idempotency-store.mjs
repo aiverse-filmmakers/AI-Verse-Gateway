@@ -1,53 +1,41 @@
 import path from "node:path";
-import { mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { link, mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { GatewayError } from "./errors.mjs";
 import { nowIso, sha256, stableStringify } from "./util.mjs";
 
-const JOURNAL_SCHEMA = "1.0";
-const LOCK_STALE_MS = 30_000;
-const LOCK_TIMEOUT_MS = 10_000;
+const SCHEMA = "1.0";
+const STALE_MS = 30_000;
+const WAIT_MS = 10_000;
 
 export class IdempotencyStore {
   constructor(stateDirectory) {
     this.directory = path.join(stateDirectory, "idempotency");
-    this.journal = path.join(this.directory, "records.ndjson");
-    this.lock = path.join(this.directory, "writer.lock");
-    this.index = new Map();
-    this.initialized = false;
+    this.records = path.join(this.directory, "records");
+    this.migration = path.join(this.directory, "migration.json");
   }
 
   async init(legacyFile) {
-    await mkdir(this.directory, { recursive: true });
-    await this.withLock(async () => {
-      const markerPath = path.join(this.directory, "migration.json");
-      let marker = await readJson(markerPath, null);
-      if (marker?.status !== "complete") {
-        const legacy = await readJson(legacyFile, null);
-        if (legacy !== null && (!legacy.records || typeof legacy.records !== "object" || Array.isArray(legacy.records))) {
-          throw new GatewayError("IDEMPOTENCY_STATE_INVALID", "Legacy idempotency state is not a records object", 500);
-        }
-        const existing = await this.loadIndex();
-        const source = legacy?.records ?? {};
-        const missing = Object.entries(source).filter(([key]) => !existing.has(key));
-        if (missing.length) {
-          const handle = await open(this.journal, "a", 0o600);
-          try {
-            for (const [mapKey, record] of missing) {
-              validateRecord(record);
-              await handle.write(`${JSON.stringify({ schema_version: JOURNAL_SCHEMA, map_key: mapKey, record })}\n`);
-            }
-            await handle.sync();
-          } finally { await handle.close(); }
-          await this.loadIndex();
-        }
-        marker = { schema_version: JOURNAL_SCHEMA, status: "complete", migrated_records: Object.keys(source).length, completed_at: nowIso() };
-        await writeAtomic(markerPath, marker);
+    await mkdir(this.records, { recursive: true });
+    await this.withLock(path.join(this.directory, "migration.lock"), async () => {
+      const marker = await readJson(this.migration, null);
+      if (marker?.status === "complete") {
         await rm(legacyFile, { force: true });
-      } else {
-        await rm(legacyFile, { force: true });
+        return;
       }
-      this.initialized = true;
+      const legacy = await readJson(legacyFile, null);
+      if (legacy && (!legacy.records || typeof legacy.records !== "object" || Array.isArray(legacy.records))) {
+        throw invalidState("Legacy idempotency state is not a records object");
+      }
+      let migrated = 0;
+      for (const [mapKey, record] of Object.entries(legacy?.records ?? {})) {
+        validateRecord(record);
+        await this.createOrVerify(mapKey, record);
+        migrated += 1;
+      }
+      // This marker publishes completion only after every record is durable.
+      await writeAtomic(this.migration, { schema_version: SCHEMA, status: "complete", migrated_records: migrated, completed_at: nowIso() });
+      await rm(legacyFile, { force: true });
     });
   }
 
@@ -55,126 +43,127 @@ export class IdempotencyStore {
     if (!key) return { state: "new" };
     const mapKey = `${namespace}:${key}`;
     const digest = sha256(stableStringify(payload));
-    return await this.withLock(async () => {
-      const records = await this.loadIndex();
-      const prior = records.get(mapKey);
-      if (prior) {
+    const file = this.recordFile(mapKey);
+    const temp = await writeTemp(file, { schema_version: SCHEMA, map_key: mapKey, record: { digest, result: result ?? null, created_at: nowIso() } });
+    try {
+      try {
+        // Hard-link publication is atomic and fails if another process claimed this key.
+        await link(temp, file);
+        return { state: "new", mapKey };
+      } catch (error) {
+        if (error?.code !== "EEXIST") throw error;
+        const prior = await this.readRecord(file, mapKey);
         if (prior.digest !== digest) throw new GatewayError("IDEMPOTENCY_CONFLICT", "Idempotency key was already used with a different payload", 409);
         if (prior.result == null) throw new GatewayError("IDEMPOTENCY_IN_PROGRESS", "Idempotency key is already reserved by an in-progress operation", 409);
         return { state: "replay", record: prior };
       }
-      const record = { digest, result: result ?? null, created_at: nowIso() };
-      await this.append({ schema_version: JOURNAL_SCHEMA, map_key: mapKey, record });
-      this.index.set(mapKey, record);
-      return { state: "new", mapKey };
-    });
+    } finally { await rm(temp, { force: true }); }
   }
 
   async commit(mapKey, result) {
     if (!mapKey) return;
-    await this.withLock(async () => {
-      const records = await this.loadIndex();
-      const current = records.get(mapKey);
-      if (!current) return;
-      const updated = { ...current, result, completed_at: nowIso() };
-      await this.append({ schema_version: JOURNAL_SCHEMA, map_key: mapKey, record: updated });
-      this.index.set(mapKey, updated);
+    const file = this.recordFile(mapKey);
+    await this.withLock(`${file}.lock`, async () => {
+      let current;
+      try { current = await readJson(file); }
+      catch (error) { if (error?.code === "ENOENT") return; throw error; }
+      if (current.map_key !== mapKey) throw invalidState("Idempotency record key does not match its digest path");
+      validateRecord(current.record);
+      await writeAtomic(file, { schema_version: SCHEMA, map_key: mapKey, record: { ...current.record, result, completed_at: nowIso() } });
     });
   }
 
-  async append(entry) {
-    const handle = await open(this.journal, "a", 0o600);
+  recordFile(mapKey) {
+    if (typeof mapKey !== "string" || !mapKey) throw new GatewayError("IDEMPOTENCY_KEY_INVALID", "Idempotency storage key is invalid", 500);
+    const digest = sha256(mapKey);
+    return path.join(this.records, digest.slice(0, 2), `${digest}.json`);
+  }
+
+  async readRecord(file, mapKey) {
+    const stored = await readJson(file);
+    if (stored.map_key !== mapKey) throw invalidState("Idempotency record key does not match its digest path");
+    validateRecord(stored.record);
+    return stored.record;
+  }
+
+  async createOrVerify(mapKey, record) {
+    const file = this.recordFile(mapKey);
+    const temp = await writeTemp(file, { schema_version: SCHEMA, map_key: mapKey, record });
     try {
-      await handle.write(`${JSON.stringify(entry)}\n`);
-      await handle.sync();
-    } finally { await handle.close(); }
-  }
-
-  async loadIndex() {
-    let data;
-    try { data = await readFile(this.journal, "utf8"); }
-    catch (error) { if (error?.code === "ENOENT") { this.index = new Map(); return this.index; } throw error; }
-    const lines = data.split(/\r?\n/);
-    const records = new Map();
-    for (let i = 0; i < lines.length; i += 1) {
-      const line = lines[i];
-      if (!line) continue;
-      let entry;
-      try { entry = JSON.parse(line); }
+      try { await link(temp, file); }
       catch (error) {
-        if (i === lines.length - 1) break; // incomplete final append is ignored; interior corruption fails closed.
-        throw new GatewayError("IDEMPOTENCY_STATE_INVALID", "Idempotency journal contains a corrupt record", 500);
+        if (error?.code !== "EEXIST") throw error;
+        const prior = await this.readRecord(file, mapKey);
+        if (stableStringify(prior) !== stableStringify(record)) throw invalidState("Existing idempotency record differs from legacy record");
       }
-      if (entry?.schema_version !== JOURNAL_SCHEMA || typeof entry.map_key !== "string" || !entry.map_key) {
-        throw new GatewayError("IDEMPOTENCY_STATE_INVALID", "Idempotency journal record is invalid", 500);
-      }
-      validateRecord(entry.record);
-      records.set(entry.map_key, entry.record);
-    }
-    this.index = records;
-    return records;
+    } finally { await rm(temp, { force: true }); }
   }
 
-  async withLock(operation) {
+  async withLock(lockPath, operation) {
+    const token = randomBytes(16).toString("hex");
     const started = Date.now();
     for (;;) {
       try {
-        const handle = await open(this.lock, "wx", 0o600);
-        try {
-          await handle.writeFile(JSON.stringify({ pid: process.pid, token: randomBytes(16).toString("hex"), created_at: Date.now() }));
-          await handle.sync();
-          return await operation();
-        } finally {
-          await handle.close();
-          await rm(this.lock, { force: true });
+        await mkdir(lockPath, { mode: 0o700 });
+        const ownerPath = path.join(lockPath, "owner.json");
+        await writeAtomic(ownerPath, { pid: process.pid, token, created_at: Date.now() });
+        try { return await operation(); }
+        finally {
+          const owner = await readJson(ownerPath, null);
+          if (owner?.token === token) {
+            const released = `${lockPath}.release.${token}`;
+            try { await rename(lockPath, released); await rm(released, { recursive: true, force: true }); }
+            catch (error) { if (error?.code !== "ENOENT") throw error; }
+          }
         }
       } catch (error) {
         if (error?.code !== "EEXIST") throw error;
-        if (Date.now() - started > LOCK_TIMEOUT_MS) throw new GatewayError("IDEMPOTENCY_LOCK_TIMEOUT", "Timed out waiting for the idempotency store writer", 503);
-        await this.recoverStaleLock();
+        if (Date.now() - started > WAIT_MS) throw new GatewayError("IDEMPOTENCY_LOCK_TIMEOUT", "Timed out waiting for idempotency storage", 503);
+        await this.recoverStaleLock(lockPath);
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
     }
   }
 
-  async recoverStaleLock() {
+  async recoverStaleLock(lockPath) {
     let stat;
-    try { stat = await (await import("node:fs/promises")).stat(this.lock); }
+    try { stat = await (await import("node:fs/promises")).stat(lockPath); }
     catch (error) { if (error?.code === "ENOENT") return; throw error; }
-    if (Date.now() - stat.mtimeMs <= LOCK_STALE_MS) return;
-    // Never steal a lock from a live local holder, even if its operation is slow.
-    try {
-      const text = await readFile(this.lock, "utf8");
-      const holder = JSON.parse(text);
-      if (Number.isInteger(holder.pid)) {
-        try { process.kill(holder.pid, 0); return; }
-        catch (error) { if (error?.code !== "ESRCH") return; }
-      } else {
-        return;
-      }
-    } catch (error) {
-      if (error?.code !== "ENOENT") return;
-    }
-    const stale = `${this.lock}.${process.pid}.${randomBytes(8).toString("hex")}.stale`;
-    try { await rename(this.lock, stale); await rm(stale, { force: true }); }
+    if (Date.now() - stat.mtimeMs <= STALE_MS) return;
+    const owner = await readJson(path.join(lockPath, "owner.json"), null);
+    if (!owner || !Number.isInteger(owner.pid)) return;
+    try { process.kill(owner.pid, 0); return; }
+    catch (error) { if (error?.code !== "ESRCH") return; }
+    const stale = `${lockPath}.stale.${process.pid}.${randomBytes(8).toString("hex")}`;
+    try { await rename(lockPath, stale); await rm(stale, { recursive: true, force: true }); }
     catch (error) { if (error?.code !== "ENOENT") throw error; }
   }
 }
 
+async function writeTemp(target, value) {
+  await mkdir(path.dirname(target), { recursive: true });
+  const temp = `${target}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
+  const handle = await open(temp, "wx", 0o600);
+  try { await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`); await handle.sync(); }
+  finally { await handle.close(); }
+  return temp;
+}
+
+async function writeAtomic(target, value) {
+  const temp = await writeTemp(target, value);
+  try { await rename(temp, target); }
+  catch (error) { await rm(temp, { force: true }); throw error; }
+}
+
+async function readJson(file, fallback = undefined) {
+  try { return JSON.parse(await readFile(file, "utf8")); }
+  catch (error) { if (error?.code === "ENOENT" && fallback !== undefined) return fallback; throw error; }
+}
+
 function validateRecord(record) {
   if (!record || typeof record !== "object" || typeof record.digest !== "string" || typeof record.created_at !== "string") {
-    throw new GatewayError("IDEMPOTENCY_STATE_INVALID", "Idempotency record is invalid", 500);
+    throw invalidState("Idempotency record is invalid");
   }
 }
 
-async function readJson(file, fallback) {
-  try { return JSON.parse(await readFile(file, "utf8")); }
-  catch (error) { if (error?.code === "ENOENT") return fallback; throw error; }
-}
-
-async function writeAtomic(file, value) {
-  const temp = `${file}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
-  await writeFile(temp, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-  try { await rename(temp, file); }
-  catch (error) { await rm(temp, { force: true }); throw error; }
-}
+function invalidState(message) { return new GatewayError("IDEMPOTENCY_STATE_INVALID", message, 500); }
