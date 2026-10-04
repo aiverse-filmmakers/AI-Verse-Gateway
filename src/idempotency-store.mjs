@@ -131,7 +131,15 @@ export class IdempotencyStore {
     catch (error) { if (error?.code === "ENOENT") return; throw error; }
     if (Date.now() - stat.mtimeMs <= STALE_MS) return;
     const owner = await readJson(path.join(lockPath, "owner.json"), null);
-    if (!owner || !Number.isInteger(owner.pid)) return;
+    if (!owner) {
+      // A writer can crash after mkdir and before publishing owner metadata.
+      // Reclaim only after the lock directory has aged beyond the recovery window.
+      const abandoned = `${lockPath}.stale.${process.pid}.${randomBytes(8).toString("hex")}`;
+      try { await rename(lockPath, abandoned); await rm(abandoned, { recursive: true, force: true }); }
+      catch (error) { if (error?.code !== "ENOENT") throw error; }
+      return;
+    }
+    if (!Number.isInteger(owner.pid)) return;
     try { process.kill(owner.pid, 0); return; }
     catch (error) { if (error?.code !== "ESRCH") return; }
     const stale = `${lockPath}.stale.${process.pid}.${randomBytes(8).toString("hex")}`;
