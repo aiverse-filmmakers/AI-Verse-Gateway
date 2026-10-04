@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { GatewayError } from "../src/errors.mjs";
 import { RunEngine } from "../src/run-engine.mjs";
@@ -286,7 +287,7 @@ test("separate Gateway processes cannot both reserve one idempotency key", async
   const home = await mkdtemp(path.join(os.tmpdir(), "avg-idem-processes-"));
   const { spawn } = await import("node:child_process");
   const { pathToFileURL } = await import("node:url");
-  const moduleUrl = pathToFileURL(path.resolve(path.dirname(new URL(import.meta.url).pathname), "../src/idempotency-store.mjs")).href;
+  const moduleUrl = pathToFileURL(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../src/idempotency-store.mjs")).href;
   const childSource = `import { IdempotencyStore } from ${JSON.stringify(moduleUrl)};
 const store = new IdempotencyStore(process.argv[1]);
 await store.init(process.argv[2]);
