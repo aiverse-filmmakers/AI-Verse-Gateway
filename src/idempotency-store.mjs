@@ -101,27 +101,33 @@ export class IdempotencyStore {
 
   async withLock(lockPath, operation) {
     const token = randomBytes(16).toString("hex");
+    const owner = { pid: process.pid, token, created_at: Date.now() };
+    const temp = await writeTemp(lockPath, owner);
     const started = Date.now();
     for (;;) {
-      try {
-        await mkdir(lockPath, { mode: 0o700 });
-        const ownerPath = path.join(lockPath, "owner.json");
-        await writeAtomic(ownerPath, { pid: process.pid, token, created_at: Date.now() });
+      let acquired = false;
+      try { await link(temp, lockPath); acquired = true; }
+      catch (error) {
+        if (error?.code !== "EEXIST") { await rm(temp, { force: true }); throw error; }
+      }
+      if (acquired) {
+        await rm(temp, { force: true });
         try { return await operation(); }
         finally {
-          const owner = await readJson(ownerPath, null);
-          if (owner?.token === token) {
+          const current = await readJson(lockPath, null);
+          if (current?.token === token) {
             const released = `${lockPath}.release.${token}`;
-            try { await rename(lockPath, released); await rm(released, { recursive: true, force: true }); }
+            try { await rename(lockPath, released); await rm(released, { force: true }); }
             catch (error) { if (error?.code !== "ENOENT") throw error; }
           }
         }
-      } catch (error) {
-        if (error?.code !== "EEXIST") throw error;
-        if (Date.now() - started > WAIT_MS) throw new GatewayError("IDEMPOTENCY_LOCK_TIMEOUT", "Timed out waiting for idempotency storage", 503);
-        await this.recoverStaleLock(lockPath);
-        await new Promise((resolve) => setTimeout(resolve, 10));
       }
+      if (Date.now() - started > WAIT_MS) {
+        await rm(temp, { force: true });
+        throw new GatewayError("IDEMPOTENCY_LOCK_TIMEOUT", "Timed out waiting for idempotency storage", 503);
+      }
+      await this.recoverStaleLock(lockPath);
+      await new Promise((resolve) => setTimeout(resolve, 10));
     }
   }
 
@@ -130,20 +136,15 @@ export class IdempotencyStore {
     try { stat = await (await import("node:fs/promises")).stat(lockPath); }
     catch (error) { if (error?.code === "ENOENT") return; throw error; }
     if (Date.now() - stat.mtimeMs <= STALE_MS) return;
-    const owner = await readJson(path.join(lockPath, "owner.json"), null);
-    if (!owner) {
-      // A writer can crash after mkdir and before publishing owner metadata.
-      // Reclaim only after the lock directory has aged beyond the recovery window.
-      const abandoned = `${lockPath}.stale.${process.pid}.${randomBytes(8).toString("hex")}`;
-      try { await rename(lockPath, abandoned); await rm(abandoned, { recursive: true, force: true }); }
-      catch (error) { if (error?.code !== "ENOENT") throw error; }
-      return;
+    let owner;
+    try { owner = await readJson(lockPath); }
+    catch { owner = null; }
+    if (owner && Number.isInteger(owner.pid)) {
+      try { process.kill(owner.pid, 0); return; }
+      catch (error) { if (error?.code !== "ESRCH") return; }
     }
-    if (!Number.isInteger(owner.pid)) return;
-    try { process.kill(owner.pid, 0); return; }
-    catch (error) { if (error?.code !== "ESRCH") return; }
     const stale = `${lockPath}.stale.${process.pid}.${randomBytes(8).toString("hex")}`;
-    try { await rename(lockPath, stale); await rm(stale, { recursive: true, force: true }); }
+    try { await rename(lockPath, stale); await rm(stale, { force: true }); }
     catch (error) { if (error?.code !== "ENOENT") throw error; }
   }
 }
