@@ -36,7 +36,7 @@ export async function startServer(config, home, options = {}) {
     .then(() => engine.recoverPendingOrganizationReviews());
   void recovery.catch(() => {});
   const limiter = new RateLimiter(config.server.requests_per_minute);
-  const preAuthLimiter = new RateLimiter(Math.min(120, Number(config.server.requests_per_minute) || 120));
+  const preAuthAdmission = new PreAuthAdmission(Math.min(120, Number(config.server.requests_per_minute) || 120));
   const ctx = {
     config,
     home,
@@ -44,7 +44,7 @@ export async function startServer(config, home, options = {}) {
     store,
     engine,
     limiter,
-    preAuthLimiter
+    preAuthAdmission
   };
   const server = createServer((req, res) => void handle(req, res, ctx));
   const host = options.host ?? config.server.host;
@@ -99,8 +99,7 @@ async function handle(req, res, ctx) {
 
     // Key pre-auth admission by the transport peer. Forwarded client-address
     // headers are ignored; behind a TLS proxy, the proxy is the peer bucket.
-    ctx.preAuthLimiter.take(requestPeerKey(req));
-    const identity = await bearer(req, ctx.config.auth.keys);
+    const identity = await ctx.preAuthAdmission.run(req, () => bearer(req, ctx.config.auth.keys));
     ctx.limiter.take(identity.principal);
 
     if (req.method === "GET" && url.pathname === "/status") {
@@ -479,6 +478,34 @@ function intersectBudget(base, requested) { const min = (key, fallback) => { con
 export function requestPeerKey(req) {
   const peer = req?.socket?.remoteAddress;
   return typeof peer === "string" && peer.length > 0 ? peer.toLowerCase() : "unknown";
+}
+
+export class PreAuthAdmission {
+  constructor(rateLimit, { maxInFlight = 64, maxInFlightPerPeer = 32 } = {}) {
+    this.limiter = new RateLimiter(rateLimit, 4096);
+    this.maxInFlight = Math.max(1, Math.floor(maxInFlight));
+    this.maxInFlightPerPeer = Math.max(1, Math.min(this.maxInFlight, Math.floor(maxInFlightPerPeer)));
+    this.inFlight = 0;
+    this.peerInFlight = new Map();
+  }
+  async run(req, operation) {
+    const peer = requestPeerKey(req);
+    this.limiter.take(peer);
+    const peerCount = this.peerInFlight.get(peer) ?? 0;
+    if (this.inFlight >= this.maxInFlight || peerCount >= this.maxInFlightPerPeer) {
+      throw new GatewayError("RATE_LIMITED", "Authentication work is at capacity", 429);
+    }
+    this.inFlight += 1;
+    this.peerInFlight.set(peer, peerCount + 1);
+    try {
+      return await operation();
+    } finally {
+      this.inFlight -= 1;
+      const current = this.peerInFlight.get(peer) ?? 1;
+      if (current <= 1) this.peerInFlight.delete(peer);
+      else this.peerInFlight.set(peer, current - 1);
+    }
+  }
 }
 
 export class RateLimiter {
