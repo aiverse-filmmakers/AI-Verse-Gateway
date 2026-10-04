@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { GatewayStore } from "../src/store.mjs";
 import { hashToken, verifyToken, verifyTokenAsync } from "../src/auth.mjs";
-import { RateLimiter, requestPeerKey } from "../src/server.mjs";
+import { PreAuthAdmission, RateLimiter, requestPeerKey } from "../src/server.mjs";
 import { GatewayError } from "../src/errors.mjs";
 import { atomicJson, readJson } from "../src/util.mjs";
 import { RunEngine } from "../src/run-engine.mjs";
@@ -20,6 +20,21 @@ test("request-time bearer verification uses asynchronous scrypt without blocking
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(settled, 0, "scrypt work should remain pending while the event loop gets a turn");
   assert.deepEqual(await Promise.all(attempts), Array(12).fill(false));
+});
+
+test("pre-auth admission bounds concurrent KDF work and releases capacity after completion", async () => {
+  const admission = new PreAuthAdmission(10, { maxInFlight: 1, maxInFlightPerPeer: 1 });
+  const req = { socket: { remoteAddress: "192.0.2.20" }, headers: {} };
+  let release;
+  const pending = admission.run(req, () => new Promise((resolve) => { release = resolve; }));
+  await assert.rejects(
+    () => admission.run(req, async () => true),
+    (error) => error instanceof GatewayError && error.code === "RATE_LIMITED"
+  );
+  release("verified");
+  assert.equal(await pending, "verified");
+  assert.equal(admission.inFlight, 0);
+  assert.equal(admission.peerInFlight.size, 0);
 });
 
 test("pre-auth limiter bounds transport-peer buckets and ignores forwarded address headers", () => {
