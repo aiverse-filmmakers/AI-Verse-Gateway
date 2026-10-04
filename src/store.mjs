@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import { readFile, readdir } from "node:fs/promises";
 import { GatewayError } from "./errors.mjs";
 import { atomicJson, appendNdjson, ensureDir, id, mutateJson, nowIso, readJson, sha256, stableStringify } from "./util.mjs";
+import { IdempotencyStore } from "./idempotency-store.mjs";
 import { paths } from "./paths.mjs";
 import { RUN_RECOVERABLE } from "./constants.mjs";
 import {
@@ -18,13 +19,13 @@ import {
 export class GatewayStore {
   constructor(home) {
     this.p = paths(home);
+    this.idempotency = new IdempotencyStore(this.p.state);
     this.bus = new EventEmitter();
     this.bus.setMaxListeners(200);
   }
   async init() {
     await Promise.all([this.p.sessions, this.p.runs, this.p.events, this.p.foldCards].map(ensureDir));
-    const idem = await readJson(this.p.idempotency, null);
-    if (!idem) await atomicJson(this.p.idempotency, { schema_version: "1.0", records: {} });
+    await this.idempotency.init(this.p.idempotency);
     await rebuildFoldCatalog(this, { live_validation: true });
   }
   sessionFile(sessionId) { assertStorageId(sessionId, "session_id"); return path.join(this.p.sessions, `${sessionId}.json`); }
@@ -155,39 +156,10 @@ export class GatewayStore {
   async readFoldSource(ref, expectedScope = null) { return await readFoldSource(this, ref, expectedScope); }
   async resolveFoldCardSources(cardId) { return await resolveFoldCardSources(this, cardId); }
   async claimIdempotency(namespace, key, payload, result = undefined) {
-    if (!key) return { state: "new" };
-    const mapKey = `${namespace}:${key}`;
-    const digest = sha256(stableStringify(payload));
-    let outcome = null;
-    await mutateJson(this.p.idempotency, (db) => {
-      const current = db ?? { schema_version: "1.0", records: {} };
-      const prior = current.records[mapKey];
-      if (prior) {
-        if (prior.digest !== digest) {
-          throw new GatewayError("IDEMPOTENCY_CONFLICT", "Idempotency key was already used with a different payload", 409);
-        }
-        if (prior.result == null) {
-          throw new GatewayError("IDEMPOTENCY_IN_PROGRESS", "Idempotency key is already reserved by an in-progress operation", 409);
-        }
-        outcome = { state: "replay", record: prior };
-        return current;
-      }
-      current.records[mapKey] = { digest, result: result ?? null, created_at: nowIso() };
-      outcome = { state: "new", mapKey };
-      return current;
-    }, { schema_version: "1.0", records: {} });
-    return outcome;
+    return await this.idempotency.claim(namespace, key, payload, result);
   }
   async commitIdempotency(mapKey, result) {
-    if (!mapKey) return;
-    await mutateJson(this.p.idempotency, (db) => {
-      const current = db ?? { schema_version: "1.0", records: {} };
-      if (current.records[mapKey]) {
-        current.records[mapKey].result = result;
-        current.records[mapKey].completed_at = nowIso();
-      }
-      return current;
-    }, { schema_version: "1.0", records: {} });
+    await this.idempotency.commit(mapKey, result);
   }
   async audit({ principal, action, run_id = null, request, outcome }) {
     const receipt = { receipt_id: id("audit"), at: nowIso(), principal, action, run_id, request_digest: sha256(stableStringify(request ?? {})), outcome };
