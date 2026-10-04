@@ -241,6 +241,95 @@ test("G2 deduplicates equivalent requests per run and serves the second tool cal
   assert.equal(events.filter((event) => event.type === "context.deep_retrieval.cached").length, 1);
 });
 
+test("G2 repeated Memory exact-source requests reread the owner and return changed current evidence", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "avg-g2-memory-drift-"));
+  const store = new GatewayStore(home);
+  await store.init();
+  const run = await makeRun(store);
+  const engine = new RunEngine({ store, config: config(home) });
+  const host = new DeepHost();
+  let revision = 1;
+  host.retrieveHistoryProgressive = async function(payload) {
+    this.progressiveCalls.push(structuredClone(payload));
+    return {
+      schema_version: 1,
+      api_version: PROGRESSIVE_HISTORY_VERSION,
+      depth: "source",
+      scope: payload.scope,
+      status: "ok",
+      exact_evidence: true,
+      record_type: "indexed_record",
+      id: "m1",
+      evidence: { source_identity: "memory:m1", source_version: `v${revision}`, source_fingerprint: `sha256:${revision}` },
+      content: revision === 1 ? "old Memory source" : "current Memory source"
+    };
+  };
+  engine.host = host;
+  const args = { depth: "source", query: "exact launch date", limit: 1, max_bytes: 4096,
+    evidence_ref: { record_type: "indexed_record", id: "m1", scope: "workspace:alpha",
+      evidence: { path: "workspace:alpha/memory/m1.md", source_identity: "memory:m1", source_version: "v1" } } };
+
+  await engine.handleToolCalls(run, [toolCall("ctx-memory-first", args)], "workspace:alpha");
+  revision = 2;
+  const afterFirst = await store.getRun(run.run_id);
+  await engine.handleToolCalls(afterFirst, [toolCall("ctx-memory-second", args)], "workspace:alpha");
+
+  const saved = await store.getRun(run.run_id);
+  const second = JSON.parse(saved.messages.find((m) => m.role === "tool" && m.tool_call_id === "ctx-memory-second").content);
+  assert.equal(host.progressiveCalls.length, 2);
+  assert.equal(second.status, "ok");
+  assert.equal(second.retrieval.owner_result.content, "current Memory source");
+  assert.equal(saved.context_deep_retrieval.cache_hits, 0);
+});
+
+test("G2 repeated Gateway external exact-source requests revalidate source fingerprint and return stale without replay", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "avg-g2-external-drift-"));
+  const store = new GatewayStore(home);
+  await store.init();
+  const originalMessages = [
+    { role: "user", content: "What is the locked launch date?" },
+    { role: "assistant", content: "Locked launch date: 18 September 2026." }
+  ];
+  const sourceRun = await makeRun(store, { runId: "run_g2_external_drift_source", sessionId: "sess_g2_external_drift_source", messages: originalMessages });
+  sourceRun.status = "completed";
+  sourceRun.completed_at = "2026-09-15T09:00:00.000Z";
+  await store.saveRun(sourceRun);
+  const requestRun = await makeRun(store, { runId: "run_g2_external_drift_request", sessionId: "sess_g2_external_drift_request",
+    messages: [{ role: "user", content: "Give me the exact launch date." }] });
+  const expectedFingerprint = `sha256:${sha256(stableStringify(originalMessages))}`;
+  const engine = new RunEngine({ store, config: config(home) });
+  const host = new DeepHost();
+  host.retrieveHistoryProgressive = async function(payload) {
+    this.progressiveCalls.push(structuredClone(payload));
+    return {
+      schema_version: 1, api_version: PROGRESSIVE_HISTORY_VERSION, depth: "source", scope: payload.scope,
+      status: "external_source_required", exact_evidence: false, record_type: "session_digest", id: "sdg-g2-drift",
+      evidence: { source_fingerprint: expectedFingerprint,
+        source_coverage: ["gateway:run:run_g2_external_drift_source:messages:0-1"],
+        external_source_refs: ["gateway:run:run_g2_external_drift_source:messages:0-1"] }
+    };
+  };
+  engine.host = host;
+  const args = { depth: "source", query: "exact launch date", limit: 1, max_bytes: 8192,
+    evidence_ref: { record_type: "session_digest", id: "sdg-g2-drift", scope: "workspace:alpha",
+      evidence: { path: "memory/sessions/sdg-g2-drift.json", digest_fingerprint: "sha256:digest" } } };
+
+  await engine.handleToolCalls(requestRun, [toolCall("ctx-external-first", args)], "workspace:alpha");
+  sourceRun.messages[1].content = "The launch date changed after digest creation.";
+  await store.saveRun(sourceRun);
+  const afterFirst = await store.getRun(requestRun.run_id);
+  await engine.handleToolCalls(afterFirst, [toolCall("ctx-external-second", args)], "workspace:alpha");
+
+  const saved = await store.getRun(requestRun.run_id);
+  const second = JSON.parse(saved.messages.find((m) => m.role === "tool" && m.tool_call_id === "ctx-external-second").content);
+  assert.equal(host.progressiveCalls.length, 2);
+  assert.equal(second.status, "ok");
+  assert.equal(second.retrieval.gateway_exact_source.status, "stale");
+  assert.equal(second.retrieval.gateway_exact_source.reason, "source_fingerprint_mismatch");
+  assert.deepEqual(second.retrieval.gateway_exact_source.messages, []);
+  assert.equal(saved.context_deep_retrieval.cache_hits, 0);
+});
+
 test("G2 source request resolves validated session-digest pointer through Gateway raw evidence and emits an auditable source-read event", async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), "avg-g2-source-"));
   const store = new GatewayStore(home);
