@@ -20,3 +20,5 @@ jobs:
           node-version: ${{ matrix.node }}
       - run: npm install --ignore-scripts
       - run: npm run check
+      - if: matrix.os == 'ubuntu-latest' && matrix.node == 22
+        run: node benchmarks/idempotency-scale.mjs
