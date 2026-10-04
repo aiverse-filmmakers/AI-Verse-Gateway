@@ -1,6 +1,6 @@
 import path from "node:path";
 import { EventEmitter } from "node:events";
-import { readFile, readdir } from "node:fs/promises";
+import { readFile, readdir, rm } from "node:fs/promises";
 import { GatewayError } from "./errors.mjs";
 import { atomicJson, appendNdjson, ensureDir, id, mutateJson, nowIso, readJson, sha256, stableStringify } from "./util.mjs";
 import { paths } from "./paths.mjs";
@@ -22,10 +22,48 @@ export class GatewayStore {
     this.bus.setMaxListeners(200);
   }
   async init() {
-    await Promise.all([this.p.sessions, this.p.runs, this.p.events, this.p.foldCards].map(ensureDir));
-    const idem = await readJson(this.p.idempotency, null);
-    if (!idem) await atomicJson(this.p.idempotency, { schema_version: "1.0", records: {} });
+    await Promise.all([this.p.sessions, this.p.runs, this.p.events, this.p.foldCards, this.p.idempotencyRecords].map(ensureDir));
+    await this.migrateLegacyIdempotency();
     await rebuildFoldCatalog(this, { live_validation: true });
+  }
+  idempotencyRecordFile(mapKey) {
+    if (typeof mapKey !== "string" || !mapKey) throw new GatewayError("IDEMPOTENCY_KEY_INVALID", "Idempotency storage key is invalid", 500);
+    const digest = sha256(mapKey);
+    return path.join(this.p.idempotencyRecords, digest.slice(0, 2), `${digest}.json`);
+  }
+  async migrateLegacyIdempotency() {
+    const completed = await readJson(this.p.idempotencyMigration, null);
+    if (completed?.status === "complete") {
+      await rm(this.p.legacyIdempotency, { force: true });
+      return completed;
+    }
+    const migration = await mutateJson(this.p.idempotencyMigration, async (state) => {
+      if (state?.status === "complete") return state;
+      const legacy = await readJson(this.p.legacyIdempotency, null);
+      const records = legacy?.records ?? {};
+      if (legacy && (!legacy.records || typeof legacy.records !== "object" || Array.isArray(legacy.records))) {
+        throw new GatewayError("IDEMPOTENCY_STATE_INVALID", "Legacy idempotency state is not a records object", 500);
+      }
+      let migrated = 0;
+      for (const [mapKey, record] of Object.entries(records)) {
+        if (!record || typeof record !== "object" || typeof record.digest !== "string" || typeof record.created_at !== "string") {
+          throw new GatewayError("IDEMPOTENCY_STATE_INVALID", "Legacy idempotency record is invalid", 500);
+        }
+        const file = this.idempotencyRecordFile(mapKey);
+        const prior = await readJson(file, null);
+        if (prior && prior.map_key !== mapKey) {
+          throw new GatewayError("IDEMPOTENCY_STATE_COLLISION", "Idempotency record path contains a different key", 500);
+        }
+        if (prior && JSON.stringify(prior.record) !== JSON.stringify(record)) {
+          throw new GatewayError("IDEMPOTENCY_STATE_CONFLICT", "Migrated idempotency record does not match the legacy record", 500);
+        }
+        if (!prior) await atomicJson(file, { schema_version: "1.0", map_key: mapKey, record });
+        migrated++;
+      }
+      return { schema_version: "1.0", status: "complete", migrated_records: migrated, completed_at: nowIso() };
+    }, { schema_version: "1.0", status: "pending" });
+    await rm(this.p.legacyIdempotency, { force: true });
+    return migration;
   }
   sessionFile(sessionId) { assertStorageId(sessionId, "session_id"); return path.join(this.p.sessions, `${sessionId}.json`); }
   runFile(runId) { assertStorageId(runId, "run_id"); return path.join(this.p.runs, `${runId}.json`); }
@@ -159,9 +197,11 @@ export class GatewayStore {
     const mapKey = `${namespace}:${key}`;
     const digest = sha256(stableStringify(payload));
     let outcome = null;
-    await mutateJson(this.p.idempotency, (db) => {
-      const current = db ?? { schema_version: "1.0", records: {} };
-      const prior = current.records[mapKey];
+    await mutateJson(this.idempotencyRecordFile(mapKey), (current) => {
+      if (current && current.map_key !== mapKey) {
+        throw new GatewayError("IDEMPOTENCY_STATE_COLLISION", "Idempotency record path contains a different key", 500);
+      }
+      const prior = current?.record ?? null;
       if (prior) {
         if (prior.digest !== digest) {
           throw new GatewayError("IDEMPOTENCY_CONFLICT", "Idempotency key was already used with a different payload", 409);
@@ -172,22 +212,25 @@ export class GatewayStore {
         outcome = { state: "replay", record: prior };
         return current;
       }
-      current.records[mapKey] = { digest, result: result ?? null, created_at: nowIso() };
+      const record = { digest, result: result ?? null, created_at: nowIso() };
       outcome = { state: "new", mapKey };
-      return current;
-    }, { schema_version: "1.0", records: {} });
+      return { schema_version: "1.0", map_key: mapKey, record };
+    }, null);
     return outcome;
   }
   async commitIdempotency(mapKey, result) {
     if (!mapKey) return;
-    await mutateJson(this.p.idempotency, (db) => {
-      const current = db ?? { schema_version: "1.0", records: {} };
-      if (current.records[mapKey]) {
-        current.records[mapKey].result = result;
-        current.records[mapKey].completed_at = nowIso();
+    const file = this.idempotencyRecordFile(mapKey);
+    if (!(await readJson(file, null))) return;
+    await mutateJson(file, (current) => {
+      if (current?.map_key !== mapKey) {
+        throw new GatewayError("IDEMPOTENCY_STATE_COLLISION", "Idempotency record path contains a different key", 500);
       }
+      if (!current.record) return current;
+      current.record.result = result;
+      current.record.completed_at = nowIso();
       return current;
-    }, { schema_version: "1.0", records: {} });
+    }, null);
   }
   async audit({ principal, action, run_id = null, request, outcome }) {
     const receipt = { receipt_id: id("audit"), at: nowIso(), principal, action, run_id, request_digest: sha256(stableStringify(request ?? {})), outcome };
