@@ -10,7 +10,7 @@ Gateway API tokens are stored as salted scrypt verifiers. Runtime/API provider s
 
 Browser requests with an `Origin` header must match the explicit origin allowlist. Authentication is header-based, not cookie-based, which removes ambient-cookie CSRF authority. CORS preflight permits only the declared API headers and methods.
 
-Request bodies are bounded. Per-principal request rates are bounded. Run turns, actions, tokens, cost, and wall-clock time can be bounded independently. Child/requested budgets can only narrow configured outer limits.
+Request bodies are bounded. A pre-auth fixed-window limit is keyed to the TCP peer address before bearer KDF work, and principal request rates are bounded after authentication. Forwarded client-address headers are ignored: direct clients are limited by their transport address, while remote deployments behind a TLS proxy share the proxy peer bucket and should enforce end-client limits at that trusted proxy. Run turns, actions, tokens, cost, and wall-clock time can be bounded independently. Child/requested budgets can only narrow configured outer limits.
 
 ## Privileged controls
 
