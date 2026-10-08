@@ -6,6 +6,7 @@ export const PROGRESSIVE_CONTEXT_VERSION = "gateway.progressive-context.g1.v1";
 export const PROGRESSIVE_HISTORY_VERSION = "memory.progressive-recall.v1";
 export const PROGRESSIVE_HISTORY_OPERATION = "retrieve_history_progressive";
 export const RUNTIME_DEEP_RETRIEVAL_VERSION = "gateway.deep-retrieval.g2.v1";
+export const PURPOSE_RUNTIME_DIAGNOSTICS_VERSION = "gateway.purpose-runtime-diagnostics.v1";
 export const RUNTIME_DEEP_LIMITS = Object.freeze({
   summary: Object.freeze({ max_limit: 6, max_bytes: 8192 }),
   detail: Object.freeze({ max_limit: 4, max_bytes: 12288 }),
@@ -90,7 +91,8 @@ export async function assembleProgressiveOwnerContext({
     legacy_reads: 0,
     fallback_reason: null,
     bytes_by_depth: {},
-    item_counts: {}
+    item_counts: {},
+    purpose: purposeRuntimeDiagnostics(purposeGate, purposeContext, scope)
   };
 
   if (progressiveAvailable) {
@@ -316,6 +318,37 @@ function assertPurposeProjection(value, boundScope) {
     throw new GatewayError("PURPOSE_CONTEXT_OWNER_MISMATCH", "Purpose projection must remain OS-owned", 502);
   }
   return value;
+}
+
+function purposeRuntimeDiagnostics(gate, projection, scope) {
+  const ownerReads = Array.isArray(projection?.provenance?.owner_reads)
+    ? projection.provenance.owner_reads
+    : [];
+  const freshness = ownerReads.slice(0, 16).map((read) => ({
+    owner: typeof read?.owner === "string" ? read.owner : null,
+    operation: typeof read?.operation === "string" ? read.operation : null,
+    status: typeof read?.status === "string" ? read.status : null,
+    state: typeof read?.freshness?.state === "string" ? read.freshness.state : null,
+    as_of: typeof read?.freshness?.as_of === "string" ? read.freshness.as_of : null
+  }));
+  return {
+    api_version: PURPOSE_RUNTIME_DIAGNOSTICS_VERSION,
+    relevance_api_version: gate?.relevance?.api_version ?? null,
+    read_gate_api_version: gate?.api_version ?? null,
+    purpose_relevant: gate?.relevance?.purpose_relevant === true,
+    task_class: gate?.relevance?.task_class ?? "irrelevant",
+    read_performed: gate?.read_performed === true,
+    state: gate?.state ?? "unknown",
+    skip_reason: gate?.skip_reason ?? null,
+    scope,
+    projection_owner: projection?.provenance?.projection_owner ?? null,
+    projection_schema_version: projection?.schema_version ?? null,
+    profile: projection?.provenance?.profile?.resolved ?? null,
+    generated_at: projection?.provenance?.generated_at ?? null,
+    projection_bytes: projection ? serializedBytes(projection) : 0,
+    owner_read_count: ownerReads.length,
+    freshness
+  };
 }
 
 function assertEvidenceScope(evidenceRef, boundScope) {
@@ -563,7 +596,8 @@ function promptDiagnostics(diagnostics) {
     legacy_reads: diagnostics.legacy_reads,
     fallback_reason: diagnostics.fallback_reason,
     bytes_by_depth: diagnostics.bytes_by_depth,
-    item_counts: diagnostics.item_counts
+    item_counts: diagnostics.item_counts,
+    purpose: diagnostics.purpose
   };
 }
 
