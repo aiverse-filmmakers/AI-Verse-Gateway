@@ -1,6 +1,16 @@
 export const PURPOSE_RUNTIME_POLICY_VERSION = "gateway.purpose-runtime-policy.v1";
 export const PURPOSE_RUNTIME_MAX_ENVELOPE_BYTES = 16384;
 export const PURPOSE_REFRESH_POLICY_VERSION = "gateway.purpose-refresh-policy.v1";
+export const PURPOSE_UNAVAILABLE_POLICY_VERSION = "gateway.purpose-unavailable-policy.v1";
+
+const PURPOSE_OWNER_UNAVAILABLE_CODES = new Set([
+  "PURPOSE_OWNER_UNAVAILABLE",
+  "ADAPTER_TIMEOUT",
+  "ADAPTER_FAILED",
+  "ADAPTER_INVALID_JSON",
+  "ENOENT",
+  "EACCES",
+]);
 
 export function assertPurposeRuntimeEnvelopeSize(value, serializedBytes) {
   if (typeof serializedBytes !== "function") {
@@ -33,5 +43,18 @@ export function purposeRefreshDecision(relevance) {
     refresh_required: true,
     cache_reuse_allowed: false,
     reason: "relevant_context_assembly",
+  });
+}
+
+export function purposeUnavailableDecision(error) {
+  const code = typeof error?.code === "string" ? error.code : null;
+  const ownerUnavailable = code !== null && PURPOSE_OWNER_UNAVAILABLE_CODES.has(code);
+  return Object.freeze({
+    api_version: PURPOSE_UNAVAILABLE_POLICY_VERSION,
+    owner_unavailable: ownerUnavailable,
+    ordinary_task_may_continue: ownerUnavailable,
+    stale_fallback_allowed: false,
+    error_code: code,
+    reason: ownerUnavailable ? "purpose_owner_unavailable" : "nonavailability_contract_error",
   });
 }
