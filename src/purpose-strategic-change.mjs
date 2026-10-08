@@ -9,6 +9,11 @@ const HYPOTHETICAL_OR_READ_ONLY = [
   /\b(?:hypothetically|as\s+a\s+hypothetical|for\s+discussion\s+only)\b/i,
 ];
 
+const EDITING_ONLY_SIGNALS = [
+  /\b(?:wording|phrasing|copy)\b/i,
+  /\b(?:this|the)\s+(?:sentence|paragraph|document|description|message|caption|copy)\b/i,
+];
+
 const OPERATION_SIGNALS = Object.freeze([
   Object.freeze({ operation_kind: 'transfer', patterns: [
     /\btransfer\b/i,
@@ -124,7 +129,8 @@ function firstChangeKind(text, operationKind) {
 }
 
 function looksReadOnly(text) {
-  return HYPOTHETICAL_OR_READ_ONLY.some((pattern) => pattern.test(text));
+  return HYPOTHETICAL_OR_READ_ONLY.some((pattern) => pattern.test(text))
+    || EDITING_ONLY_SIGNALS.some((pattern) => pattern.test(text));
 }
 
 export function classifyStrategicChangeIntent(text) {
