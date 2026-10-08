@@ -51,30 +51,29 @@ function assertSuccessfulTransferReceipt(envelope) {
     throw new TypeError('direction-owner transfer verification requires proven canonical-owner success');
   }
   const operation = requireObject(envelope.operation, 'owner operation');
-  const proposal = requireObject(operation.proposal, 'owner operation proposal');
-  if (proposal.change_kind !== 'direction_owner_transfer') throw new TypeError('handover verification only applies to direction-owner transfers');
-  if (proposal.operation_kind !== 'transfer' && proposal.operation_kind !== 'set' && proposal.operation_kind !== 'update') {
-    throw new TypeError('unsupported direction-owner transfer operation kind');
-  }
+  const binding = requireObject(operation.semantic_binding, 'owner operation semantic binding');
+  if (binding.change_kind !== 'direction_owner_transfer') throw new TypeError('handover verification only applies to direction-owner transfers');
+  if (!['transfer', 'set', 'update'].includes(binding.operation_kind)) throw new TypeError('unsupported direction-owner transfer operation kind');
   if (!STRATEGIC_DIRECTION_OWNERS.has(operation.target_owner)) throw new TypeError('transfer source owner must be os or brain');
-  if (operation.scope !== proposal.scope || envelope.scope !== operation.scope) throw new TypeError('transfer scope binding is inconsistent');
+  if (binding.target_owner !== operation.target_owner) throw new TypeError('semantic binding owner does not match owner operation');
+  if (operation.scope !== binding.scope || envelope.scope !== operation.scope) throw new TypeError('transfer scope binding is inconsistent');
   if (envelope.target_owner !== operation.target_owner) throw new TypeError('receipt envelope target owner does not match owner operation');
   if (!envelope.owner_receipt?.receipt_id) throw new TypeError('direction-owner transfer requires canonical owner receipt evidence');
-  return { operation, proposal };
+  return { operation, binding };
 }
 
-export function strategicDirectionTransferTarget(proposal) {
-  requireObject(proposal, 'strategic proposal');
-  if (proposal.change_kind !== 'direction_owner_transfer') return null;
-  return transferTargetFromText(proposal.requested_change);
+export function strategicDirectionTransferTarget(binding) {
+  requireObject(binding, 'strategic semantic binding');
+  if (binding.change_kind !== 'direction_owner_transfer') return null;
+  return transferTargetFromText(binding.requested_change);
 }
 
 export async function verifyStrategicDirectionTransfer({ receiptEnvelope, readDirectionOwner } = {}) {
-  const { operation, proposal } = assertSuccessfulTransferReceipt(receiptEnvelope);
+  const { operation, binding } = assertSuccessfulTransferReceipt(receiptEnvelope);
   if (typeof readDirectionOwner !== 'function') throw new TypeError('readDirectionOwner must be an explicit current-owner reader');
 
   const previousOwner = operation.target_owner;
-  const expectedOwner = strategicDirectionTransferTarget(proposal);
+  const expectedOwner = strategicDirectionTransferTarget(binding);
   if (expectedOwner === previousOwner) throw new TypeError('direction-owner transfer destination must differ from current owner');
 
   const current = normalizeOwnerStatus(await readDirectionOwner(operation.scope), operation.scope);
