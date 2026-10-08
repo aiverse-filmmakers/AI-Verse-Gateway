@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
+// Crash-safety invariant: canonical owner evidence may survive independently; Purpose never becomes fallback truth.
 import { proposeStrategicOwnerMutation } from '../src/purpose-strategic-change.mjs';
 import { routeStrategicOwnerMutation } from '../src/purpose-strategic-routing.mjs';
 import {
