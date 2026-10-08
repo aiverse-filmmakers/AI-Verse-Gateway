@@ -140,7 +140,7 @@ export async function gatePurposeOwnerRead(query, readPurpose) {
       api_version: PURPOSE_READ_GATE_VERSION,
       relevance,
       refresh,
-      read_performed: true,
+      read_performed: false,
       state: 'unavailable',
       skip_reason: 'purpose_owner_unavailable',
       unavailable,
