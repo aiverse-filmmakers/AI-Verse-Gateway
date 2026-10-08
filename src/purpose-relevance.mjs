@@ -1,6 +1,7 @@
 import {
   purposeRefreshDecision,
   purposeUnavailableDecision,
+  selectPurposeRuntimeProjection,
 } from './purpose-runtime-policy.mjs';
 
 const PURPOSE_RELEVANCE_VERSION = 'gateway.purpose-relevance.v1';
@@ -101,18 +102,21 @@ export function classifyPurposeRelevance(query) {
   });
 }
 
-export async function gatePurposeOwnerRead(query, readPurpose) {
+export async function gatePurposeOwnerRead(query, readPurpose, options = {}) {
   if (typeof readPurpose !== 'function') {
     throw new TypeError('readPurpose must be a function');
   }
 
+  const cachedPurposeProjection = options?.cachedPurposeProjection ?? null;
   const relevance = classifyPurposeRelevance(query);
   const refresh = purposeRefreshDecision(relevance);
   if (!refresh.refresh_required) {
+    const precedence = selectPurposeRuntimeProjection(null, cachedPurposeProjection);
     return Object.freeze({
       api_version: PURPOSE_READ_GATE_VERSION,
       relevance,
       refresh,
+      precedence,
       read_performed: false,
       state: 'skipped',
       skip_reason: 'irrelevant_task',
@@ -122,24 +126,28 @@ export async function gatePurposeOwnerRead(query, readPurpose) {
   }
 
   try {
-    const value = await readPurpose();
+    const freshOwnerProjection = await readPurpose();
+    const precedence = selectPurposeRuntimeProjection(freshOwnerProjection, cachedPurposeProjection);
     return Object.freeze({
       api_version: PURPOSE_READ_GATE_VERSION,
       relevance,
       refresh,
+      precedence,
       read_performed: true,
       state: 'read',
       skip_reason: null,
       unavailable: null,
-      value,
+      value: precedence.projection,
     });
   } catch (error) {
     const unavailable = purposeUnavailableDecision(error);
     if (!unavailable.owner_unavailable) throw error;
+    const precedence = selectPurposeRuntimeProjection(null, cachedPurposeProjection);
     return Object.freeze({
       api_version: PURPOSE_READ_GATE_VERSION,
       relevance,
       refresh,
+      precedence,
       read_performed: false,
       state: 'unavailable',
       skip_reason: 'purpose_owner_unavailable',
