@@ -1,8 +1,13 @@
 import path from "node:path";
 import { HOST_PROTOCOL } from "./constants.mjs";
 import { jsonSubprocess } from "./subprocess.mjs";
-import { id, readJson } from "./util.mjs";
+import { id, readJson, stableStringify } from "./util.mjs";
 import { GatewayError } from "./errors.mjs";
+import {
+  PURPOSE_RUNTIME_MAX_ENVELOPE_BYTES,
+  PURPOSE_RUNTIME_POLICY_VERSION,
+  assertPurposeRuntimeEnvelopeSize,
+} from "./purpose-runtime-policy.mjs";
 
 const PURPOSE_SCOPE = /^(operator|workspace:[a-z0-9][a-z0-9-]{0,127})$/;
 
@@ -14,6 +19,10 @@ function purposeRoot(config) {
     return path.resolve(command[index + 1]);
   }
   throw new GatewayError("PURPOSE_OWNER_UNAVAILABLE", "OS host config does not expose a canonical system root", 409);
+}
+
+function serializedPurposeBytes(value) {
+  return Buffer.byteLength(stableStringify(value ?? null), "utf8");
 }
 
 export class HostClient {
@@ -45,7 +54,9 @@ export class HostClient {
         "--scope",
         scope,
         "--profile",
-        "auto"
+        "auto",
+        "--max-bytes",
+        String(PURPOSE_RUNTIME_MAX_ENVELOPE_BYTES)
       ],
       cwd: root,
       timeout_seconds: hostConfig.timeout_seconds ?? 60,
@@ -63,6 +74,15 @@ export class HostClient {
     }
     if (projection?.provenance?.projection_owner !== "ai-verse-os") {
       throw new GatewayError("PURPOSE_OWNER_MISMATCH", "Purpose projection did not preserve OS projection ownership", 502);
+    }
+    const budget = assertPurposeRuntimeEnvelopeSize(projection, serializedPurposeBytes);
+    if (!budget.within_budget) {
+      throw new GatewayError(
+        "PURPOSE_CONTEXT_BUDGET_EXCEEDED",
+        `OS Purpose projection exceeded ${PURPOSE_RUNTIME_MAX_ENVELOPE_BYTES} runtime bytes`,
+        502,
+        { purpose_runtime_policy: PURPOSE_RUNTIME_POLICY_VERSION, envelope_bytes: budget.envelope_bytes, max_envelope_bytes: budget.max_envelope_bytes }
+      );
     }
     return projection;
   }
