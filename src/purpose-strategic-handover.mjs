@@ -50,7 +50,7 @@ function assertSuccessfulTransferReceipt(envelope) {
   if (envelope.state !== 'owner_effect_succeeded' || envelope.mutation_executed !== true || envelope.purpose_rebuild_allowed !== true) {
     throw new TypeError('direction-owner transfer verification requires proven canonical-owner success');
   }
-  const operation = requireObject(envelope.owner_operation, 'owner operation');
+  const operation = requireObject(envelope.operation, 'owner operation');
   const proposal = requireObject(operation.proposal, 'owner operation proposal');
   if (proposal.change_kind !== 'direction_owner_transfer') throw new TypeError('handover verification only applies to direction-owner transfers');
   if (proposal.operation_kind !== 'transfer' && proposal.operation_kind !== 'set' && proposal.operation_kind !== 'update') {
@@ -58,6 +58,7 @@ function assertSuccessfulTransferReceipt(envelope) {
   }
   if (!STRATEGIC_DIRECTION_OWNERS.has(operation.target_owner)) throw new TypeError('transfer source owner must be os or brain');
   if (operation.scope !== proposal.scope || envelope.scope !== operation.scope) throw new TypeError('transfer scope binding is inconsistent');
+  if (envelope.target_owner !== operation.target_owner) throw new TypeError('receipt envelope target owner does not match owner operation');
   if (!envelope.owner_receipt?.receipt_id) throw new TypeError('direction-owner transfer requires canonical owner receipt evidence');
   return { operation, proposal };
 }
