@@ -2,6 +2,7 @@ export const PURPOSE_RUNTIME_POLICY_VERSION = "gateway.purpose-runtime-policy.v1
 export const PURPOSE_RUNTIME_MAX_ENVELOPE_BYTES = 16384;
 export const PURPOSE_REFRESH_POLICY_VERSION = "gateway.purpose-refresh-policy.v1";
 export const PURPOSE_UNAVAILABLE_POLICY_VERSION = "gateway.purpose-unavailable-policy.v1";
+export const PURPOSE_PRECEDENCE_POLICY_VERSION = "gateway.purpose-precedence-policy.v1";
 
 const PURPOSE_OWNER_UNAVAILABLE_CODES = new Set([
   "PURPOSE_OWNER_UNAVAILABLE",
@@ -56,5 +57,19 @@ export function purposeUnavailableDecision(error) {
     stale_fallback_allowed: false,
     error_code: code,
     reason: ownerUnavailable ? "purpose_owner_unavailable" : "nonavailability_contract_error",
+  });
+}
+
+export function selectPurposeRuntimeProjection(freshOwnerProjection, cachedUiOrOutputProjection = null) {
+  const freshOwnerPresent = freshOwnerProjection !== null && freshOwnerProjection !== undefined;
+  const cachedCandidatePresent = cachedUiOrOutputProjection !== null && cachedUiOrOutputProjection !== undefined;
+  return Object.freeze({
+    api_version: PURPOSE_PRECEDENCE_POLICY_VERSION,
+    projection: freshOwnerPresent ? freshOwnerProjection : null,
+    source: freshOwnerPresent ? "fresh_owner_read" : "none",
+    fresh_owner_present: freshOwnerPresent,
+    cached_candidate_present: cachedCandidatePresent,
+    cached_candidate_ignored: cachedCandidatePresent,
+    stale_fallback_allowed: false,
   });
 }
