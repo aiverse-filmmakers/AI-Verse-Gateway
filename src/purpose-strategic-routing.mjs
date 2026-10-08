@@ -5,6 +5,7 @@ import {
 } from './purpose-strategic-mutation-boundary.mjs';
 
 export const PURPOSE_STRATEGIC_ROUTING_VERSION = 'gateway.purpose-strategic-routing.v1';
+const OWNER_STATUS_FIELDS = new Set(['schema_version', 'scope', 'owner', 'record']);
 
 function assertProposalEnvelope(result) {
   if (!result || typeof result !== 'object' || Array.isArray(result)) {
@@ -22,6 +23,11 @@ function assertProposalEnvelope(result) {
 function normalizeOwnerStatus(status, scope) {
   if (!status || typeof status !== 'object' || Array.isArray(status)) {
     throw new TypeError('direction-owner reader must return an owner status object');
+  }
+  for (const key of Object.keys(status)) {
+    if (!OWNER_STATUS_FIELDS.has(key)) {
+      throw new TypeError(`direction-owner status contains unsupported authority field: ${key}`);
+    }
   }
   if (status.schema_version !== 1) {
     throw new TypeError('unsupported direction-owner schema version');
