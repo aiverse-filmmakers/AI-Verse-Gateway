@@ -2,6 +2,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  assembleProgressiveOwnerContext,
+} from '../src/progressive-context.mjs';
+import {
   MAX_QUERY_CHARS,
   PURPOSE_READ_GATE_VERSION,
   PURPOSE_RELEVANCE_VERSION,
@@ -29,6 +32,40 @@ const irrelevantCases = [
   'Which color should I choose?',
   'Summarize this paragraph.',
 ];
+
+function fakeContextHost({ purposeScope = 'workspace:alpha', purposeOwner = 'ai-verse-os' } = {}) {
+  const calls = { purpose: [], current: [], capabilities: [], connections: [] };
+  const host = {
+    async describe() { return { adapter_id: 'fixture', metadata: {}, operations: [] }; },
+    async readContext(scope) { calls.current.push(scope); return { scope, current_context: 'fixture' }; },
+    async listCapabilities(scope) { calls.capabilities.push(scope); return []; },
+    async listConnections(scope) { calls.connections.push(scope); return []; },
+    async retrieveHistory() { return []; },
+    async readPurposeContext(scope) {
+      calls.purpose.push(scope);
+      return {
+        schema_version: '1.0',
+        scope: purposeScope,
+        scope_kind: purposeScope === 'operator' ? 'operator' : 'workspace',
+        identity: purposeScope === 'operator'
+          ? { kind: 'operator', id: 'operator' }
+          : { kind: 'workspace', id: purposeScope.slice('workspace:'.length) },
+        goals: [{ kind: 'goal', statement: 'Ship the right thing next' }],
+        provenance: { projection_owner: purposeOwner, owner_reads: [] },
+      };
+    },
+  };
+  return { host, calls };
+}
+
+function fixtureRun(scope = 'workspace:alpha') {
+  return {
+    system_id: 'system-fixture',
+    principal: 'principal-fixture',
+    workspace_id: scope === 'operator' ? 'operator' : scope.slice('workspace:'.length),
+    messages: [{ role: 'user', content: 'what should I work on next?' }],
+  };
+}
 
 test('classifies the frozen Phase 7 strategic prompts as Purpose-relevant', () => {
   for (const [query, taskClass] of strategicCases) {
@@ -114,5 +151,71 @@ test('read gate requires an explicit owner-read closure', async () => {
   await assert.rejects(
     gatePurposeOwnerRead('what should I work on next?', null),
     /readPurpose must be a function/,
+  );
+});
+
+test('strategic runtime assembly requests Purpose only for the already-bound workspace scope and injects the OS projection', async () => {
+  const scope = 'workspace:alpha';
+  const { host, calls } = fakeContextHost({ purposeScope: scope });
+  const assembled = await assembleProgressiveOwnerContext({
+    host,
+    store: null,
+    run: fixtureRun(scope),
+    scope,
+    query: 'what should I work on next?',
+    signal: null,
+  });
+
+  assert.deepEqual(calls.purpose, [scope]);
+  assert.deepEqual(calls.current, [scope]);
+  assert.equal(assembled.safe.purpose_context.scope, scope);
+  assert.equal(assembled.safe.purpose_context.provenance.projection_owner, 'ai-verse-os');
+  assert.equal(assembled.safe.purpose_context.goals[0].statement, 'Ship the right thing next');
+});
+
+test('irrelevant runtime assembly leaves Purpose out of the owner-context bundle and performs zero Purpose reads', async () => {
+  const scope = 'workspace:alpha';
+  const { host, calls } = fakeContextHost({ purposeScope: scope });
+  const assembled = await assembleProgressiveOwnerContext({
+    host,
+    store: null,
+    run: fixtureRun(scope),
+    scope,
+    query: 'Format this JSON.',
+    signal: null,
+  });
+
+  assert.deepEqual(calls.purpose, []);
+  assert.equal(Object.hasOwn(assembled.safe, 'purpose_context'), false);
+});
+
+test('runtime rejects a Purpose projection returned for another workspace', async () => {
+  const { host } = fakeContextHost({ purposeScope: 'workspace:other' });
+  await assert.rejects(
+    assembleProgressiveOwnerContext({
+      host,
+      store: null,
+      run: fixtureRun('workspace:alpha'),
+      scope: 'workspace:alpha',
+      query: 'why are we doing this?',
+      signal: null,
+    }),
+    (error) => error?.code === 'PURPOSE_CONTEXT_SCOPE_MISMATCH',
+  );
+});
+
+test('runtime rejects relabeled Purpose authority', async () => {
+  const scope = 'workspace:alpha';
+  const { host } = fakeContextHost({ purposeScope: scope, purposeOwner: 'ai-verse-gateway' });
+  await assert.rejects(
+    assembleProgressiveOwnerContext({
+      host,
+      store: null,
+      run: fixtureRun(scope),
+      scope,
+      query: 'which project should take priority?',
+      signal: null,
+    }),
+    (error) => error?.code === 'PURPOSE_CONTEXT_OWNER_MISMATCH',
   );
 });
