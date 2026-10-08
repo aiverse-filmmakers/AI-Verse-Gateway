@@ -1,3 +1,5 @@
+import { purposeRefreshDecision } from './purpose-runtime-policy.mjs';
+
 const PURPOSE_RELEVANCE_VERSION = 'gateway.purpose-relevance.v1';
 const PURPOSE_READ_GATE_VERSION = 'gateway.purpose-read-gate.v1';
 const MAX_QUERY_CHARS = 4096;
@@ -102,10 +104,12 @@ export async function gatePurposeOwnerRead(query, readPurpose) {
   }
 
   const relevance = classifyPurposeRelevance(query);
-  if (!relevance.purpose_relevant) {
+  const refresh = purposeRefreshDecision(relevance);
+  if (!refresh.refresh_required) {
     return Object.freeze({
       api_version: PURPOSE_READ_GATE_VERSION,
       relevance,
+      refresh,
       read_performed: false,
       state: 'skipped',
       skip_reason: 'irrelevant_task',
@@ -117,6 +121,7 @@ export async function gatePurposeOwnerRead(query, readPurpose) {
   return Object.freeze({
     api_version: PURPOSE_READ_GATE_VERSION,
     relevance,
+    refresh,
     read_performed: true,
     state: 'read',
     skip_reason: null,
