@@ -3,6 +3,7 @@ import { HOST_PROTOCOL } from "./constants.mjs";
 import { jsonSubprocess } from "./subprocess.mjs";
 import { id, readJson } from "./util.mjs";
 import { GatewayError } from "./errors.mjs";
+import { PURPOSE_RUNTIME_MAX_ENVELOPE_BYTES } from "./purpose-runtime-policy.mjs";
 
 const PURPOSE_SCOPE = /^(operator|workspace:[a-z0-9][a-z0-9-]{0,127})$/;
 
@@ -45,7 +46,9 @@ export class HostClient {
         "--scope",
         scope,
         "--profile",
-        "auto"
+        "auto",
+        "--max-bytes",
+        String(PURPOSE_RUNTIME_MAX_ENVELOPE_BYTES)
       ],
       cwd: root,
       timeout_seconds: hostConfig.timeout_seconds ?? 60,
