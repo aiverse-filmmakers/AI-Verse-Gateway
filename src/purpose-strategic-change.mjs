@@ -1,3 +1,8 @@
+import {
+  assertStrategicMutationProposalBoundary,
+  CANONICAL_STRATEGIC_DIRECTION_SURFACE,
+} from './purpose-strategic-mutation-boundary.mjs';
+
 export const PURPOSE_STRATEGIC_CHANGE_INTENT_VERSION = 'gateway.purpose-strategic-change-intent.v1';
 export const PURPOSE_STRATEGIC_CHANGE_PROPOSAL_VERSION = 'gateway.purpose-strategic-change-proposal.v1';
 export const PURPOSE_STRATEGIC_CHANGE_MAX_CHARS = 4096;
@@ -212,6 +217,7 @@ export function proposeStrategicOwnerMutation({ text, scope } = {}) {
       scope: normalizedScope,
       intent,
       proposal: null,
+      boundary: null,
     });
   }
 
@@ -222,7 +228,7 @@ export function proposeStrategicOwnerMutation({ text, scope } = {}) {
     change_kind: intent.change_kind,
     operation_kind: intent.operation_kind,
     requested_change: intent.normalized_text,
-    target_surface: 'canonical_strategic_direction',
+    target_surface: CANONICAL_STRATEGIC_DIRECTION_SURFACE,
     target_owner: null,
     routing_state: 'unresolved_until_current_direction_owner_read',
     requires_explicit_confirmation: true,
@@ -230,6 +236,7 @@ export function proposeStrategicOwnerMutation({ text, scope } = {}) {
     apply_allowed: false,
     mutation_executed: false,
   });
+  const boundary = assertStrategicMutationProposalBoundary(proposal);
 
   return Object.freeze({
     api_version: PURPOSE_STRATEGIC_CHANGE_PROPOSAL_VERSION,
@@ -237,5 +244,6 @@ export function proposeStrategicOwnerMutation({ text, scope } = {}) {
     scope: normalizedScope,
     intent,
     proposal,
+    boundary,
   });
 }
