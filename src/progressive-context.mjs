@@ -1,4 +1,5 @@
 import { GatewayError } from "./errors.mjs";
+import { gatePurposeOwnerRead } from "./purpose-relevance.mjs";
 import { sha256, stableStringify } from "./util.mjs";
 
 export const PROGRESSIVE_CONTEXT_VERSION = "gateway.progressive-context.g1.v1";
@@ -51,13 +52,18 @@ export async function assembleProgressiveOwnerContext({
   if (!host) throw new GatewayError("CONTEXT_HOST_REQUIRED", "Progressive context assembly requires the OS host", 500);
   const text = String(query ?? "").trim();
   const intent = classifyProgressiveContextNeed(text);
+  const purposeGatePromise = gatePurposeOwnerRead(text, () => host.readPurposeContext(scope, signal));
 
-  const [description, current, capabilities, connections] = await Promise.all([
+  const [description, current, capabilities, connections, purposeGate] = await Promise.all([
     host.describe(signal),
     host.readContext(scope, signal),
     host.listCapabilities(scope, signal),
-    host.listConnections(scope, signal)
+    host.listConnections(scope, signal),
+    purposeGatePromise
   ]);
+  const purposeContext = purposeGate.read_performed
+    ? assertPurposeProjection(purposeGate.value, scope)
+    : null;
 
   const operations = Array.isArray(description?.operations) ? description.operations : [];
   const progressiveAvailable = operations.includes(PROGRESSIVE_HISTORY_OPERATION);
@@ -168,6 +174,7 @@ export async function assembleProgressiveOwnerContext({
       metadata: description?.metadata ?? null
     },
     current_context: current,
+    ...(purposeContext ? { purpose_context: purposeContext } : {}),
     context_ladder: {
       api_version: PROGRESSIVE_CONTEXT_VERSION,
       l0: {
@@ -292,6 +299,23 @@ export async function retrieveRuntimeDeepContext({
       result_status: gatewayExactSource?.status ?? ownerResult?.status ?? "ok"
     }
   };
+}
+
+function assertPurposeProjection(value, boundScope) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new GatewayError("PURPOSE_CONTEXT_INVALID", "OS Purpose owner returned an invalid projection", 502);
+  }
+  if (value.scope !== boundScope) {
+    throw new GatewayError("PURPOSE_CONTEXT_SCOPE_MISMATCH", "Purpose projection escaped the run's bound scope", 502);
+  }
+  const expectedKind = boundScope === "operator" ? "operator" : "workspace";
+  if (value.scope_kind !== expectedKind) {
+    throw new GatewayError("PURPOSE_CONTEXT_SCOPE_MISMATCH", "Purpose projection scope kind does not match the run's bound scope", 502);
+  }
+  if (value?.provenance?.projection_owner !== "ai-verse-os") {
+    throw new GatewayError("PURPOSE_CONTEXT_OWNER_MISMATCH", "Purpose projection must remain OS-owned", 502);
+  }
+  return value;
 }
 
 function assertEvidenceScope(evidenceRef, boundScope) {
