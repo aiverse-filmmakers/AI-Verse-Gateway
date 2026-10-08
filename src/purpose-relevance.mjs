@@ -1,4 +1,5 @@
 const PURPOSE_RELEVANCE_VERSION = 'gateway.purpose-relevance.v1';
+const PURPOSE_READ_GATE_VERSION = 'gateway.purpose-read-gate.v1';
 const MAX_QUERY_CHARS = 4096;
 
 const SIGNALS = Object.freeze([
@@ -95,4 +96,36 @@ export function classifyPurposeRelevance(query) {
   });
 }
 
-export { MAX_QUERY_CHARS, PURPOSE_RELEVANCE_VERSION };
+export async function gatePurposeOwnerRead(query, readPurpose) {
+  if (typeof readPurpose !== 'function') {
+    throw new TypeError('readPurpose must be a function');
+  }
+
+  const relevance = classifyPurposeRelevance(query);
+  if (!relevance.purpose_relevant) {
+    return Object.freeze({
+      api_version: PURPOSE_READ_GATE_VERSION,
+      relevance,
+      read_performed: false,
+      state: 'skipped',
+      skip_reason: 'irrelevant_task',
+      value: null,
+    });
+  }
+
+  const value = await readPurpose();
+  return Object.freeze({
+    api_version: PURPOSE_READ_GATE_VERSION,
+    relevance,
+    read_performed: true,
+    state: 'read',
+    skip_reason: null,
+    value,
+  });
+}
+
+export {
+  MAX_QUERY_CHARS,
+  PURPOSE_READ_GATE_VERSION,
+  PURPOSE_RELEVANCE_VERSION,
+};

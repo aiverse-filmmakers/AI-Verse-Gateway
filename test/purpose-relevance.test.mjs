@@ -3,8 +3,10 @@ import test from 'node:test';
 
 import {
   MAX_QUERY_CHARS,
+  PURPOSE_READ_GATE_VERSION,
   PURPOSE_RELEVANCE_VERSION,
   classifyPurposeRelevance,
+  gatePurposeOwnerRead,
 } from '../src/purpose-relevance.mjs';
 
 const strategicCases = [
@@ -15,6 +17,17 @@ const strategicCases = [
   ['what changed?', 'material_change'],
   ['what is blocking this goal?', 'blocker'],
   ['compare two strategic options', 'strategic_compare'],
+];
+
+const irrelevantCases = [
+  'Rewrite this sentence more concisely.',
+  'Fix this typo.',
+  'Format this JSON.',
+  'Convert 5 feet to centimeters.',
+  'What changed in this sentence?',
+  'Compare these two filenames.',
+  'Which color should I choose?',
+  'Summarize this paragraph.',
 ];
 
 test('classifies the frozen Phase 7 strategic prompts as Purpose-relevant', () => {
@@ -28,17 +41,7 @@ test('classifies the frozen Phase 7 strategic prompts as Purpose-relevant', () =
 });
 
 test('keeps irrelevant microtasks out of Purpose relevance', () => {
-  const irrelevant = [
-    'Rewrite this sentence more concisely.',
-    'Fix this typo.',
-    'Format this JSON.',
-    'Convert 5 feet to centimeters.',
-    'What changed in this sentence?',
-    'Compare these two filenames.',
-    'Which color should I choose?',
-    'Summarize this paragraph.',
-  ];
-  for (const query of irrelevant) {
+  for (const query of irrelevantCases) {
     const result = classifyPurposeRelevance(query);
     assert.equal(result.purpose_relevant, false, query);
     assert.equal(result.task_class, 'irrelevant', query);
@@ -62,4 +65,54 @@ test('normalizes bounded text deterministically without inventing relevance', ()
 
   const oversized = `Rewrite this sentence. ${'x'.repeat(MAX_QUERY_CHARS + 100)}`;
   assert.equal(classifyPurposeRelevance(oversized).purpose_relevant, false);
+});
+
+test('irrelevant microtasks perform zero Purpose owner reads', async () => {
+  let readCount = 0;
+  const forbiddenRead = async () => {
+    readCount += 1;
+    throw new Error('irrelevant task must never perform a Purpose owner read');
+  };
+
+  for (const query of [
+    ...irrelevantCases,
+    'What happened yesterday?',
+    'Show me the exact historical record.',
+    '',
+  ]) {
+    const result = await gatePurposeOwnerRead(query, forbiddenRead);
+    assert.equal(result.api_version, PURPOSE_READ_GATE_VERSION);
+    assert.equal(result.read_performed, false, query);
+    assert.equal(result.state, 'skipped', query);
+    assert.equal(result.skip_reason, 'irrelevant_task', query);
+    assert.equal(result.value, null, query);
+  }
+
+  assert.equal(readCount, 0);
+});
+
+test('strategic tasks pass through the Purpose owner-read gate exactly once', async () => {
+  for (const [query, taskClass] of strategicCases) {
+    let readCount = 0;
+    const sentinel = Object.freeze({ owner: 'ai-verse-os', projection: 'purpose-context' });
+    const result = await gatePurposeOwnerRead(query, async () => {
+      readCount += 1;
+      return sentinel;
+    });
+
+    assert.equal(readCount, 1, query);
+    assert.equal(result.api_version, PURPOSE_READ_GATE_VERSION);
+    assert.equal(result.read_performed, true, query);
+    assert.equal(result.state, 'read', query);
+    assert.equal(result.skip_reason, null, query);
+    assert.equal(result.relevance.task_class, taskClass, query);
+    assert.equal(result.value, sentinel, query);
+  }
+});
+
+test('read gate requires an explicit owner-read closure', async () => {
+  await assert.rejects(
+    gatePurposeOwnerRead('what should I work on next?', null),
+    /readPurpose must be a function/,
+  );
 });
