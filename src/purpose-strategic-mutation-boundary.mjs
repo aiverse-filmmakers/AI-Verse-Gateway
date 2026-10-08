@@ -34,7 +34,7 @@ function declaresPurposeOrProjectionTarget(key, value) {
   return normalized.includes('purpose') || normalized.includes('projection');
 }
 
-function assertCommonBoundary(proposal) {
+function assertCommonBoundary(proposal, confirmationState) {
   if (!proposal || typeof proposal !== 'object' || Array.isArray(proposal)) {
     throw new TypeError('strategic mutation proposal must be an object');
   }
@@ -44,11 +44,11 @@ function assertCommonBoundary(proposal) {
   if (proposal.target_surface !== CANONICAL_STRATEGIC_DIRECTION_SURFACE) {
     throw new TypeError('strategic mutation proposal target must be canonical strategic direction, never Purpose projection state');
   }
-  if (proposal.requires_explicit_confirmation !== true || proposal.confirmation_state !== 'required_not_confirmed') {
-    throw new TypeError('strategic mutation proposal must remain unconfirmed');
+  if (proposal.requires_explicit_confirmation !== true || proposal.confirmation_state !== confirmationState) {
+    throw new TypeError(`strategic mutation proposal confirmation state must be ${confirmationState}`);
   }
   if (proposal.apply_allowed !== false || proposal.mutation_executed !== false) {
-    throw new TypeError('strategic mutation proposal cannot be executable before explicit confirmation');
+    throw new TypeError('strategic mutation proposal cannot execute before an owner operation is built and accepted');
   }
 
   for (const [key, value] of Object.entries(proposal)) {
@@ -61,32 +61,7 @@ function assertCommonBoundary(proposal) {
   }
 }
 
-function boundaryResult({ routed }) {
-  return Object.freeze({
-    api_version: PURPOSE_STRATEGIC_MUTATION_BOUNDARY_VERSION,
-    valid: true,
-    target_surface: CANONICAL_STRATEGIC_DIRECTION_SURFACE,
-    purpose_projection_mutable: false,
-    second_truth_store_allowed: false,
-    canonical_owner_required: true,
-    owner_routing_allowed_at_this_stage: routed,
-    mutation_execution_allowed_at_this_stage: false,
-  });
-}
-
-export function assertStrategicMutationProposalBoundary(proposal) {
-  assertCommonBoundary(proposal);
-  if (proposal.target_owner !== null) {
-    throw new TypeError('strategic mutation proposal owner routing must remain unresolved until Slice 8.1 Task 4');
-  }
-  if (proposal.routing_state !== 'unresolved_until_current_direction_owner_read') {
-    throw new TypeError('strategic mutation proposal routing must remain unresolved');
-  }
-  return boundaryResult({ routed: false });
-}
-
-export function assertRoutedStrategicMutationBoundary(proposal) {
-  assertCommonBoundary(proposal);
+function assertRoutedOwner(proposal) {
   if (!STRATEGIC_DIRECTION_OWNERS.has(proposal.target_owner)) {
     throw new TypeError('routed strategic mutation proposal target_owner must be the current canonical direction owner');
   }
@@ -103,5 +78,51 @@ export function assertRoutedStrategicMutationBoundary(proposal) {
   ) {
     throw new TypeError('direction-owner evidence must match the exact proposal scope and target owner');
   }
-  return boundaryResult({ routed: true });
+}
+
+function boundaryResult({ routed, confirmed }) {
+  return Object.freeze({
+    api_version: PURPOSE_STRATEGIC_MUTATION_BOUNDARY_VERSION,
+    valid: true,
+    target_surface: CANONICAL_STRATEGIC_DIRECTION_SURFACE,
+    purpose_projection_mutable: false,
+    second_truth_store_allowed: false,
+    canonical_owner_required: true,
+    owner_routing_allowed_at_this_stage: routed,
+    explicit_user_confirmation_present: confirmed,
+    mutation_execution_allowed_at_this_stage: false,
+  });
+}
+
+export function assertStrategicMutationProposalBoundary(proposal) {
+  assertCommonBoundary(proposal, 'required_not_confirmed');
+  if (proposal.target_owner !== null) {
+    throw new TypeError('strategic mutation proposal owner routing must remain unresolved until Slice 8.1 Task 4');
+  }
+  if (proposal.routing_state !== 'unresolved_until_current_direction_owner_read') {
+    throw new TypeError('strategic mutation proposal routing must remain unresolved');
+  }
+  return boundaryResult({ routed: false, confirmed: false });
+}
+
+export function assertRoutedStrategicMutationBoundary(proposal) {
+  assertCommonBoundary(proposal, 'required_not_confirmed');
+  assertRoutedOwner(proposal);
+  return boundaryResult({ routed: true, confirmed: false });
+}
+
+export function assertConfirmedStrategicMutationBoundary(proposal) {
+  assertCommonBoundary(proposal, 'explicit_user_confirmed');
+  assertRoutedOwner(proposal);
+  if (!proposal.confirmation || typeof proposal.confirmation !== 'object' || Array.isArray(proposal.confirmation)) {
+    throw new TypeError('confirmed strategic mutation proposal requires explicit-user confirmation evidence');
+  }
+  if (
+    proposal.confirmation.authority !== 'explicit_user'
+    || proposal.confirmation.scope !== proposal.scope
+    || proposal.confirmation.target_owner !== proposal.target_owner
+  ) {
+    throw new TypeError('explicit-user confirmation must match the exact proposal scope and current owner');
+  }
+  return boundaryResult({ routed: true, confirmed: true });
 }
