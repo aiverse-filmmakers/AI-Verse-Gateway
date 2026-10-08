@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   assembleProgressiveOwnerContext,
+  PURPOSE_RUNTIME_DIAGNOSTICS_VERSION,
 } from '../src/progressive-context.mjs';
 import {
   MAX_QUERY_CHARS,
@@ -51,7 +52,19 @@ function fakeContextHost({ purposeScope = 'workspace:alpha', purposeOwner = 'ai-
           ? { kind: 'operator', id: 'operator' }
           : { kind: 'workspace', id: purposeScope.slice('workspace:'.length) },
         goals: [{ kind: 'goal', statement: 'Ship the right thing next' }],
-        provenance: { projection_owner: purposeOwner, owner_reads: [] },
+        provenance: {
+          projection_owner: purposeOwner,
+          generated_at: '2026-10-08T18:00:00.000Z',
+          profile: { requested: 'auto', resolved: 'workspace_basic', reasons: ['workspace_default_basic'] },
+          owner_reads: [{
+            owner: 'ai-verse-os',
+            operation: 'current-context.read',
+            scope: purposeScope,
+            status: 'ok',
+            freshness: { state: 'unknown', as_of: '2026-10-08T18:00:00.000Z' },
+            canonical_refs: [{ owner: 'ai-verse-os', scope: purposeScope, kind: 'current-context', id: 'active' }],
+          }],
+        },
       };
     },
   };
@@ -173,7 +186,46 @@ test('strategic runtime assembly requests Purpose only for the already-bound wor
   assert.equal(assembled.safe.purpose_context.goals[0].statement, 'Ship the right thing next');
 });
 
-test('irrelevant runtime assembly leaves Purpose out of the owner-context bundle and performs zero Purpose reads', async () => {
+test('strategic runtime records bounded Purpose relevance/read/size/freshness/version diagnostics', async () => {
+  const scope = 'workspace:alpha';
+  const { host } = fakeContextHost({ purposeScope: scope });
+  const assembled = await assembleProgressiveOwnerContext({
+    host,
+    store: null,
+    run: fixtureRun(scope),
+    scope,
+    query: 'what should I work on next?',
+    signal: null,
+  });
+  const diagnostic = assembled.diagnostics.purpose;
+  assert.equal(diagnostic.api_version, PURPOSE_RUNTIME_DIAGNOSTICS_VERSION);
+  assert.equal(diagnostic.relevance_api_version, PURPOSE_RELEVANCE_VERSION);
+  assert.equal(diagnostic.read_gate_api_version, PURPOSE_READ_GATE_VERSION);
+  assert.equal(diagnostic.purpose_relevant, true);
+  assert.equal(diagnostic.task_class, 'next_work');
+  assert.equal(diagnostic.read_performed, true);
+  assert.equal(diagnostic.state, 'read');
+  assert.equal(diagnostic.skip_reason, null);
+  assert.equal(diagnostic.scope, scope);
+  assert.equal(diagnostic.projection_owner, 'ai-verse-os');
+  assert.equal(diagnostic.projection_schema_version, '1.0');
+  assert.equal(diagnostic.profile, 'workspace_basic');
+  assert.equal(diagnostic.generated_at, '2026-10-08T18:00:00.000Z');
+  assert.ok(diagnostic.projection_bytes > 0);
+  assert.equal(diagnostic.owner_read_count, 1);
+  assert.deepEqual(diagnostic.freshness, [{
+    owner: 'ai-verse-os',
+    operation: 'current-context.read',
+    status: 'ok',
+    state: 'unknown',
+    as_of: '2026-10-08T18:00:00.000Z',
+  }]);
+  assert.deepEqual(assembled.safe.context_ladder.retrieval.purpose, diagnostic);
+  assert.equal(Object.hasOwn(diagnostic, 'goals'), false);
+  assert.equal(Object.hasOwn(diagnostic, 'canonical_refs'), false);
+});
+
+test('irrelevant runtime assembly leaves Purpose out of the owner-context bundle, performs zero reads, and records the skip', async () => {
   const scope = 'workspace:alpha';
   const { host, calls } = fakeContextHost({ purposeScope: scope });
   const assembled = await assembleProgressiveOwnerContext({
@@ -187,6 +239,14 @@ test('irrelevant runtime assembly leaves Purpose out of the owner-context bundle
 
   assert.deepEqual(calls.purpose, []);
   assert.equal(Object.hasOwn(assembled.safe, 'purpose_context'), false);
+  assert.equal(assembled.diagnostics.purpose.api_version, PURPOSE_RUNTIME_DIAGNOSTICS_VERSION);
+  assert.equal(assembled.diagnostics.purpose.purpose_relevant, false);
+  assert.equal(assembled.diagnostics.purpose.read_performed, false);
+  assert.equal(assembled.diagnostics.purpose.state, 'skipped');
+  assert.equal(assembled.diagnostics.purpose.skip_reason, 'irrelevant_task');
+  assert.equal(assembled.diagnostics.purpose.projection_bytes, 0);
+  assert.equal(assembled.diagnostics.purpose.owner_read_count, 0);
+  assert.deepEqual(assembled.diagnostics.purpose.freshness, []);
 });
 
 test('runtime rejects a Purpose projection returned for another workspace', async () => {
