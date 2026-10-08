@@ -1,4 +1,7 @@
-import { purposeRefreshDecision } from './purpose-runtime-policy.mjs';
+import {
+  purposeRefreshDecision,
+  purposeUnavailableDecision,
+} from './purpose-runtime-policy.mjs';
 
 const PURPOSE_RELEVANCE_VERSION = 'gateway.purpose-relevance.v1';
 const PURPOSE_READ_GATE_VERSION = 'gateway.purpose-read-gate.v1';
@@ -113,20 +116,37 @@ export async function gatePurposeOwnerRead(query, readPurpose) {
       read_performed: false,
       state: 'skipped',
       skip_reason: 'irrelevant_task',
+      unavailable: null,
       value: null,
     });
   }
 
-  const value = await readPurpose();
-  return Object.freeze({
-    api_version: PURPOSE_READ_GATE_VERSION,
-    relevance,
-    refresh,
-    read_performed: true,
-    state: 'read',
-    skip_reason: null,
-    value,
-  });
+  try {
+    const value = await readPurpose();
+    return Object.freeze({
+      api_version: PURPOSE_READ_GATE_VERSION,
+      relevance,
+      refresh,
+      read_performed: true,
+      state: 'read',
+      skip_reason: null,
+      unavailable: null,
+      value,
+    });
+  } catch (error) {
+    const unavailable = purposeUnavailableDecision(error);
+    if (!unavailable.owner_unavailable) throw error;
+    return Object.freeze({
+      api_version: PURPOSE_READ_GATE_VERSION,
+      relevance,
+      refresh,
+      read_performed: true,
+      state: 'unavailable',
+      skip_reason: 'purpose_owner_unavailable',
+      unavailable,
+      value: null,
+    });
+  }
 }
 
 export {
