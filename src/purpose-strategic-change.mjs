@@ -1,4 +1,5 @@
 export const PURPOSE_STRATEGIC_CHANGE_INTENT_VERSION = 'gateway.purpose-strategic-change-intent.v1';
+export const PURPOSE_STRATEGIC_CHANGE_PROPOSAL_VERSION = 'gateway.purpose-strategic-change-proposal.v1';
 export const PURPOSE_STRATEGIC_CHANGE_MAX_CHARS = 4096;
 
 const HYPOTHETICAL_OR_READ_ONLY = [
@@ -133,6 +134,18 @@ function looksReadOnly(text) {
     || EDITING_ONLY_SIGNALS.some((pattern) => pattern.test(text));
 }
 
+function normalizeStrategicScope(scope) {
+  if (scope === 'operator') return scope;
+  if (typeof scope !== 'string' || !scope.startsWith('workspace:')) {
+    throw new TypeError('scope must be operator or workspace:<id>');
+  }
+  const workspaceId = scope.slice('workspace:'.length);
+  if (workspaceId.length < 1 || workspaceId.length > 128 || !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(workspaceId)) {
+    throw new TypeError('workspace scope id must be lowercase alphanumeric/hyphen and at most 128 characters');
+  }
+  return `workspace:${workspaceId}`;
+}
+
 export function classifyStrategicChangeIntent(text) {
   const normalized = normalizeText(text);
   if (!normalized) {
@@ -185,5 +198,44 @@ export function classifyStrategicChangeIntent(text) {
     requires_explicit_confirmation: true,
     reason: 'durable_high_impact_strategic_change_signal',
     normalized_text: normalized,
+  });
+}
+
+export function proposeStrategicOwnerMutation({ text, scope } = {}) {
+  const normalizedScope = normalizeStrategicScope(scope);
+  const intent = classifyStrategicChangeIntent(text);
+
+  if (!intent.strategic_change) {
+    return Object.freeze({
+      api_version: PURPOSE_STRATEGIC_CHANGE_PROPOSAL_VERSION,
+      state: 'not_proposed',
+      scope: normalizedScope,
+      intent,
+      proposal: null,
+    });
+  }
+
+  const proposal = Object.freeze({
+    api_version: PURPOSE_STRATEGIC_CHANGE_PROPOSAL_VERSION,
+    state: 'proposed',
+    scope: normalizedScope,
+    change_kind: intent.change_kind,
+    operation_kind: intent.operation_kind,
+    requested_change: intent.normalized_text,
+    target_surface: 'canonical_strategic_direction',
+    target_owner: null,
+    routing_state: 'unresolved_until_current_direction_owner_read',
+    requires_explicit_confirmation: true,
+    confirmation_state: 'required_not_confirmed',
+    apply_allowed: false,
+    mutation_executed: false,
+  });
+
+  return Object.freeze({
+    api_version: PURPOSE_STRATEGIC_CHANGE_PROPOSAL_VERSION,
+    state: 'proposed',
+    scope: normalizedScope,
+    intent,
+    proposal,
   });
 }
