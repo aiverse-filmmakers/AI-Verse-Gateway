@@ -1,5 +1,6 @@
 export const PURPOSE_RUNTIME_POLICY_VERSION = "gateway.purpose-runtime-policy.v1";
 export const PURPOSE_RUNTIME_MAX_ENVELOPE_BYTES = 16384;
+export const PURPOSE_REFRESH_POLICY_VERSION = "gateway.purpose-refresh-policy.v1";
 
 export function assertPurposeRuntimeEnvelopeSize(value, serializedBytes) {
   if (typeof serializedBytes !== "function") {
@@ -15,4 +16,22 @@ export function assertPurposeRuntimeEnvelopeSize(value, serializedBytes) {
     envelope_bytes: bytes,
     within_budget: bytes <= PURPOSE_RUNTIME_MAX_ENVELOPE_BYTES,
   };
+}
+
+export function purposeRefreshDecision(relevance) {
+  const purposeRelevant = relevance?.purpose_relevant === true;
+  if (!purposeRelevant) {
+    return Object.freeze({
+      api_version: PURPOSE_REFRESH_POLICY_VERSION,
+      refresh_required: false,
+      cache_reuse_allowed: false,
+      reason: "irrelevant_task",
+    });
+  }
+  return Object.freeze({
+    api_version: PURPOSE_REFRESH_POLICY_VERSION,
+    refresh_required: true,
+    cache_reuse_allowed: false,
+    reason: "relevant_context_assembly",
+  });
 }
