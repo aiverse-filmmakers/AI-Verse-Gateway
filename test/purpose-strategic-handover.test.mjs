@@ -50,8 +50,8 @@ async function successfulTransfer({ text, currentOwner }) {
 
 test('OS-to-Brain handover is executed by current OS owner and only verified after registry flips to Brain', async () => {
   const envelope = await successfulTransfer({ text: 'Transfer the direction owner to Brain.', currentOwner: 'os' });
-  assert.equal(envelope.owner_operation.target_owner, 'os');
-  assert.equal(strategicDirectionTransferTarget(envelope.owner_operation.proposal), 'brain');
+  assert.equal(envelope.operation.target_owner, 'os');
+  assert.equal(strategicDirectionTransferTarget(envelope.operation.proposal), 'brain');
   let reads = 0;
   const verified = await verifyStrategicDirectionTransfer({
     receiptEnvelope: envelope,
@@ -71,8 +71,8 @@ test('OS-to-Brain handover is executed by current OS owner and only verified aft
 
 test('Brain-to-OS handback is executed by current Brain owner and requires canonical registry handback', async () => {
   const envelope = await successfulTransfer({ text: 'Hand back the direction owner to OS.', currentOwner: 'brain' });
-  assert.equal(envelope.owner_operation.target_owner, 'brain');
-  assert.equal(strategicDirectionTransferTarget(envelope.owner_operation.proposal), 'os');
+  assert.equal(envelope.operation.target_owner, 'brain');
+  assert.equal(strategicDirectionTransferTarget(envelope.operation.proposal), 'os');
   const verified = await verifyStrategicDirectionTransfer({
     receiptEnvelope: envelope,
     readDirectionOwner: async (scope) => ({ schema_version: 1, scope, owner: 'os', record: { owner: 'os', state: 'active', export_confirmed: true } }),
