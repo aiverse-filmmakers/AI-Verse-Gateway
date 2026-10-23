@@ -82,14 +82,16 @@ async function writeJsonReplacement(file, value) {
   }
 }
 
-async function renameWithTransientRetry(source, destination) {
+// Small injectable filesystem/wait seam for deterministic contention tests.
+// Production callers use the actual atomic rename and timer without override.
+export async function renameWithTransientRetry(source, destination, { renameFile = rename, delay = sleep } = {}) {
   for (let attempt = 0; ; attempt += 1) {
     try {
-      await rename(source, destination);
+      await renameFile(source, destination);
       return;
     } catch (error) {
       if (!TRANSIENT_RENAME_CODES.has(error?.code) || attempt >= 7) throw error;
-      await sleep(Math.min(10 * (2 ** attempt), 320));
+      await delay(Math.min(10 * (2 ** attempt), 320));
     }
   }
 }
