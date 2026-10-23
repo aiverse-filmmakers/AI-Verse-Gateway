@@ -229,9 +229,17 @@ test("two installed systems switch A→B→A without session, workspace or princ
   const b = await fixture();
   await installComponent({ home: a.home });
   await installComponent({ home: b.home });
+  // A has an explicitly configured owner transport; B intentionally does not.
+  const goalConfigA = path.join(a.root, "goal-owner.json");
+  await writeFile(goalConfigA, JSON.stringify({
+    transport: "json-subprocess",
+    command: [process.execPath, path.resolve(here, "..", "fixtures", "fake-goal-owner.mjs")],
+    timeout_seconds: 10, max_output_bytes: 1048576, max_stderr_bytes: 65536,
+    env_names: [], cwd: a.root
+  }));
   const setupA = await setupComponent({
     home: a.home, system_root: a.root, host_config: a.hostConfig,
-    system_id: "system-a", runtime: "deterministic"
+    system_id: "system-a", runtime: "deterministic", goal_owner_config: goalConfigA
   });
   const setupB = await setupComponent({
     home: b.home, system_root: b.root, host_config: b.hostConfig,
@@ -256,17 +264,18 @@ test("two installed systems switch A→B→A without session, workspace or princ
   const userMessage = [{ role: "user", content: "system switch isolation" }];
   const requestA = { model: "aiverse", messages: userMessage, metadata: { workspace_id: "alpha", system_id: "system-b" } };
   const requestB = { model: "aiverse", messages: userMessage, metadata: { workspace_id: "beta", system_id: "system-a" } };
+  let runA, runB;
   try {
     const firstA = await postRun(urlA, setupA.api_token, requestA, "shared-client-retry");
     assert.equal(firstA.status, 202);
-    const runA = await firstA.json();
+    runA = await firstA.json();
     assert.equal(runA.system_id, "system-a", "client cannot retarget a configured Gateway");
     assert.equal(runA.workspace_id, "alpha");
     assert.equal(runA.principal, "operator");
 
     const switchedB = await postRun(urlB, setupB.api_token, requestB, "shared-client-retry");
     assert.equal(switchedB.status, 202);
-    const runB = await switchedB.json();
+    runB = await switchedB.json();
     assert.equal(runB.system_id, "system-b");
     assert.equal(runB.workspace_id, "beta");
     assert.notEqual(runB.run_id, runA.run_id, "separate canonical stores must not share run IDs");
@@ -301,8 +310,74 @@ test("two installed systems switch A→B→A without session, workspace or princ
     assert.equal(crossSystemRead.status, 404);
     const foreignSystemBearer = await fetch(`${urlA}/v1/runs/${runA.run_id}`, { headers: headers(setupB.api_token) });
     assert.equal(foreignSystemBearer.status, 401);
+
+    const onA = await postRun(urlA, setupA.api_token, {
+      model: "aiverse", messages: [{ role: "user", content: "evaluate owned goal" }],
+      metadata: { workspace_id: "alpha", goal_id: "goal_fixture", system_id: "system-b" }
+    });
+    assert.equal(onA.status, 202);
+    const goalA = await onA.json();
+    let ownerResult;
+    for (let n = 0; n < 150; n += 1) {
+      ownerResult = await (await fetch(`${urlA}/v1/runs/${goalA.run_id}`, { headers: headers(setupA.api_token) })).json();
+      if (["completed", "failed"].includes(ownerResult.status)) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(ownerResult.status, "completed", "only A's configured Goal owner evaluates its scoped Goal");
+    assert.deepEqual(ownerResult.goal_binding, { goal_id: "goal_fixture", version: 1, activation_epoch: 1 });
+    assert.equal(ownerResult.system_id, "system-a");
+    assert.equal(ownerResult.workspace_id, "alpha");
+
+    const onB = await postRun(urlB, setupB.api_token, {
+      model: "aiverse", messages: [{ role: "user", content: "evaluate other system's goal" }],
+      metadata: { workspace_id: "beta", goal_id: "goal_fixture", system_id: "system-a" }
+    });
+    assert.equal(onB.status, 202);
+    const goalB = await onB.json();
+    let absentOwner;
+    for (let n = 0; n < 150; n += 1) {
+      absentOwner = await (await fetch(`${urlB}/v1/runs/${goalB.run_id}`, { headers: headers(setupB.api_token) })).json();
+      if (["failed", "completed"].includes(absentOwner.status)) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(absentOwner.status, "failed", "B may not borrow A's Goal owner");
+    assert.equal(absentOwner.error.code, "GOAL_OWNER_UNAVAILABLE");
+    assert.equal(absentOwner.system_id, "system-b");
+    assert.equal(absentOwner.workspace_id, "beta");
+    const statusA = await (await fetch(`${urlA}/status`, { headers: headers(setupA.api_token) })).json();
+    const statusB = await (await fetch(`${urlB}/status`, { headers: headers(setupB.api_token) })).json();
+    assert.equal(statusA.goal_owner_configured, true);
+    assert.equal(statusB.goal_owner_configured, false);
   } finally {
     await liveA.close();
     await liveB.close();
+  }
+
+  // Cold-start both canonical homes without a new registry or cloned Goal truth.
+  const restartedA = await startServer(await loadConfig(a.home), a.home, { port: 0 });
+  const restartedB = await startServer(await loadConfig(b.home), b.home, { port: 0 });
+  try {
+    const baseA = `http://127.0.0.1:${restartedA.port}`;
+    const baseB = `http://127.0.0.1:${restartedB.port}`;
+    const replayA = await fetch(`${baseA}/v1/runs/${runA.run_id}`, { headers: headers(setupA.api_token) });
+    assert.equal(replayA.status, 200);
+    const recoveredA = await replayA.json();
+    assert.equal(recoveredA.system_id, "system-a");
+    assert.equal(recoveredA.workspace_id, "alpha");
+    assert.equal(recoveredA.principal, "operator");
+    const replayB = await fetch(`${baseB}/v1/runs/${runB.run_id}`, { headers: headers(setupB.api_token) });
+    assert.equal(replayB.status, 200);
+    assert.equal((await replayB.json()).system_id, "system-b");
+    assert.equal((await fetch(`${baseB}/v1/runs/${runA.run_id}`, { headers: headers(setupB.api_token) })).status, 404);
+    const resumedOwnerReplay = await postRun(baseA, setupA.api_token, requestA, "shared-client-retry");
+    assert.equal(resumedOwnerReplay.status, 202);
+    assert.equal((await resumedOwnerReplay.json()).run_id, runA.run_id);
+    const statusA = await (await fetch(`${baseA}/status`, { headers: headers(setupA.api_token) })).json();
+    const statusB = await (await fetch(`${baseB}/status`, { headers: headers(setupB.api_token) })).json();
+    assert.equal(statusA.goal_owner_configured, true);
+    assert.equal(statusB.goal_owner_configured, false);
+  } finally {
+    await restartedA.close();
+    await restartedB.close();
   }
 });
