@@ -365,9 +365,32 @@ async function controlRun(res, runId, action, body, identity, ctx) {
 
 async function sseRun(res, runId, store, origin) {
   res.writeHead(200, corsHeaders(origin, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" }));
-  for (const event of await store.listEvents(runId)) res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
-  const unsubscribe = store.subscribe(runId, (msg) => { if (msg.kind === "event") res.write(`event: ${msg.event.type}\ndata: ${JSON.stringify(msg.event)}\n\n`); });
-  res.on("close", unsubscribe);
+  // Subscribe *before* the async disk snapshot. A concurrent append must be
+  // visible in either replay or the buffered follow phase, never in neither.
+  const seen = new Set();
+  const pending = [];
+  let replaying = true;
+  let closed = false;
+  const send = (event) => {
+    if (closed || seen.has(event.event_id)) return;
+    seen.add(event.event_id);
+    res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+  };
+  const unsubscribe = store.subscribe(runId, (msg) => {
+    if (msg.kind !== "event" || closed) return;
+    if (replaying) pending.push(msg.event);
+    else send(msg.event);
+  });
+  res.on("close", () => { closed = true; unsubscribe(); });
+  try {
+    for (const event of await store.listEvents(runId)) send(event);
+    for (const event of pending) send(event);
+    replaying = false;
+  } catch (error) {
+    closed = true;
+    unsubscribe();
+    res.destroy(error);
+  }
 }
 function openAIChunk(run, content, finishReason = null) { return { id: `chatcmpl-${run.run_id}`, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: run.runtime?.model ?? "aiverse", choices: [{ index: 0, delta: content ? { content } : {}, finish_reason: finishReason }] }; }
 async function ownedRun(store, runId, principal) { const run = await store.getRun(runId); if (!run) throw new GatewayError("RUN_NOT_FOUND", "Run not found", 404); if (run.principal !== principal) throw new GatewayError("FORBIDDEN", "Principal does not own this run", 403); return run; }
