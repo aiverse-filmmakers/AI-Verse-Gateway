@@ -4,7 +4,8 @@ import { mkdtemp, writeFile, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { sha256 } from "../src/util.mjs";
+import { sha256, atomicJson } from "../src/util.mjs";
+import { hashToken } from "../src/auth.mjs";
 import { installComponent, setupComponent, doctorComponent, setEnabled, uninstallComponent, statusComponent, updateComponent } from "../src/lifecycle.mjs";
 import { loadConfig } from "../src/config.mjs";
 import { startServer } from "../src/server.mjs";
@@ -220,5 +221,88 @@ test("fast authenticated OpenAI SSE completes with a terminal marker and never b
     }
   } finally {
     await live.close();
+  }
+});
+
+test("two installed systems switch A→B→A without session, workspace or principal replay leakage", async () => {
+  const a = await fixture();
+  const b = await fixture();
+  await installComponent({ home: a.home });
+  await installComponent({ home: b.home });
+  const setupA = await setupComponent({
+    home: a.home, system_root: a.root, host_config: a.hostConfig,
+    system_id: "system-a", runtime: "deterministic"
+  });
+  const setupB = await setupComponent({
+    home: b.home, system_root: b.root, host_config: b.hostConfig,
+    system_id: "system-b", runtime: "deterministic"
+  });
+  const configA = await loadConfig(a.home);
+  const foreignToken = "second-principal-test-credential";
+  configA.auth.keys.push(hashToken(foreignToken, "foreign-principal"));
+  await atomicJson(path.join(a.home, "config.json"), configA);
+
+  const liveA = await startServer(await loadConfig(a.home), a.home, { port: 0 });
+  const liveB = await startServer(await loadConfig(b.home), b.home, { port: 0 });
+  const urlA = `http://127.0.0.1:${liveA.port}`;
+  const urlB = `http://127.0.0.1:${liveB.port}`;
+  const headers = (token, key) => ({
+    authorization: `Bearer ${token}`, "content-type": "application/json",
+    ...(key ? { "idempotency-key": key } : {})
+  });
+  const postRun = (base, token, body, key) => fetch(`${base}/v1/runs`, {
+    method: "POST", headers: headers(token, key), body: JSON.stringify(body)
+  });
+  const userMessage = [{ role: "user", content: "system switch isolation" }];
+  const requestA = { model: "aiverse", messages: userMessage, metadata: { workspace_id: "alpha", system_id: "system-b" } };
+  const requestB = { model: "aiverse", messages: userMessage, metadata: { workspace_id: "beta", system_id: "system-a" } };
+  try {
+    const firstA = await postRun(urlA, setupA.api_token, requestA, "shared-client-retry");
+    assert.equal(firstA.status, 202);
+    const runA = await firstA.json();
+    assert.equal(runA.system_id, "system-a", "client cannot retarget a configured Gateway");
+    assert.equal(runA.workspace_id, "alpha");
+    assert.equal(runA.principal, "operator");
+
+    const switchedB = await postRun(urlB, setupB.api_token, requestB, "shared-client-retry");
+    assert.equal(switchedB.status, 202);
+    const runB = await switchedB.json();
+    assert.equal(runB.system_id, "system-b");
+    assert.equal(runB.workspace_id, "beta");
+    assert.notEqual(runB.run_id, runA.run_id, "separate canonical stores must not share run IDs");
+
+    const backA = await postRun(urlA, setupA.api_token, {
+      model: "aiverse", messages: userMessage,
+      metadata: { session_id: runA.session_id, system_id: "system-b" }
+    }, "back-to-system-a");
+    assert.equal(backA.status, 202);
+    const returnA = await backA.json();
+    assert.equal(returnA.system_id, "system-a");
+    assert.equal(returnA.workspace_id, "alpha", "existing session retains canonical workspace on return");
+    assert.equal(returnA.session_id, runA.session_id);
+
+    const wrongWorkspace = await postRun(urlA, setupA.api_token, {
+      model: "aiverse", messages: userMessage,
+      metadata: { session_id: runA.session_id, workspace_id: "beta" }
+    });
+    assert.equal(wrongWorkspace.status, 409);
+    assert.equal((await wrongWorkspace.json()).error.code, "SESSION_BINDING_MISMATCH");
+
+    const foreignRun = await postRun(urlA, foreignToken, requestA, "shared-client-retry");
+    assert.equal(foreignRun.status, 409, "foreign principal cannot replay or read the owner's run using the same key");
+    assert.equal((await foreignRun.json()).error.code, "IDEMPOTENCY_CONFLICT");
+    const ownerReplay = await postRun(urlA, setupA.api_token, requestA, "shared-client-retry");
+    assert.equal(ownerReplay.status, 202);
+    assert.equal((await ownerReplay.json()).run_id, runA.run_id);
+
+    const foreignRead = await fetch(`${urlA}/v1/runs/${runA.run_id}`, { headers: headers(foreignToken) });
+    assert.equal(foreignRead.status, 403);
+    const crossSystemRead = await fetch(`${urlA}/v1/runs/${runB.run_id}`, { headers: headers(setupA.api_token) });
+    assert.equal(crossSystemRead.status, 404);
+    const foreignSystemBearer = await fetch(`${urlA}/v1/runs/${runA.run_id}`, { headers: headers(setupB.api_token) });
+    assert.equal(foreignSystemBearer.status, 401);
+  } finally {
+    await liveA.close();
+    await liveB.close();
   }
 });
