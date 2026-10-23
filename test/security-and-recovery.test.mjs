@@ -116,8 +116,8 @@ test("atomic rename survives twelve transient Windows holds beyond the old retry
   const home = await mkdtemp(path.join(os.tmpdir(), "avg-rename-extended-"));
   const target = path.join(home, "run.json");
   const temp = path.join(home, "run.json.writing.tmp");
-  await writeFile(target, '{"status":"previous"}\\n');
-  await writeFile(temp, '{"status":"completed","evidence":true}\\n');
+  await writeFile(target, '{"status":"previous"}\n');
+  await writeFile(temp, '{"status":"completed","evidence":true}\n');
   let attempts = 0;
   const waits = [];
   const codes = ["EPERM", "EACCES", "EBUSY"];
@@ -140,8 +140,8 @@ test("persistent transient rename failures stop after a finite budget and preser
   const home = await mkdtemp(path.join(os.tmpdir(), "avg-rename-bounded-"));
   const target = path.join(home, "run.json");
   const temp = path.join(home, "run.json.writing.tmp");
-  await writeFile(target, '{"status":"previous"}\\n');
-  await writeFile(temp, '{"status":"incoming"}\\n');
+  await writeFile(target, '{"status":"previous"}\n');
+  await writeFile(temp, '{"status":"incoming"}\n');
   let attempts = 0;
   let waits = 0;
   await assert.rejects(
