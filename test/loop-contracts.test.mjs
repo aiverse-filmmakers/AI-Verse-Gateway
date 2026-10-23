@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { installComponent, setupComponent } from "../src/lifecycle.mjs";
 import { loadConfig } from "../src/config.mjs";
 import { startServer } from "../src/server.mjs";
+import { hashToken } from "../src/auth.mjs";
 import { RunEngine } from "../src/run-engine.mjs";
 import { GatewayStore } from "../src/store.mjs";
 
@@ -44,7 +45,10 @@ test("approval interrupt reauthorizes before tool execution and resumes from che
     home: f.home, system_root: f.root, host_config: f.hostConfig,
     runtime: "json-subprocess", runtime_command: JSON.stringify([process.execPath, runtimeFixture])
   });
-  const live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+  const config = await loadConfig(f.home);
+  const foreignToken = "untrusted-control-caller-fixture";
+  config.auth.keys.push(hashToken(foreignToken, "different-principal"));
+  const live = await startServer(config, f.home, { port: 0 });
   const baseUrl = `http://127.0.0.1:${live.port}`;
   const headers = { authorization: `Bearer ${setup.api_token}`, "content-type": "application/json" };
   try {
@@ -70,11 +74,29 @@ test("approval interrupt reauthorizes before tool execution and resumes from che
       assert.equal((await unmodified.json()).status, "awaiting_approval", "bad decision must not consume approval");
     }
 
+    // Foreign principal must not reserve a real owner's future operation_id.
+    const noBearer = await fetch(approvalUrl, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ operation_id: "approve-1", decision: "approve" })
+    });
+    assert.equal(noBearer.status, 401);
+    const foreign = await fetch(approvalUrl, {
+      method: "POST",
+      headers: { authorization: `Bearer ${foreignToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ operation_id: "approve-1", decision: "approve" })
+    });
+    assert.equal(foreign.status, 403);
+    assert.equal((await foreign.json()).error.code, "FORBIDDEN");
+    const wrongMethod = await fetch(approvalUrl, { method: "GET", headers });
+    assert.equal(wrongMethod.status, 404);
+    const stillPending = await fetch(`${baseUrl}/v1/runs/${created.run_id}`, { headers });
+    assert.equal((await stillPending.json()).status, "awaiting_approval");
+
     const approved = await fetch(approvalUrl, {
       method: "POST", headers,
       body: JSON.stringify({ operation_id: "approve-1", decision: "approve" })
     });
-    assert.equal(approved.status, 200);
+    assert.equal(approved.status, 200, "foreign operation cannot poison owner idempotency");
     const done = await waitStatus(baseUrl, setup.api_token, created.run_id, ["completed"]);
     assert.equal(done.output.content, "approved tool completed");
     assert.equal(done.usage.actions, 1);
