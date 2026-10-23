@@ -38,7 +38,50 @@ async function fspReadJson(file){return JSON.parse(await readFile(file,"utf8"));
 async function waitStatus(baseUrl,token,runId,wanted,timeout=5000){const end=Date.now()+timeout;while(Date.now()<end){const r=await fetch(`${baseUrl}/v1/runs/${runId}`,{headers:{authorization:`Bearer ${token}`}});const body=await r.json();if(wanted.includes(body.status))return body;await new Promise(r=>setTimeout(r,25));}throw new Error(`timeout waiting for ${wanted}`);}
 async function waitOrganizationReview(home,runId,wanted=["completed","skipped"],timeout=5000){const end=Date.now()+timeout;while(Date.now()<end){const body=await fspReadJson(path.join(home,"state","runs",`${runId}.json`));if(wanted.includes(body.organization_review?.status))return body;await new Promise(r=>setTimeout(r,25));}throw new Error(`timeout waiting for organization review ${wanted}`);}
 
-test("approval interrupt reauthorizes before tool execution and resumes from checkpoint",async()=>{const f=await base();const setup=await setupComponent({home:f.home,system_root:f.root,host_config:f.hostConfig,runtime:"json-subprocess",runtime_command:JSON.stringify([process.execPath,runtimeFixture])});const live=await startServer(await loadConfig(f.home),f.home,{port:0});const baseUrl=`http://127.0.0.1:${live.port}`;try{const r=await fetch(`${baseUrl}/v1/runs`,{method:"POST",headers:{authorization:`Bearer ${setup.api_token}`,"content-type":"application/json"},body:JSON.stringify({model:"fixture",messages:[{role:"user",content:"use the fixture tool"}]})});assert.equal(r.status,202);const created=await r.json();const pending=await waitStatus(baseUrl,setup.api_token,created.run_id,["awaiting_approval"]);assert.equal(pending.pending_approval.authorization.approval_required,true);const approved=await fetch(`${baseUrl}/v1/runs/${created.run_id}/approval`,{method:"POST",headers:{authorization:`Bearer ${setup.api_token}`,"content-type":"application/json"},body:JSON.stringify({operation_id:"approve-1",decision:"approve"})});assert.equal(approved.status,200);const done=await waitStatus(baseUrl,setup.api_token,created.run_id,["completed"]);assert.equal(done.output.content,"approved tool completed");assert.equal(done.usage.actions,1);}finally{await live.close();}});
+test("approval interrupt reauthorizes before tool execution and resumes from checkpoint", async () => {
+  const f = await base();
+  const setup = await setupComponent({
+    home: f.home, system_root: f.root, host_config: f.hostConfig,
+    runtime: "json-subprocess", runtime_command: JSON.stringify([process.execPath, runtimeFixture])
+  });
+  const live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+  const baseUrl = `http://127.0.0.1:${live.port}`;
+  const headers = { authorization: `Bearer ${setup.api_token}`, "content-type": "application/json" };
+  try {
+    const createdResponse = await fetch(`${baseUrl}/v1/runs`, {
+      method: "POST", headers,
+      body: JSON.stringify({ model: "fixture", messages: [{ role: "user", content: "use the fixture tool" }] })
+    });
+    assert.equal(createdResponse.status, 202);
+    const created = await createdResponse.json();
+    const pending = await waitStatus(baseUrl, setup.api_token, created.run_id, ["awaiting_approval"]);
+    assert.equal(pending.pending_approval.authorization.approval_required, true);
+
+    const approvalUrl = `${baseUrl}/v1/runs/${created.run_id}/approval`;
+    for (const [index, decision] of [undefined, "", "maybe", { choice: "approve" }].entries()) {
+      const response = await fetch(approvalUrl, {
+        method: "POST", headers,
+        body: JSON.stringify({ operation_id: `invalid-approval-${index}`, ...(decision === undefined ? {} : { decision }) })
+      });
+      assert.equal(response.status, 400, "malformed approval must reject before any denial or authorization");
+      assert.equal((await response.json()).error.code, "APPROVAL_DECISION_INVALID");
+      const unmodified = await fetch(`${baseUrl}/v1/runs/${created.run_id}`, { headers });
+      assert.equal(unmodified.status, 200);
+      assert.equal((await unmodified.json()).status, "awaiting_approval", "bad decision must not consume approval");
+    }
+
+    const approved = await fetch(approvalUrl, {
+      method: "POST", headers,
+      body: JSON.stringify({ operation_id: "approve-1", decision: "approve" })
+    });
+    assert.equal(approved.status, 200);
+    const done = await waitStatus(baseUrl, setup.api_token, created.run_id, ["completed"]);
+    assert.equal(done.output.content, "approved tool completed");
+    assert.equal(done.usage.actions, 1);
+  } finally {
+    await live.close();
+  }
+});
 
 test("Goal-bound run reads and evaluates through Brain owner adapter without storing Goal truth",async()=>{const f=await base();const goalConfig=path.join(f.root,"goal-owner.json");await writeFile(goalConfig,JSON.stringify({transport:"json-subprocess",command:[process.execPath,goalFixture],timeout_seconds:10,max_output_bytes:1048576,max_stderr_bytes:65536,env_names:[],cwd:f.root}));const setup=await setupComponent({home:f.home,system_root:f.root,host_config:f.hostConfig,goal_owner_config:goalConfig,runtime:"deterministic"});const live=await startServer(await loadConfig(f.home),f.home,{port:0});const baseUrl=`http://127.0.0.1:${live.port}`;try{const r=await fetch(`${baseUrl}/v1/runs`,{method:"POST",headers:{authorization:`Bearer ${setup.api_token}`,"content-type":"application/json"},body:JSON.stringify({model:"aiverse",messages:[{role:"user",content:"finish goal"}],metadata:{workspace_id:"alpha",goal_id:"goal_fixture"}})});assert.equal(r.status,202);const created=await r.json();const done=await waitStatus(baseUrl,setup.api_token,created.run_id,["completed","failed"]);assert.equal(done.status,"completed");assert.deepEqual(done.goal_binding,{goal_id:"goal_fixture",version:1,activation_epoch:1});}finally{await live.close();}});
 

@@ -341,6 +341,9 @@ function secretLikeWake(value) {
 }
 
 async function controlRun(res, runId, action, body, identity, ctx) {
+  if (action === "approval" && !["approve", "deny"].includes(body?.decision)) {
+    throw new GatewayError("APPROVAL_DECISION_INVALID", "Approval decision must be approve or deny");
+  }
   const operationId = String(body.operation_id ?? id("op"));
   const payload = { run_id: runId, action, operation_id: operationId, decision: body.decision ?? null, reason: body.reason ?? null };
   const idem = await ctx.store.claimIdempotency(`control:${runId}`, operationId, payload);
