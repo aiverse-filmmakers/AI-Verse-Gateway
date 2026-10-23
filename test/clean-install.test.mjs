@@ -189,3 +189,36 @@ test("ordinary chat remains usable while unconfigured Brain Goal continuation fa
     await live.close();
   }
 });
+
+test("fast authenticated OpenAI SSE completes with a terminal marker and never bypasses Origin", async () => {
+  const f = await fixture();
+  await installComponent({ home: f.home });
+  const setup = await setupComponent({
+    home: f.home, system_root: f.root, host_config: f.hostConfig, runtime: "deterministic"
+  });
+  const live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+  const endpoint = `http://127.0.0.1:${live.port}/v1/chat/completions`;
+  const payload = JSON.stringify({ model: "aiverse", stream: true, messages: [{ role: "user", content: "stream exact answer" }] });
+  const headers = { authorization: `Bearer ${setup.api_token}`, "content-type": "application/json" };
+  try {
+    const missingAuth = await fetch(endpoint, { method: "POST", headers: { "content-type": "application/json" }, body: payload });
+    assert.equal(missingAuth.status, 401);
+    const forbiddenOrigin = await fetch(endpoint, { method: "POST", headers: { ...headers, origin: "https://not-allowed.example" }, body: payload });
+    assert.equal(forbiddenOrigin.status, 403);
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const response = await fetch(endpoint, { method: "POST", headers, body: payload, signal: AbortSignal.timeout(10000) });
+      assert.equal(response.status, 200);
+      assert.match(response.headers.get("content-type") ?? "", /text\/event-stream/);
+      const streamText = await response.text();
+      assert.ok(streamText.includes("data: [DONE]"), "even a fast completed run must terminate SSE instead of hanging");
+      const chunks = streamText.split(/\r?\n/).filter((line) => line.startsWith("data: ") && line !== "data: [DONE]")
+        .map((line) => JSON.parse(line.slice("data: ".length)));
+      assert.ok(chunks.length >= 2, "expected text and terminal chunks");
+      assert.equal(chunks.every((chunk) => chunk.object === "chat.completion.chunk"), true);
+      assert.ok(chunks.some((chunk) => chunk.choices[0].delta.content?.includes("stream exact answer")));
+      assert.ok(chunks.some((chunk) => chunk.choices[0].finish_reason === "stop"));
+    }
+  } finally {
+    await live.close();
+  }
+});
