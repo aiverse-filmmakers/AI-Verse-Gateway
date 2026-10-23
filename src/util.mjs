@@ -4,6 +4,9 @@ import path from "node:path";
 
 const fileWriteTails = new Map();
 const TRANSIENT_RENAME_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
+// Windows antivirus/indexing/handle contention may outlast the previous ~1s window.
+// Keep retries finite (~4.8s max scheduled delay) and never delete the prior destination.
+const TRANSIENT_RENAME_MAX_ATTEMPTS = 20;
 
 export function nowIso() { return new Date().toISOString(); }
 export function id(prefix) { return `${prefix}_${randomUUID().replaceAll("-", "")}`; }
@@ -90,7 +93,7 @@ export async function renameWithTransientRetry(source, destination, { renameFile
       await renameFile(source, destination);
       return;
     } catch (error) {
-      if (!TRANSIENT_RENAME_CODES.has(error?.code) || attempt >= 7) throw error;
+      if (!TRANSIENT_RENAME_CODES.has(error?.code) || attempt >= TRANSIENT_RENAME_MAX_ATTEMPTS - 1) throw error;
       await delay(Math.min(10 * (2 ** attempt), 320));
     }
   }
