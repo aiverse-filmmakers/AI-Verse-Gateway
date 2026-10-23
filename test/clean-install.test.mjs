@@ -264,17 +264,18 @@ test("two installed systems switch A→B→A without session, workspace or princ
   const userMessage = [{ role: "user", content: "system switch isolation" }];
   const requestA = { model: "aiverse", messages: userMessage, metadata: { workspace_id: "alpha", system_id: "system-b" } };
   const requestB = { model: "aiverse", messages: userMessage, metadata: { workspace_id: "beta", system_id: "system-a" } };
+  let runA, runB;
   try {
     const firstA = await postRun(urlA, setupA.api_token, requestA, "shared-client-retry");
     assert.equal(firstA.status, 202);
-    const runA = await firstA.json();
+    runA = await firstA.json();
     assert.equal(runA.system_id, "system-a", "client cannot retarget a configured Gateway");
     assert.equal(runA.workspace_id, "alpha");
     assert.equal(runA.principal, "operator");
 
     const switchedB = await postRun(urlB, setupB.api_token, requestB, "shared-client-retry");
     assert.equal(switchedB.status, 202);
-    const runB = await switchedB.json();
+    runB = await switchedB.json();
     assert.equal(runB.system_id, "system-b");
     assert.equal(runB.workspace_id, "beta");
     assert.notEqual(runB.run_id, runA.run_id, "separate canonical stores must not share run IDs");
