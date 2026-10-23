@@ -1,13 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readdir } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, writeFile, rename } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { GatewayStore } from "../src/store.mjs";
 import { hashToken, verifyToken, verifyTokenAsync } from "../src/auth.mjs";
 import { PreAuthAdmission, RateLimiter, requestPeerKey } from "../src/server.mjs";
 import { GatewayError } from "../src/errors.mjs";
-import { atomicJson, readJson } from "../src/util.mjs";
+import { atomicJson, readJson, renameWithTransientRetry } from "../src/util.mjs";
 import { RunEngine } from "../src/run-engine.mjs";
 
 test("auth stores a one-way scrypt verifier", () => { const token="secret-fixture";const record=hashToken(token,"operator");assert.equal(record.hash.includes(token),false);assert.equal(verifyToken(token,record),true);assert.equal(verifyToken("wrong",record),false); });
@@ -64,6 +64,52 @@ test("atomic JSON replacement serializes same-file writers and leaves one valid 
   assert.ok(saved.sequence >= 0 && saved.sequence < 48);
   const names = await readdir(path.dirname(file));
   assert.deepEqual(names.filter((name) => name.endsWith(".tmp")), []);
+});
+
+test("atomic rename retries the existing seven transient EPERM windows without losing run state", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "avg-rename-characterization-"));
+  const runFile = path.join(home, "run.json");
+  const tempFile = path.join(home, "run.tmp");
+  await writeFile(runFile, '{"status":"previous"}\n');
+  await writeFile(tempFile, '{"status":"completed"}\n');
+  const waits = [];
+  let calls = 0;
+  await renameWithTransientRetry(tempFile, runFile, {
+    renameFile: async (src, dest) => {
+      calls += 1;
+      if (calls <= 7) throw Object.assign(new Error("Windows destination held open"), { code: "EPERM" });
+      await rename(src, dest);
+    },
+    delay: async (ms) => { waits.push(ms); }
+  });
+  assert.equal(calls, 8, "original policy permits seven retries plus first attempt");
+  assert.deepEqual(waits, [10, 20, 40, 80, 160, 320, 320]);
+  assert.deepEqual(JSON.parse(await readFile(runFile, "utf8")), { status: "completed" });
+  assert.deepEqual((await readdir(home)).filter((name) => name.endsWith(".tmp")), []);
+});
+
+test("atomic rename never retries non-transient filesystem errors or damages existing run state", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "avg-rename-reject-"));
+  const runFile = path.join(home, "run.json");
+  const tempFile = path.join(home, "run.tmp");
+  await writeFile(runFile, '{"status":"previous"}\n');
+  await writeFile(tempFile, '{"status":"incoming"}\n');
+  let attempts = 0;
+  let waits = 0;
+  await assert.rejects(
+    renameWithTransientRetry(tempFile, runFile, {
+      renameFile: async () => {
+        attempts += 1;
+        throw Object.assign(new Error("permission intentionally denied"), { code: "EIO" });
+      },
+      delay: async () => { waits += 1; }
+    }),
+    (error) => error?.code === "EIO"
+  );
+  assert.equal(attempts, 1);
+  assert.equal(waits, 0);
+  assert.deepEqual(JSON.parse(await readFile(runFile, "utf8")), { status: "previous" });
+  assert.deepEqual(JSON.parse(await readFile(tempFile, "utf8")), { status: "incoming" });
 });
 
 test("idempotency rejects same operation id with changed payload", async()=>{const home=await mkdtemp(path.join(os.tmpdir(),"avg-store-"));const store=new GatewayStore(home);await store.init();await store.claimIdempotency("run","same",{a:1});await assert.rejects(()=>store.claimIdempotency("run","same",{a:2}),e=>e instanceof GatewayError&&e.code==="IDEMPOTENCY_CONFLICT");});
