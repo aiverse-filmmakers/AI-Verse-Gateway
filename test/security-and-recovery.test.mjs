@@ -183,6 +183,105 @@ test("idempotency rejects same operation id with changed payload", async()=>{con
 
 test("restart recovery pauses in-flight run instead of claiming provider resume", async()=>{const home=await mkdtemp(path.join(os.tmpdir(),"avg-recover-"));const store=new GatewayStore(home);await store.init();const run=await store.createRun({session_id:"sess_x",system_id:"local",workspace_id:"operator",principal:"operator",runtime:{kind:"deterministic"},messages:[{role:"user",content:"x"}],max_turns:1,budget:{max_actions:1},deadline_at:new Date(Date.now()+60000).toISOString()});run.status="running";await store.saveRun(run);const changed=await store.recoverInterrupted();assert.deepEqual(changed,[run.run_id]);assert.equal((await store.getRun(run.run_id)).status,"paused_recovery_required");});
 
+
+test("cold recovery preserves approval waits, raw event history and canonical run after an abandoned partial-write temp", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "avg-cold-recover-"));
+  const store = new GatewayStore(home);
+  await store.init();
+  const newRun = async (suffix) => await store.createRun({
+    session_id: `sess_${suffix}`, system_id: "system-a", workspace_id: "alpha", principal: "operator",
+    runtime: { kind: "deterministic" }, messages: [{ role: "user", content: `raw-history-${suffix}` }],
+    max_turns: 2, budget: { max_actions: 1 }, deadline_at: new Date(Date.now() + 60000).toISOString()
+  });
+
+  const running = await newRun("running");
+  running.status = "running";
+  running.checkpoint = { phase: "awaiting_model" };
+  await store.saveRun(running);
+  const beforeRestart = await store.getRun(running.run_id);
+  const record = await store.event(running.run_id, "assistant.delta", { text: "raw-before-restart" });
+  const count = 192;
+  for (let i = 0; i < count; i += 1) {
+    await store.event(running.run_id, "history.raw", { ordinal: i });
+  }
+
+  const pending = await newRun("approval");
+  pending.status = "awaiting_approval";
+  pending.pending_approval = {
+    tool_call_id: "tool_approval", request: { operation: "needs.approval" },
+    authorization: { decision: "approval_required", approval_required: true }
+  };
+  await store.saveRun(pending);
+  const pendingVersion = pending.revision;
+
+  const complete = await newRun("complete");
+  complete.status = "completed";
+  complete.output = { content: "canonical completed result" };
+  complete.completed_at = new Date().toISOString();
+  await store.saveRun(complete);
+  const completeVersion = complete.revision;
+
+  // A process crash may leave a half-written temporary sibling. Never parse it
+  // as the canonical run or convert it to a new state.
+  const abandoned = `${store.runFile(running.run_id)}.abandoned.tmp`;
+  await writeFile(abandoned, '{"status":"completed","output":', "utf8");
+
+  const restarted = new GatewayStore(home);
+  await restarted.init();
+  assert.deepEqual(await restarted.recoverInterrupted(), [running.run_id]);
+  const recovered = await restarted.getRun(running.run_id);
+  assert.equal(recovered.status, "paused_recovery_required");
+  assert.equal(recovered.checkpoint.reason, "gateway_restart");
+  assert.equal(recovered.output, null);
+  assert.equal(recovered.system_id, "system-a");
+  assert.equal(recovered.workspace_id, "alpha");
+  assert.equal(recovered.principal, "operator");
+  assert.ok(recovered.revision > beforeRestart.revision);
+  assert.equal((await restarted.getRun(pending.run_id)).status, "awaiting_approval");
+  assert.equal((await restarted.getRun(pending.run_id)).revision, pendingVersion);
+  assert.deepEqual((await restarted.getRun(pending.run_id)).pending_approval, pending.pending_approval);
+  assert.equal((await restarted.getRun(complete.run_id)).revision, completeVersion);
+  assert.deepEqual((await restarted.getRun(complete.run_id)).output, complete.output);
+  assert.equal(await readFile(abandoned, "utf8"), '{"status":"completed","output":');
+
+  const events = await restarted.listEvents(running.run_id);
+  assert.equal(events.length, count + 3, "run.created + raw content + 192 history + recovery marker");
+  assert.equal(events.find((event) => event.event_id === record.event_id)?.data.text, "raw-before-restart");
+  assert.deepEqual(events.filter((event) => event.type === "history.raw").map((event) => event.data.ordinal),
+    Array.from({ length: count }, (_, i) => i));
+  assert.equal(events.filter((event) => event.type === "run.recovery_required").length, 1);
+
+  // A stale provider process must never overwrite the recovered checkpoint.
+  beforeRestart.status = "completed";
+  beforeRestart.output = { content: "stale provider continuation" };
+  await assert.rejects(() => restarted.saveRun(beforeRestart),
+    (error) => error instanceof GatewayError && error.code === "RUN_REVISION_CONFLICT");
+  assert.equal((await restarted.getRun(running.run_id)).status, "paused_recovery_required");
+  assert.deepEqual(await restarted.recoverInterrupted(), [], "recovery does not repeat its own transition");
+});
+
+test("run idempotency from pre-principal payload fails closed after upgrade and preserves original receipt", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "avg-idem-upgrade-"));
+  const first = new GatewayStore(home);
+  await first.init();
+  const oldPayload = {
+    system_id: "system-a", workspace_id: "alpha", requested_session_id: null,
+    messages: [{ role: "user", content: "same content" }], goal_id: null, model: "aiverse",
+    context_policy: { cache_sensitive: false }
+  };
+  const claim = await first.claimIdempotency("run", "pre-owner-version", oldPayload);
+  assert.equal(claim.state, "new");
+  await first.commitIdempotency(claim.mapKey, { run_id: "run_original" });
+  const reloaded = new GatewayStore(home);
+  await reloaded.init();
+  const newPayload = { principal: "operator", ...oldPayload };
+  await assert.rejects(() => reloaded.claimIdempotency("run", "pre-owner-version", newPayload),
+    (error) => error instanceof GatewayError && error.code === "IDEMPOTENCY_CONFLICT");
+  const legacyReplay = await reloaded.claimIdempotency("run", "pre-owner-version", oldPayload);
+  assert.equal(legacyReplay.state, "replay");
+  assert.equal(legacyReplay.record.result.run_id, "run_original", "upgrade cannot silently reassign the old receipt");
+});
+
 test("storage rejects caller-controlled path-like session ids", async()=>{const home=await mkdtemp(path.join(os.tmpdir(),"avg-id-"));const store=new GatewayStore(home);await store.init();await assert.rejects(()=>store.createSession({system_id:"local",workspace_id:"operator",principal:"operator",session_id:"../../escape"}),e=>e instanceof GatewayError&&e.code==="INVALID_ID");});
 
 test("serve-time host override cannot bypass loopback security policy", async()=>{
