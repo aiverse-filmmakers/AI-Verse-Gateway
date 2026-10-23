@@ -187,7 +187,9 @@ async function createRun(req, body, identity, ctx) {
   workspace = String(workspace);
   if (!/^(operator|[a-z0-9][a-z0-9-]{0,127})$/.test(workspace)) throw new GatewayError("WORKSPACE_INVALID", "Invalid workspace binding");
   const contextPolicy = { cache_sensitive: body?.metadata?.cache_sensitive_context === true };
-  const payload = { system_id: systemId, workspace_id: workspace, requested_session_id: requestedSessionId, messages: body.messages, goal_id: body?.metadata?.goal_id ?? null, model: body.model ?? null, context_policy: contextPolicy };
+  // Bind the canonical authenticated principal into run idempotency. A different
+  // principal must not replay another caller\x27s run metadata with the same client key.
+  const payload = { principal: identity.principal, system_id: systemId, workspace_id: workspace, requested_session_id: requestedSessionId, messages: body.messages, goal_id: body?.metadata?.goal_id ?? null, model: body.model ?? null, context_policy: contextPolicy };
   const idemKey = req.headers["idempotency-key"];
   const idem = await ctx.store.claimIdempotency("run", typeof idemKey === "string" ? idemKey : null, payload);
   if (idem.state === "replay" && idem.record.result?.run_id) {
