@@ -381,3 +381,62 @@ test("two installed systems switch A→B→A without session, workspace or princ
     await restartedB.close();
   }
 });
+
+test("event SSE bridges snapshot replay to live subscription without dropping or duplicating interleaved events", async () => {
+  const f = await fixture();
+  await installComponent({ home: f.home });
+  const setup = await setupComponent({ home: f.home, system_root: f.root, host_config: f.hostConfig, runtime: "deterministic" });
+  const live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+  const origin = `http://127.0.0.1:${live.port}`;
+  const headers = { authorization: `Bearer ${setup.api_token}`, "content-type": "application/json" };
+  try {
+    const created = await fetch(`${origin}/v1/runs`, {
+      method: "POST", headers, body: JSON.stringify({ model: "aiverse", messages: [{ role: "user", content: "SSE replay race fixture" }] })
+    });
+    assert.equal(created.status, 202);
+    const { run_id: runId } = await created.json();
+    // Keep a fixed, persisted event visible to snapshot and to buffered live
+    // notifications; it must still appear once, not twice.
+    let interleaved = false;
+    let both;
+    const listEvents = live.store.listEvents.bind(live.store);
+    live.store.listEvents = async (id) => {
+      if (id !== runId || interleaved) return listEvents(id);
+      interleaved = true;
+      const beforeSnapshot = await live.store.event(runId, "test.snapshot_overlap", { mark: "both" });
+      const snapshot = await listEvents(id);
+      const afterSnapshot = await live.store.event(runId, "test.after_snapshot", { mark: "buffered" });
+      both = { beforeSnapshot, afterSnapshot };
+      return snapshot;
+    };
+    const response = await fetch(`${origin}/v1/runs/${runId}/events`, {
+      headers: { authorization: headers.authorization }, signal: AbortSignal.timeout(10000)
+    });
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("content-type") ?? "", /text\/event-stream/);
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let received = "";
+    try {
+      while (!received.includes('event: test.after_snapshot') || !received.includes('event: test.snapshot_overlap')) {
+        const { done, value } = await reader.read();
+        assert.equal(done, false, "SSE must deliver events injected during snapshot-to-live boundary");
+        received += decoder.decode(value, { stream: true });
+        assert.ok(received.length < 250000, "fixture stream remains bounded");
+      }
+      const envelopes = received.split("\n\n").filter((part) => part.includes("data: "))
+        .map((part) => JSON.parse(part.split("\n").find((line) => line.startsWith("data: ")).slice(6)));
+      assert.ok(both, "test must exercise the interleaved snapshot hook");
+      assert.equal(envelopes.filter((event) => event.event_id === both.beforeSnapshot.event_id).length, 1,
+        "an event in both snapshot and live queue is delivered exactly once");
+      assert.equal(envelopes.filter((event) => event.event_id === both.afterSnapshot.event_id).length, 1,
+        "an event after snapshot must be delivered from live buffer exactly once");
+      const order = envelopes.map((event) => event.event_id);
+      assert.ok(order.indexOf(both.beforeSnapshot.event_id) < order.indexOf(both.afterSnapshot.event_id));
+    } finally {
+      await reader.cancel();
+    }
+  } finally {
+    await live.close();
+  }
+});
