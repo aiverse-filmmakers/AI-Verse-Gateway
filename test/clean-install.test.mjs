@@ -127,3 +127,65 @@ test("canonical /v1 run caller retains scope, replays safely and exposes authent
     await live.close();
   }
 });
+
+test("ordinary chat remains usable while unconfigured Brain Goal continuation fails closed", async () => {
+  const f = await fixture();
+  await installComponent({ home: f.home });
+  const setup = await setupComponent({
+    home: f.home, system_root: f.root, host_config: f.hostConfig, runtime: "deterministic"
+  });
+  const live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+  const base = `http://127.0.0.1:${live.port}`;
+  const headers = { authorization: `Bearer ${setup.api_token}`, "content-type": "application/json" };
+  try {
+    const statusResponse = await fetch(`${base}/status`, { headers });
+    assert.equal(statusResponse.status, 200);
+    const status = await statusResponse.json();
+    assert.equal(status.state, "ready");
+    assert.equal(status.goal_owner_configured, false, "Goal configured means config presence, not model readiness");
+
+    const chat = await fetch(`${base}/v1/chat/completions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ model: "aiverse", messages: [{ role: "user", content: "hello without a Goal" }] })
+    });
+    assert.equal(chat.status, 200, "ordinary non-Goal chat does not depend on Brain Goal transport");
+    assert.match((await chat.json()).choices[0].message.content, /hello without a Goal/);
+
+    const goal = await fetch(`${base}/v1/runs`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "aiverse",
+        messages: [{ role: "user", content: "continue this Goal" }],
+        metadata: { goal_id: "goal_without_owner", workspace_id: "operator", system_id: "forged-system" }
+      })
+    });
+    assert.equal(goal.status, 202);
+    const created = await goal.json();
+    assert.equal(created.system_id, "local", "caller-supplied system_id cannot retarget the Gateway");
+    assert.equal(created.workspace_id, "operator");
+
+    let finalRun;
+    const deadline = Date.now() + 7000;
+    do {
+      const response = await fetch(`${base}/v1/runs/${created.run_id}`, { headers });
+      assert.equal(response.status, 200);
+      finalRun = await response.json();
+      if (finalRun.status === "failed") break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    } while (Date.now() < deadline);
+
+    assert.equal(finalRun.status, "failed", "no Goal transport never becomes an invented completed run");
+    assert.equal(finalRun.error.code, "GOAL_OWNER_UNAVAILABLE");
+    assert.match(finalRun.error.message, /Brain Goal owner adapter is not configured/);
+    assert.equal(finalRun.system_id, "local");
+    const rawEvents = await readFile(path.join(f.home, "state", "events", `${created.run_id}.ndjson`), "utf8");
+    const events = rawEvents.trim().split(/\r?\n/).map((line) => JSON.parse(line));
+    assert.ok(events.some((event) => event.type === "run.failed" && event.data.code === "GOAL_OWNER_UNAVAILABLE"));
+    assert.equal(events.some((event) => ["assistant.delta", "goal.evaluated", "approval.required"].includes(event.type)), false,
+      "unconfigured Brain Goal owner must fail before model or owner-effect continuation");
+  } finally {
+    await live.close();
+  }
+});
