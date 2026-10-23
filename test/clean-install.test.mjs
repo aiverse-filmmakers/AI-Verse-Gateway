@@ -55,3 +55,75 @@ test("clean install -> setup -> doctor -> OpenAI chat -> disable/enable -> unins
   const idemRecord = path.join(f.home, "state", "idempotency", "records", sha256(idemKey).slice(0, 2), `${sha256(idemKey)}.json`);
   assert.match(await readFile(idemRecord, "utf8"), /clean-1/);
 });
+
+test("canonical /v1 run caller retains scope, replays safely and exposes authenticated events", async () => {
+  const f = await fixture();
+  await installComponent({ home: f.home });
+  const setup = await setupComponent({
+    home: f.home, system_root: f.root, host_config: f.hostConfig, runtime: "deterministic"
+  });
+  const live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+  const base = `http://127.0.0.1:${live.port}`;
+  const token = setup.api_token;
+  const headers = {
+    authorization: `Bearer ${token}`,
+    "content-type": "application/json",
+    "idempotency-key": "consumer-run-1"
+  };
+  const request = { model: "aiverse", messages: [{ role: "user", content: "bounded smoke" }], metadata: { workspace_id: "operator" } };
+  const post = (body) => fetch(`${base}/v1/runs`, { method: "POST", headers, body: JSON.stringify(body) });
+  try {
+    const models = await fetch(`${base}/v1/models`, { headers: { authorization: headers.authorization } });
+    assert.equal(models.status, 200);
+    assert.equal((await models.json()).data[0].id, "aiverse");
+
+    const created = await post(request);
+    assert.equal(created.status, 202);
+    const run = await created.json();
+    assert.match(run.run_id, /^run_/);
+    assert.equal(run.system_id, "local");
+    assert.equal(run.workspace_id, "operator");
+    assert.equal(Object.hasOwn(run, "messages"), false, "run metadata never exposes transcript bodies");
+
+    const replay = await post(request);
+    assert.equal(replay.status, 202);
+    assert.equal((await replay.json()).run_id, run.run_id, "identical HTTP retry cannot create another run");
+
+    const scopeChange = await post({ ...request, metadata: { workspace_id: "different" } });
+    assert.equal(scopeChange.status, 409, "reusing operation identity for another workspace fails closed");
+    assert.equal((await scopeChange.json()).error.code, "IDEMPOTENCY_CONFLICT");
+
+    const noBearer = await fetch(`${base}/v1/runs/${run.run_id}`);
+    assert.equal(noBearer.status, 401);
+    const scoped = await fetch(`${base}/v1/runs/${run.run_id}`, {
+      headers: { authorization: headers.authorization }
+    });
+    assert.equal(scoped.status, 200);
+    const lookedUp = await scoped.json();
+    assert.equal(lookedUp.run_id, run.run_id);
+    assert.equal(lookedUp.system_id, "local");
+    assert.equal(lookedUp.workspace_id, "operator");
+    assert.equal(Object.hasOwn(lookedUp, "messages"), false);
+
+    const eventRes = await fetch(`${base}/v1/runs/${run.run_id}/events`, {
+      headers: { authorization: headers.authorization },
+      signal: AbortSignal.timeout(5000)
+    });
+    assert.equal(eventRes.status, 200);
+    assert.match(eventRes.headers.get("content-type") ?? "", /text\/event-stream/);
+    const reader = eventRes.body.getReader();
+    try {
+      const first = await reader.read();
+      assert.equal(first.done, false, "event SSE replays already-persisted run events");
+      const data = new TextDecoder().decode(first.value);
+      assert.match(data, /event: run\.started/);
+      assert.ok(data.includes(run.run_id), "event data is bound to the requested run");
+    } finally {
+      await reader.cancel();
+    }
+    const forbiddenEvents = await fetch(`${base}/v1/runs/${run.run_id}/events`);
+    assert.equal(forbiddenEvents.status, 401, "run event stream is not public");
+  } finally {
+    await live.close();
+  }
+});
