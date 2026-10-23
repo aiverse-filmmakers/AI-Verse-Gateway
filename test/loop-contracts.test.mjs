@@ -8,6 +8,7 @@ import { installComponent, setupComponent } from "../src/lifecycle.mjs";
 import { loadConfig } from "../src/config.mjs";
 import { startServer } from "../src/server.mjs";
 import { hashToken } from "../src/auth.mjs";
+import { atomicJson } from "../src/util.mjs";
 import { RunEngine } from "../src/run-engine.mjs";
 import { GatewayStore } from "../src/store.mjs";
 
@@ -48,7 +49,9 @@ test("approval interrupt reauthorizes before tool execution and resumes from che
   const config = await loadConfig(f.home);
   const foreignToken = "untrusted-control-caller-fixture";
   config.auth.keys.push(hashToken(foreignToken, "different-principal"));
-  const live = await startServer(config, f.home, { port: 0 });
+  // startServer honors authoritative disk config rather than mutable caller input.
+  await atomicJson(path.join(f.home, "config.json"), config);
+  const live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
   const baseUrl = `http://127.0.0.1:${live.port}`;
   const headers = { authorization: `Bearer ${setup.api_token}`, "content-type": "application/json" };
   try {
