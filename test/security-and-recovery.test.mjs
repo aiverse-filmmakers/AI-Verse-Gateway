@@ -112,6 +112,73 @@ test("atomic rename never retries non-transient filesystem errors or damages exi
   assert.deepEqual(JSON.parse(await readFile(tempFile, "utf8")), { status: "incoming" });
 });
 
+test("atomic rename survives twelve transient Windows holds beyond the old retry limit", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "avg-rename-extended-"));
+  const target = path.join(home, "run.json");
+  const temp = path.join(home, "run.json.writing.tmp");
+  await writeFile(target, '{"status":"previous"}\\n');
+  await writeFile(temp, '{"status":"completed","evidence":true}\\n');
+  let attempts = 0;
+  const waits = [];
+  const codes = ["EPERM", "EACCES", "EBUSY"];
+  await renameWithTransientRetry(temp, target, {
+    renameFile: async (src, dest) => {
+      attempts += 1;
+      if (attempts <= 12) throw Object.assign(new Error("transient Windows lock"), { code: codes[(attempts - 1) % 3] });
+      await rename(src, dest);
+    },
+    delay: async (ms) => { waits.push(ms); }
+  });
+  assert.equal(attempts, 13, "repeated Windows contention must outlive the original eight-attempt limit");
+  assert.equal(waits.length, 12);
+  assert.ok(waits.every((ms) => ms >= 10 && ms <= 320));
+  assert.deepEqual(JSON.parse(await readFile(target, "utf8")), { status: "completed", evidence: true });
+  assert.deepEqual((await readdir(home)).filter((name) => name.endsWith(".tmp")), []);
+});
+
+test("persistent transient rename failures stop after a finite budget and preserve the old checkpoint", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "avg-rename-bounded-"));
+  const target = path.join(home, "run.json");
+  const temp = path.join(home, "run.json.writing.tmp");
+  await writeFile(target, '{"status":"previous"}\\n');
+  await writeFile(temp, '{"status":"incoming"}\\n');
+  let attempts = 0;
+  let waits = 0;
+  await assert.rejects(
+    renameWithTransientRetry(temp, target, {
+      renameFile: async () => {
+        attempts += 1;
+        throw Object.assign(new Error("target remains held"), { code: "EPERM" });
+      },
+      delay: async (ms) => {
+        waits += 1;
+        assert.ok(ms <= 320);
+      }
+    }),
+    (error) => error?.code === "EPERM"
+  );
+  assert.equal(attempts, 20, "bounded retry policy must eventually return control to the caller");
+  assert.equal(waits, 19);
+  assert.deepEqual(JSON.parse(await readFile(target, "utf8")), { status: "previous" });
+  assert.deepEqual(JSON.parse(await readFile(temp, "utf8")), { status: "incoming" });
+});
+
+test("atomic state writes from two isolated system roots remain independent", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "avg-rename-two-systems-"));
+  const systems = ["system-a", "system-b"];
+  const targets = systems.map((systemId) => path.join(home, systemId, "state", "runs", "run.json"));
+  await Promise.all(targets.flatMap((target, sys) =>
+    Array.from({ length: 24 }, (_, seq) => atomicJson(target, { system_id: systems[sys], seq }))
+  ));
+  for (const [i, target] of targets.entries()) {
+    const saved = await readJson(target);
+    assert.equal(saved.system_id, systems[i]);
+    assert.ok(Number.isInteger(saved.seq) && saved.seq >= 0 && saved.seq < 24);
+    const names = await readdir(path.dirname(target));
+    assert.deepEqual(names.filter((name) => name.endsWith(".tmp")), []);
+  }
+});
+
 test("idempotency rejects same operation id with changed payload", async()=>{const home=await mkdtemp(path.join(os.tmpdir(),"avg-store-"));const store=new GatewayStore(home);await store.init();await store.claimIdempotency("run","same",{a:1});await assert.rejects(()=>store.claimIdempotency("run","same",{a:2}),e=>e instanceof GatewayError&&e.code==="IDEMPOTENCY_CONFLICT");});
 
 test("restart recovery pauses in-flight run instead of claiming provider resume", async()=>{const home=await mkdtemp(path.join(os.tmpdir(),"avg-recover-"));const store=new GatewayStore(home);await store.init();const run=await store.createRun({session_id:"sess_x",system_id:"local",workspace_id:"operator",principal:"operator",runtime:{kind:"deterministic"},messages:[{role:"user",content:"x"}],max_turns:1,budget:{max_actions:1},deadline_at:new Date(Date.now()+60000).toISOString()});run.status="running";await store.saveRun(run);const changed=await store.recoverInterrupted();assert.deepEqual(changed,[run.run_id]);assert.equal((await store.getRun(run.run_id)).status,"paused_recovery_required");});
