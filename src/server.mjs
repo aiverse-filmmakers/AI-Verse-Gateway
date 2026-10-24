@@ -365,27 +365,62 @@ async function controlRun(res, runId, action, body, identity, ctx) {
 
 async function sseRun(res, runId, store, origin) {
   res.writeHead(200, corsHeaders(origin, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" }));
-  // Subscribe *before* the async disk snapshot. A concurrent append must be
-  // visible in either replay or the buffered follow phase, never in neither.
-  const seen = new Set();
+  const MAX_PENDING = 256;
+  const RECENT_IDS = 512;
   const pending = [];
-  let replaying = true;
-  let closed = false;
-  const send = (event) => {
-    if (closed || seen.has(event.event_id)) return;
-    seen.add(event.event_id);
-    res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+  const pendingIds = new Set();
+  const overlap = new Set();
+  const recent = new Set();
+  const recentOrder = [];
+  let replaying = true, closed = false, overflow = false;
+  const remember = (eventId) => {
+    if (!eventId || recent.has(eventId)) return;
+    recent.add(eventId);
+    recentOrder.push(eventId);
+    if (recentOrder.length > RECENT_IDS) recent.delete(recentOrder.shift());
+  };
+  const write = async (event) => {
+    if (closed || recent.has(event.event_id)) return;
+    remember(event.event_id);
+    const chunk = `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
+    if (!res.write(chunk)) {
+      await new Promise((resolve) => {
+        const settle = () => { res.off("drain", settle); res.off("close", settle); resolve(); };
+        res.once("drain", settle);
+        res.once("close", settle);
+      });
+    }
   };
   const unsubscribe = store.subscribe(runId, (msg) => {
-    if (msg.kind !== "event" || closed) return;
-    if (replaying) pending.push(msg.event);
-    else send(msg.event);
+    if (closed || msg.kind !== "event") return;
+    if (!replaying) { void write(msg.event).catch(() => { closed = true; unsubscribe(); res.destroy(); }); return; }
+    if (pending.length >= MAX_PENDING) { overflow = true; return; }
+    pending.push(msg.event);
+    pendingIds.add(msg.event.event_id);
   });
   res.on("close", () => { closed = true; unsubscribe(); });
   try {
-    for (const event of await store.listEvents(runId)) send(event);
-    for (const event of pending) send(event);
+    // Incremental disk replay retains only a line buffer, a fixed-size recent-ID
+    // window and at most MAX_PENDING live notifications; it never materializes
+    // the entire historical event file or an unbounded deduplication set.
+    for await (const event of store.streamEvents(runId)) {
+      if (closed || overflow) break;
+      if (pendingIds.has(event.event_id)) overlap.add(event.event_id);
+      await write(event);
+    }
+    while (pending.length && !closed && !overflow) {
+      const event = pending.shift();
+      pendingIds.delete(event.event_id);
+      if (!overlap.delete(event.event_id)) await write(event);
+    }
     replaying = false;
+    if (overflow && !closed) {
+      // Explicitly disconnect an overrun slow replay rather than silently
+      // dropping a canonical event. Reconnect replays the durable log.
+      res.end("event: gateway.replay_overflow\ndata: {\"error\":\"EVENT_REPLAY_OVERFLOW\"}\n\n");
+      closed = true;
+      unsubscribe();
+    }
   } catch (error) {
     closed = true;
     unsubscribe();
