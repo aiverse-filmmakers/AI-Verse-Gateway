@@ -1,6 +1,8 @@
 import path from "node:path";
+import { createReadStream } from "node:fs";
+import { createInterface } from "node:readline";
 import { EventEmitter } from "node:events";
-import { readFile, readdir } from "node:fs/promises";
+import { readFile, readdir, stat } from "node:fs/promises";
 import { GatewayError } from "./errors.mjs";
 import { atomicJson, appendNdjson, ensureDir, id, mutateJson, nowIso, readJson, sha256, stableStringify } from "./util.mjs";
 import { IdempotencyStore } from "./idempotency-store.mjs";
@@ -146,6 +148,39 @@ export class GatewayStore {
       const body = await readFile(this.eventFile(runId), "utf8");
       return body.split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
     } catch (error) { if (error?.code === "ENOENT") return []; throw error; }
+  }
+  // Bounded-memory historical iterator. Capture a fixed byte length so
+  // concurrent appends belong to the live subscription rather than a
+  // growing disk replay. Leave listEvents unchanged for existing callers.
+  async *streamEvents(runId) {
+    const file = this.eventFile(runId);
+    let size;
+    try { size = (await stat(file)).size; }
+    catch (error) { if (error?.code === "ENOENT") return; throw error; }
+    if (size === 0) return;
+    const stream = createReadStream(file, { start: 0, end: size - 1, encoding: "utf8", highWaterMark: 64 * 1024 });
+    const lines = createInterface({ input: stream, crlfDelay: Infinity });
+    try {
+      for await (const line of lines) {
+        if (!line) continue;
+        // An append may have been in flight when the snapshot size was read.
+        // The incomplete final line is delivered by the subscribed live bus
+        // once the append commits; never parse partial JSON as a full event.
+        if (line.length > 8 * 1024 * 1024) throw new GatewayError("EVENT_TOO_LARGE", "Stored event line exceeds replay limit", 413);
+        let event;
+        try { event = JSON.parse(line); }
+        catch (error) {
+          // Only a truncated final line is permitted. A corrupt *complete*
+          // line must fail closed, never silently discard canonical history.
+          if (stream.bytesRead >= size && !line.endsWith("}")) break;
+          throw error;
+        }
+        yield event;
+      }
+    } finally {
+      lines.close();
+      stream.destroy();
+    }
   }
   subscribe(runId, listener) { this.bus.on(`run:${runId}`, listener); return () => this.bus.off(`run:${runId}`, listener); }
   async createFoldCard(input) { return await createFoldCard(this, input); }
