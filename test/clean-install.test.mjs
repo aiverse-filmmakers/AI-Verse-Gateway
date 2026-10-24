@@ -399,15 +399,14 @@ test("event SSE bridges snapshot replay to live subscription without dropping or
     // notifications; it must still appear once, not twice.
     let interleaved = false;
     let both;
-    const listEvents = live.store.listEvents.bind(live.store);
-    live.store.listEvents = async (id) => {
-      if (id !== runId || interleaved) return listEvents(id);
+    const streamEvents = live.store.streamEvents.bind(live.store);
+    live.store.streamEvents = async function* (id) {
+      if (id !== runId || interleaved) { yield* streamEvents(id); return; }
       interleaved = true;
       const beforeSnapshot = await live.store.event(runId, "test.snapshot_overlap", { mark: "both" });
-      const snapshot = await listEvents(id);
+      yield* streamEvents(id);
       const afterSnapshot = await live.store.event(runId, "test.after_snapshot", { mark: "buffered" });
       both = { beforeSnapshot, afterSnapshot };
-      return snapshot;
     };
     const response = await fetch(`${origin}/v1/runs/${runId}/events`, {
       headers: { authorization: headers.authorization }, signal: AbortSignal.timeout(10000)
@@ -439,4 +438,54 @@ test("event SSE bridges snapshot replay to live subscription without dropping or
   } finally {
     await live.close();
   }
+});
+
+test("event SSE incrementally replays 1400 canonical events without whole-history materialization", async () => {
+  const f = await fixture();
+  await installComponent({ home: f.home });
+  const setup = await setupComponent({ home: f.home, system_root: f.root, host_config: f.hostConfig, runtime: "deterministic" });
+  const live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+  const base = `http://127.0.0.1:${live.port}`;
+  const headers = { authorization: `Bearer ${setup.api_token}`, "content-type": "application/json" };
+  try {
+    const created = await fetch(`${base}/v1/runs`, { method: "POST", headers,
+      body: JSON.stringify({ model: "aiverse", messages: [{ role: "user", content: "high volume replay" }] }) });
+    assert.equal(created.status, 202);
+    const { run_id: runId } = await created.json();
+    const ids = [];
+    for (let i = 0; i < 1400; i += 1) {
+      const event = await live.store.event(runId, "test.history", { ordinal: i });
+      ids.push(event.event_id);
+    }
+    live.store.listEvents = () => { throw new Error("unbounded array replay forbidden on the SSE path"); };
+    const response = await fetch(`${base}/v1/runs/${runId}/events`, {
+      headers: { authorization: headers.authorization }, signal: AbortSignal.timeout(15000)
+    });
+    assert.equal(response.status, 200);
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let raw = "", count = 0, first = null, last = null;
+    try {
+      while (count < ids.length) {
+        const { done, value } = await reader.read();
+        assert.equal(done, false);
+        raw += decoder.decode(value, { stream: true });
+        for (;;) {
+          const sep = raw.indexOf("\n\n");
+          if (sep < 0) break;
+          const message = raw.slice(0, sep);
+          raw = raw.slice(sep + 2);
+          if (!message.includes("event: test.history")) continue;
+          const event = JSON.parse(message.split("\n").find((line) => line.startsWith("data: ")).slice(6));
+          if (first === null) first = event;
+          last = event;
+          assert.equal(event.data.ordinal, count, "no event reorder or loss across bounded-memory replay");
+          count += 1;
+        }
+        assert.ok(raw.length < 8 * 1024 * 1024, "only an incomplete response frame may stay buffered");
+      }
+      assert.equal(first.event_id, ids[0]);
+      assert.equal(last.event_id, ids[ids.length - 1]);
+    } finally { await reader.cancel(); }
+  } finally { await live.close(); }
 });
