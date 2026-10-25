@@ -364,7 +364,6 @@ async function controlRun(res, runId, action, body, identity, ctx) {
 }
 
 async function sseRun(res, runId, store, origin) {
-  res.writeHead(200, corsHeaders(origin, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" }));
   const MAX_PENDING = 256;
   const RECENT_IDS = 512;
   const pending = [];
@@ -427,8 +426,11 @@ async function sseRun(res, runId, store, origin) {
     pending.push(msg.event);
     pendingIds.add(msg.event.event_id);
     if (!replaying) void drain();
-  });
+  }, { maxListeners: 16 });
   res.on("close", () => { closed = true; unsubscribe(); });
+  // Subscriber admission must precede HTTP 200. Quota violations return a
+  // proper authenticated 429 JSON error, not a broken SSE response.
+  res.writeHead(200, corsHeaders(origin, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" }));
   try {
     // Incremental disk replay retains only a line buffer, a fixed-size recent-ID
     // window and at most MAX_PENDING live notifications; it never materializes
