@@ -391,12 +391,42 @@ async function sseRun(res, runId, store, origin) {
       });
     }
   };
-  const unsubscribe = store.subscribe(runId, (msg) => {
-    if (closed || msg.kind !== "event") return;
-    if (!replaying) { void write(msg.event).catch(() => { closed = true; unsubscribe(); res.destroy(); }); return; }
-    if (pending.length >= MAX_PENDING) { overflow = true; return; }
+  let draining = false;
+  let unsubscribe;
+  const overflowClose = () => {
+    if (closed) return;
+    // Explicitly end the bounded subscriber, so reconnect can replay from
+    // immutable canonical history. Never allow unbounded writable backlog.
+    closed = true;
+    unsubscribe();
+    res.end('event: gateway.replay_overflow\\ndata: {"error":"EVENT_REPLAY_OVERFLOW"}\\n\\n'.replaceAll("\\\\n", "\\n"));
+  };
+  const drain = async () => {
+    if (draining || closed || replaying) return;
+    draining = true;
+    try {
+      while (pending.length && !closed && !overflow) {
+        const event = pending.shift();
+        pendingIds.delete(event.event_id);
+        if (!overlap.delete(event.event_id)) await write(event);
+      }
+      if (overflow) overflowClose();
+    } catch (error) {
+      closed = true;
+      unsubscribe();
+      res.destroy(error);
+    } finally { draining = false; }
+  };
+  unsubscribe = store.subscribe(runId, (msg) => {
+    if (closed || msg.kind !== "event" || overflow) return;
+    if (pending.length >= MAX_PENDING) {
+      overflow = true;
+      if (!replaying) overflowClose();
+      return;
+    }
     pending.push(msg.event);
     pendingIds.add(msg.event.event_id);
+    if (!replaying) void drain();
   });
   res.on("close", () => { closed = true; unsubscribe(); });
   try {
@@ -408,19 +438,9 @@ async function sseRun(res, runId, store, origin) {
       if (pendingIds.has(event.event_id)) overlap.add(event.event_id);
       await write(event);
     }
-    while (pending.length && !closed && !overflow) {
-      const event = pending.shift();
-      pendingIds.delete(event.event_id);
-      if (!overlap.delete(event.event_id)) await write(event);
-    }
     replaying = false;
-    if (overflow && !closed) {
-      // Explicitly disconnect an overrun slow replay rather than silently
-      // dropping a canonical event. Reconnect replays the durable log.
-      res.end("event: gateway.replay_overflow\ndata: {\"error\":\"EVENT_REPLAY_OVERFLOW\"}\n\n");
-      closed = true;
-      unsubscribe();
-    }
+    if (overflow) overflowClose();
+    else await drain();
   } catch (error) {
     closed = true;
     unsubscribe();
