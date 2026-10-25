@@ -399,7 +399,7 @@ async function sseRun(res, runId, store, origin) {
     // immutable canonical history. Never allow unbounded writable backlog.
     closed = true;
     unsubscribe();
-    res.end('event: gateway.replay_overflow\\ndata: {"error":"EVENT_REPLAY_OVERFLOW"}\\n\\n'.replaceAll("\\\\n", "\\n"));
+    res.end('event: gateway.replay_overflow\ndata: {"error":"EVENT_REPLAY_OVERFLOW"}\n\n');
   };
   const drain = async () => {
     if (draining || closed || replaying) return;
