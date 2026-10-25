@@ -129,7 +129,7 @@ async function handle(req, res, ctx) {
     if (match) {
       const runId = match[1], action = match[2];
       if (!action && req.method === "GET") return json(res, 200, sanitizeRun(await ownedRun(ctx.store, runId, identity.principal)));
-      if (action === "events" && req.method === "GET") { await ownedRun(ctx.store, runId, identity.principal); return sseRun(res, runId, ctx.store, origin); }
+      if (action === "events" && req.method === "GET") { await ownedRun(ctx.store, runId, identity.principal); return await sseRun(res, runId, ctx.store, origin); }
       if (action === "diagnostics" && req.method === "GET") {
         const run = await ownedRun(ctx.store, runId, identity.principal);
         return json(res, 200, await advancedRunDiagnostics(ctx.store, run));
