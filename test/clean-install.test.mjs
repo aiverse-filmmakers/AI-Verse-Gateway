@@ -489,3 +489,57 @@ test("event SSE incrementally replays 1400 canonical events without whole-histor
     } finally { await reader.cancel(); }
   } finally { await live.close(); }
 });
+
+test("request-size and malformed JSON guards fail closed before run creation without reflecting secrets", async () => {
+  const f = await fixture();
+  await installComponent({ home: f.home });
+  const setup = await setupComponent({
+    home: f.home, system_root: f.root, host_config: f.hostConfig,
+    runtime: "deterministic", max_body_bytes: 1024
+  });
+  const live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+  const url = `http://127.0.0.1:${live.port}/v1/runs`;
+  const auth = `Bearer ${setup.api_token}`;
+  const unsafe = "must-not-reflect-this-secret-f6e2" + "x".repeat(2050);
+  try {
+    const noBearer = await fetch(url, { method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "aiverse", messages: [{ role: "user", content: unsafe }] })
+    });
+    assert.equal(noBearer.status, 401);
+
+    const badOrigin = await fetch(url, { method: "POST",
+      headers: { authorization: auth, origin: "https://untrusted.invalid", "content-type": "application/json" },
+      body: JSON.stringify({ model: "aiverse", messages: [{ role: "user", content: unsafe }] })
+    });
+    assert.equal(badOrigin.status, 403);
+
+    const tooLarge = await fetch(url, { method: "POST",
+      headers: { authorization: auth, "content-type": "application/json" },
+      body: JSON.stringify({ model: "aiverse", messages: [{ role: "user", content: unsafe }] })
+    });
+    assert.equal(tooLarge.status, 413);
+    const sizeError = await tooLarge.text();
+    assert.match(sizeError, /BODY_TOO_LARGE/);
+    assert.equal(sizeError.includes(unsafe.slice(0, 32)), false, "raw secret must not be in errors");
+
+    const malformed = await fetch(url, { method: "POST",
+      headers: { authorization: auth, "content-type": "application/json" },
+      body: '{"messages":[{"role":"user","content":"must-not-reflect-this-secret-f6e2"}'
+    });
+    assert.equal(malformed.status, 400);
+    const parseError = await malformed.text();
+    assert.match(parseError, /INVALID_JSON/);
+    assert.equal(parseError.includes("must-not-reflect-this-secret-f6e2"), false);
+
+    // Valid owner operation remains live after all rejected requests.
+    const allowed = await fetch(url, { method: "POST",
+      headers: { authorization: auth, "content-type": "application/json" },
+      body: JSON.stringify({ model: "aiverse", messages: [{ role: "user", content: "safe work" }] })
+    });
+    assert.equal(allowed.status, 202);
+    const run = await allowed.json();
+    assert.match(run.run_id, /^run_/);
+    assert.equal(run.principal, "operator");
+  } finally { await live.close(); }
+});
