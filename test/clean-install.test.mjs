@@ -497,6 +497,9 @@ test("request-size and malformed JSON guards fail closed before run creation wit
     home: f.home, system_root: f.root, host_config: f.hostConfig,
     runtime: "deterministic", max_body_bytes: 1024
   });
+  const config = await loadConfig(f.home);
+  config.server.max_body_bytes = 1024;
+  await atomicJson(path.join(f.home, "config.json"), config);
   const live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
   const url = `http://127.0.0.1:${live.port}/v1/runs`;
   const auth = `Bearer ${setup.api_token}`;
