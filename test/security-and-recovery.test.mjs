@@ -512,7 +512,7 @@ test("complete corrupt and oversized persisted events fail replay closed without
   const runId = "run_bad_history";
   const original = await store.event(runId, "test.valid", { ordinal: 1 });
   const file = store.eventFile(runId);
-  await writeFile(file, '{"event_id":"evt_invalid","type":, "data":{}}\\n', { flag: "a" });
+  await writeFile(file, '{"event_id":"evt_invalid","type":, "data":{}}\n', { flag: "a" });
   const beforeCorruptionReplay = await readFile(file, "utf8");
   const seen = [];
   await assert.rejects(async () => {
@@ -524,7 +524,7 @@ test("complete corrupt and oversized persisted events fail replay closed without
   const hugeRun = "run_oversized_history";
   const hugeFile = store.eventFile(hugeRun);
   const oversized = JSON.stringify({ event_id: "evt_oversize", run_id: hugeRun,
-    type: "test.large", data: { value: "x".repeat(8 * 1024 * 1024) } }) + "\\n";
+    type: "test.large", data: { value: "x".repeat(8 * 1024 * 1024) } }) + "\n";
   await writeFile(hugeFile, oversized);
   await assert.rejects(async () => {
     for await (const event of store.streamEvents(hugeRun)) void event;
