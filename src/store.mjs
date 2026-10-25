@@ -182,7 +182,14 @@ export class GatewayStore {
       stream.destroy();
     }
   }
-  subscribe(runId, listener) { this.bus.on(`run:${runId}`, listener); return () => this.bus.off(`run:${runId}`, listener); }
+  subscribe(runId, listener, { maxListeners = null } = {}) {
+    const channel = `run:${runId}`;
+    if (Number.isInteger(maxListeners) && maxListeners > 0 && this.bus.listenerCount(channel) >= maxListeners) {
+      throw new GatewayError("EVENT_SUBSCRIBER_LIMIT", "Too many active subscribers for this run", 429);
+    }
+    this.bus.on(channel, listener);
+    return () => this.bus.off(channel, listener);
+  }
   async createFoldCard(input) { return await createFoldCard(this, input); }
   async getFoldCard(cardId) { return await getFoldCard(this, cardId); }
   async validateFoldCard(cardId) { return await validateFoldCard(this, cardId); }

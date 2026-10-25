@@ -129,7 +129,7 @@ async function handle(req, res, ctx) {
     if (match) {
       const runId = match[1], action = match[2];
       if (!action && req.method === "GET") return json(res, 200, sanitizeRun(await ownedRun(ctx.store, runId, identity.principal)));
-      if (action === "events" && req.method === "GET") { await ownedRun(ctx.store, runId, identity.principal); return sseRun(res, runId, ctx.store, origin); }
+      if (action === "events" && req.method === "GET") { await ownedRun(ctx.store, runId, identity.principal); return await sseRun(res, runId, ctx.store, origin); }
       if (action === "diagnostics" && req.method === "GET") {
         const run = await ownedRun(ctx.store, runId, identity.principal);
         return json(res, 200, await advancedRunDiagnostics(ctx.store, run));
@@ -364,7 +364,6 @@ async function controlRun(res, runId, action, body, identity, ctx) {
 }
 
 async function sseRun(res, runId, store, origin) {
-  res.writeHead(200, corsHeaders(origin, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" }));
   const MAX_PENDING = 256;
   const RECENT_IDS = 512;
   const pending = [];
@@ -427,8 +426,11 @@ async function sseRun(res, runId, store, origin) {
     pending.push(msg.event);
     pendingIds.add(msg.event.event_id);
     if (!replaying) void drain();
-  });
+  }, { maxListeners: 16 });
   res.on("close", () => { closed = true; unsubscribe(); });
+  // Subscriber admission must precede HTTP 200. Quota violations return a
+  // proper authenticated 429 JSON error, not a broken SSE response.
+  res.writeHead(200, corsHeaders(origin, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" }));
   try {
     // Incremental disk replay retains only a line buffer, a fixed-size recent-ID
     // window and at most MAX_PENDING live notifications; it never materializes

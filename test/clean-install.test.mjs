@@ -546,3 +546,71 @@ test("request-size and malformed JSON guards fail closed before run creation wit
     assert.equal(run.principal, "operator");
   } finally { await live.close(); }
 });
+
+test("run SSE caps active subscribers, returns authenticated 429 and frees capacity on disconnect", async () => {
+  const f = await fixture();
+  await installComponent({ home: f.home });
+  const setup = await setupComponent({ home: f.home, system_root: f.root, host_config: f.hostConfig, runtime: "deterministic" });
+  const live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+  const endpoint = `http://127.0.0.1:${live.port}`;
+  const headers = { authorization: `Bearer ${setup.api_token}`, "content-type": "application/json" };
+  try {
+    const created = await fetch(`${endpoint}/v1/runs`, { method: "POST", headers,
+      body: JSON.stringify({ model: "aiverse", messages: [{ role: "user", content: "subscriber quota" }] })
+    });
+    assert.equal(created.status, 202);
+    const { run_id: runId } = await created.json();
+    const listeners = Array.from({ length: 16 }, () => live.store.subscribe(runId, () => {}));
+    try {
+      const blocked = await fetch(`${endpoint}/v1/runs/${runId}/events`, {
+        headers: { authorization: headers.authorization }
+      });
+      assert.equal(blocked.status, 429);
+      assert.equal((await blocked.json()).error.code, "EVENT_SUBSCRIBER_LIMIT");
+      assert.equal(live.store.bus.listenerCount(`run:${runId}`), 16);
+      listeners.pop()();
+      const admitted = await fetch(`${endpoint}/v1/runs/${runId}/events`, {
+        headers: { authorization: headers.authorization }, signal: AbortSignal.timeout(10000)
+      });
+      assert.equal(admitted.status, 200);
+      assert.match(admitted.headers.get("content-type") ?? "", /text\/event-stream/);
+      await admitted.body.cancel();
+    } finally {
+      for (const unsubscribe of listeners) unsubscribe();
+    }
+  } finally { await live.close(); }
+});
+
+test("slow run SSE replay fails explicitly on bounded live buffer overflow without losing disk events", async () => {
+  const f = await fixture();
+  await installComponent({ home: f.home });
+  const setup = await setupComponent({ home: f.home, system_root: f.root, host_config: f.hostConfig, runtime: "deterministic" });
+  const live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+  const base = `http://127.0.0.1:${live.port}`;
+  const headers = { authorization: `Bearer ${setup.api_token}`, "content-type": "application/json" };
+  try {
+    const created = await fetch(`${base}/v1/runs`, { method: "POST", headers,
+      body: JSON.stringify({ model: "aiverse", messages: [{ role: "user", content: "subscriber overflow" }] })
+    });
+    assert.equal(created.status, 202);
+    const { run_id: runId } = await created.json();
+    const historical = live.store.streamEvents.bind(live.store);
+    let injected = false;
+    live.store.streamEvents = async function* (id) {
+      if (id !== runId || injected) { yield* historical(id); return; }
+      injected = true;
+      for (let i = 0; i < 270; i += 1) await live.store.event(id, "test.overflow", { ordinal: i });
+      yield* historical(id);
+    };
+    const response = await fetch(`${base}/v1/runs/${runId}/events`, {
+      headers: { authorization: headers.authorization }, signal: AbortSignal.timeout(15000)
+    });
+    assert.equal(response.status, 200);
+    const output = await response.text();
+    assert.match(output, /event: gateway\.replay_overflow/);
+    assert.match(output, /EVENT_REPLAY_OVERFLOW/);
+    const persisted = await live.store.listEvents(runId);
+    assert.equal(persisted.filter((event) => event.type === "test.overflow").length, 270,
+      "slow-client disconnect must never drop immutable canonical event history");
+  } finally { await live.close(); }
+});
