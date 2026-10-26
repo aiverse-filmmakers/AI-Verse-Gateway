@@ -614,3 +614,33 @@ test("slow run SSE replay fails explicitly on bounded live buffer overflow witho
       "slow-client disconnect must never drop immutable canonical event history");
   } finally { await live.close(); }
 });
+
+
+test("unexpected internal HTTP error never echoes diagnostic secrets", async () => {
+  const f = await fixture();
+  await installComponent({ home: f.home });
+  const setup = await setupComponent({ home: f.home, system_root: f.root,
+    host_config: f.hostConfig, runtime: "deterministic" });
+  const live = await startServer(await loadConfig(f.home), f.home, { port: 0 });
+  const originalGetRun = live.store.getRun.bind(live.store);
+  const sensitive = "must-not-echo-private-debug-credential-2026";
+  try {
+    live.store.getRun = async () => { throw new Error(`unexpected store failure: ${sensitive}`); };
+    const response = await fetch(`http://127.0.0.1:${live.port}/v1/runs/run_error_probe`, {
+      headers: { authorization: `Bearer ${setup.api_token}` }
+    });
+    assert.equal(response.status, 500);
+    const body = await response.json();
+    assert.deepEqual(body.error, { code: "INTERNAL_ERROR", message: "Internal Gateway error" },
+      "internal exception text must not leave the authenticated HTTP boundary");
+    assert.equal(JSON.stringify(body).includes(sensitive), false);
+    live.store.getRun = originalGetRun;
+    const models = await fetch(`http://127.0.0.1:${live.port}/v1/models`, {
+      headers: { authorization: `Bearer ${setup.api_token}` }
+    });
+    assert.equal(models.status, 200, "a redacted error must not break ordinary authenticated traffic");
+  } finally {
+    live.store.getRun = originalGetRun;
+    await live.close();
+  }
+});

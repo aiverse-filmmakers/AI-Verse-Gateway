@@ -10,5 +10,6 @@ export class GatewayError extends Error {
 
 export function asGatewayError(error) {
   if (error instanceof GatewayError) return error;
-  return new GatewayError("INTERNAL_ERROR", String(error?.message ?? error), 500);
+  // Never expose unexpected exception messages (paths, keys, owner diagnostic data) to HTTP callers.
+  return new GatewayError("INTERNAL_ERROR", "Internal Gateway error", 500);
 }

@@ -503,3 +503,32 @@ test("secret-like completed sessions are not persisted as session digests", asyn
   assert.equal(saved.memory_digest.status, "skipped");
   assert.equal(hostCalls, 0);
 });
+
+
+test("complete corrupt and oversized persisted events fail replay closed without rewriting canonical history", async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), "avg-bad-sse-history-"));
+  const store = new GatewayStore(home);
+  await store.init();
+  const runId = "run_bad_history";
+  const original = await store.event(runId, "test.valid", { ordinal: 1 });
+  const file = store.eventFile(runId);
+  await writeFile(file, '{"event_id":"evt_invalid","type":, "data":{}}\n', { flag: "a" });
+  const beforeCorruptionReplay = await readFile(file, "utf8");
+  const seen = [];
+  await assert.rejects(async () => {
+    for await (const event of store.streamEvents(runId)) seen.push(event);
+  }, SyntaxError, "complete corrupt event record must not disappear silently");
+  assert.deepEqual(seen.map((event) => event.event_id), [original.event_id]);
+  assert.equal(await readFile(file, "utf8"), beforeCorruptionReplay);
+
+  const hugeRun = "run_oversized_history";
+  const hugeFile = store.eventFile(hugeRun);
+  const oversized = JSON.stringify({ event_id: "evt_oversize", run_id: hugeRun,
+    type: "test.large", data: { value: "x".repeat(8 * 1024 * 1024) } }) + "\n";
+  await writeFile(hugeFile, oversized);
+  await assert.rejects(async () => {
+    for await (const event of store.streamEvents(hugeRun)) void event;
+  }, (error) => error instanceof GatewayError && error.code === "EVENT_TOO_LARGE");
+  assert.equal((await readFile(hugeFile)).length, Buffer.byteLength(oversized),
+    "oversized canonical log remains intact for operator recovery");
+});
