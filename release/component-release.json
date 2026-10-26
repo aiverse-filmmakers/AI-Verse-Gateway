@@ -65,14 +65,15 @@
     "acceptance": [
       {
         "kind": "approved-standalone-disposable-real-local-model-evidence",
-        "status": "pass",
+        "status": "source-tested-not-distribution-accepted",
         "revision": "386ff40135a841c27bfd106531b38a7f37c1c227",
         "source_tested_revision": "81d49a04c14caf2429cc0acd3a77f1072a1465f0",
         "url": "https://github.com/aiverse-filmmakers/AI-Verse-Dashboard/blob/main/docs/evidence/mc1-real-model-macos-2026-10-26.json",
         "scope": "standalone-os-ollama-qwen-local-only",
         "limitations": [
           "No private Core, cloud credential, tool actions, or Distribution member release tested"
-        ]
+        ],
+        "notes": "Bounded real-model proof executed on the exact PR source; merged commit only verified by separate six-job native CI. Gateway release remains candidate; Distribution admission not approved."
       }
     ]
   },
