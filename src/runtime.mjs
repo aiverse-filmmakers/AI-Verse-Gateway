@@ -27,7 +27,8 @@ async function openAICompatible(config, input, signal) {
     headers.authorization = `Bearer ${secret}`;
   }
   const body = {
-    model: input.model || config.model,
+    // "aiverse" is the public Gateway identity, not an upstream model name.
+    model: !input.model || input.model === "aiverse" ? config.model : input.model,
     messages: input.messages,
     stream: false,
     ...(Number.isInteger(input.max_output_tokens) && input.max_output_tokens > 0
