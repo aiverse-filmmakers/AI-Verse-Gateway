@@ -2,7 +2,7 @@
   "schema_version": "ai-verse.component-release/v1",
   "component_id": "ai-verse-gateway",
   "version": "0.1.0-beta.1",
-  "revision": "1772b75e2add73a524715f746e87b3a6b5561bf6",
+  "revision": "386ff40135a841c27bfd106531b38a7f37c1c227",
   "release_status": "candidate",
   "package": {
     "repository": "aiverse-filmmakers/AI-Verse-Gateway",
@@ -10,15 +10,74 @@
     "package_name": "@aiverse/gateway",
     "integrity": null
   },
-  "supported_platforms": ["linux"],
-  "runtime_requirements": {"python": null, "node": ">=20", "other": []},
-  "lifecycle": {"install": true, "setup": false, "status": false, "doctor": false, "enable": false, "disable": false, "update": true, "uninstall": true},
-  "state": {"canonical_state_owned": true, "preserve_on_update": true, "preserve_on_uninstall": true, "preserve_unknown_user_files": true, "state_format": null},
-  "migration": {"change_classification": "non-breaking", "compatibility": "none-required", "from_versions": [], "requires_explicit_migration": false, "owner_controlled": true, "checkpoint_policy": "not-required"},
-  "authority": {"grants_permissions": false, "changes_direction_owner": false, "changes_scope": false, "enables_disabled_component": false, "exposes_remote_listener": false},
-  "evidence": {
-    "ci": [{"kind": "owner-native-ci", "status": "pass", "revision": "1772b75e2add73a524715f746e87b3a6b5561bf6", "run_id": "37876089214", "url": "https://github.com/aiverse-filmmakers/AI-Verse-Gateway/actions/runs/37876089214"}],
-    "acceptance": [{"kind": "owner-local-native-workflow-acceptance", "status": "pass", "revision": "1772b75e2add73a524715f746e87b3a6b5561bf6", "run_id": "37876089214", "url": "https://github.com/aiverse-filmmakers/AI-Verse-Gateway/actions/runs/37876089214"}]
+  "supported_platforms": [
+    "linux",
+    "macos",
+    "windows"
+  ],
+  "runtime_requirements": {
+    "python": null,
+    "node": ">=20",
+    "other": []
   },
-  "semantics": {"release_metadata_only": true, "live_health_truth": false}
+  "lifecycle": {
+    "install": true,
+    "setup": true,
+    "status": true,
+    "doctor": true,
+    "enable": true,
+    "disable": true,
+    "update": true,
+    "uninstall": true
+  },
+  "state": {
+    "canonical_state_owned": true,
+    "preserve_on_update": true,
+    "preserve_on_uninstall": true,
+    "preserve_unknown_user_files": true,
+    "state_format": null
+  },
+  "migration": {
+    "change_classification": "non-breaking",
+    "compatibility": "none-required",
+    "from_versions": [],
+    "requires_explicit_migration": false,
+    "owner_controlled": true,
+    "checkpoint_policy": "not-required"
+  },
+  "authority": {
+    "grants_permissions": false,
+    "changes_direction_owner": false,
+    "changes_scope": false,
+    "enables_disabled_component": false,
+    "exposes_remote_listener": false
+  },
+  "evidence": {
+    "ci": [
+      {
+        "kind": "owner-native-ci",
+        "status": "pass",
+        "revision": "386ff40135a841c27bfd106531b38a7f37c1c227",
+        "run_id": "40391434958",
+        "url": "https://github.com/aiverse-filmmakers/AI-Verse-Gateway/actions/runs/40391434958"
+      }
+    ],
+    "acceptance": [
+      {
+        "kind": "approved-standalone-disposable-real-local-model-evidence",
+        "status": "pass",
+        "revision": "386ff40135a841c27bfd106531b38a7f37c1c227",
+        "source_tested_revision": "81d49a04c14caf2429cc0acd3a77f1072a1465f0",
+        "url": "https://github.com/aiverse-filmmakers/AI-Verse-Dashboard/blob/main/docs/evidence/mc1-real-model-macos-2026-10-26.json",
+        "scope": "standalone-os-ollama-qwen-local-only",
+        "limitations": [
+          "No private Core, cloud credential, tool actions, or Distribution member release tested"
+        ]
+      }
+    ]
+  },
+  "semantics": {
+    "release_metadata_only": true,
+    "live_health_truth": false
+  }
 }
