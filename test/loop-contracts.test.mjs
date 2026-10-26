@@ -11,6 +11,22 @@ import { hashToken } from "../src/auth.mjs";
 import { atomicJson } from "../src/util.mjs";
 import { RunEngine } from "../src/run-engine.mjs";
 import { GatewayStore } from "../src/store.mjs";
+import { RuntimeRegistry } from "../src/runtime.mjs";
+
+test("public aiverse model routes to the configured real upstream model", async (t) => {
+  const requests = [];
+  t.mock.method(globalThis, "fetch", async (url, init) => {
+    requests.push({ url, body: JSON.parse(init.body) });
+    return Response.json({ choices: [{ message: { content: "real transport reply" } }] });
+  });
+  const runtime = new RuntimeRegistry({ kind: "openai-compatible", base_url: "http://127.0.0.1:11439", model: "qwen3:0.6b" });
+  for (const model of ["aiverse", undefined, "explicit-provider-model"]) {
+    const out = await runtime.invoke({ model, messages: [{ role: "user", content: "test" }] });
+    assert.equal(out.content, "real transport reply");
+  }
+  assert.deepEqual(requests.map((r) => r.body.model), ["qwen3:0.6b", "qwen3:0.6b", "explicit-provider-model"]);
+  assert.ok(requests.every((r) => r.url === "http://127.0.0.1:11439/v1/chat/completions"));
+});
 
 const here=path.dirname(fileURLToPath(import.meta.url));
 const hostFixture=path.resolve(here,"..","fixtures","fake-host.mjs");
