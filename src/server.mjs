@@ -2,6 +2,7 @@ import { createServer } from "node:http";
 import { GatewayError, asGatewayError } from "./errors.mjs";
 import { bearer } from "./auth.mjs";
 import { GatewayStore } from "./store.mjs";
+import {listOwnedSessions,listOwnedSessionRuns} from "./history.mjs";
 import { RunEngine } from "./run-engine.mjs";
 import { id, nowIso, sleep, stableStringify } from "./util.mjs";
 import { VERSION } from "./constants.mjs";
@@ -115,6 +116,22 @@ async function handle(req, res, ctx) {
     if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
       const body = await readJsonBody(req, ctx.config.server.max_body_bytes);
       return await chatCompletions(req, res, body, identity, ctx, origin);
+    }
+    // Read-only discovery is authoritative Gateway storage, never Dashboard
+    // filesystem access. Scope is explicit and principal is from bearer auth.
+    if (req.method === "GET" && url.pathname === "/v1/sessions") {
+      const workspaceId=url.searchParams.get("workspace_id");
+      return json(res,200,await listOwnedSessions(ctx.store,{
+        principal:identity.principal,systemId:ctx.config.system.id,workspaceId,url,
+      }));
+    }
+    const sessionRuns=url.pathname.match(/^\/v1\/sessions\/([A-Za-z0-9._:-]+)\/runs$/);
+    if (req.method === "GET" && sessionRuns) {
+      const workspaceId=url.searchParams.get("workspace_id");
+      return json(res,200,await listOwnedSessionRuns(ctx.store,{
+        principal:identity.principal,systemId:ctx.config.system.id,
+        workspaceId,sessionId:sessionRuns[1],url,
+      }));
     }
     if (req.method === "POST" && url.pathname === "/v1/runs") {
       const body = await readJsonBody(req, ctx.config.server.max_body_bytes);
